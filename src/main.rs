@@ -32,7 +32,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::distro::DistroInfo;
 use crate::model::{
-    human_size, AppError, AppResult, BackupMode, EntryKind, ProgressFn, ScanReport,
+    human_size, AppError, AppResult, BackupMode, EntryKind, ProgressFn, RestoreStrategy, ScanReport,
 };
 use crate::scan::ScanOptions;
 
@@ -54,20 +54,35 @@ enum Cmd {
         mode: BackupMode,
         kver: Option<String>,
     },
-    /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`。
+    /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`
+    ///   `[--root <dir>] [--strategy <s>] [--on-immutable <p>] [--strict-links] [--no-sign] [--chroot-exec]`
     Restore {
         archive: String,
         dry_run: bool,
         yes: bool,
         with_firmware: bool,
         allow_kernel_mismatch: bool,
+        root: Option<String>,
+        strategy: Option<RestoreStrategy>,
+        on_immutable: bool,
+        strict_links: bool,
+        no_sign: bool,
+        chroot_exec: bool,
     },
-    /// `--helper-restore --archive <f> [--kver <k>] [--with-firmware] [--allow-kernel-mismatch]`。
+    /// `--rollback [last|<id>] [--root <dir>]`
+    Rollback { journal: Option<String>, root: Option<String> },
+    /// `--helper-restore --archive <f> [--kver <k>] [--with-firmware] …`（内部）。
     Helper {
         archive: String,
         kver: Option<String>,
         with_firmware: bool,
         allow_kernel_mismatch: bool,
+        root: Option<String>,
+        strategy: Option<RestoreStrategy>,
+        on_immutable: bool,
+        strict_links: bool,
+        no_sign: bool,
+        chroot_exec: bool,
     },
 }
 
@@ -84,6 +99,21 @@ fn parse_mode(value: &str) -> Result<BackupMode, String> {
         "full" => Ok(BackupMode::Full),
         other => Err(format!(
             "`--mode` 取值非法：`{other}`（可选 minimal | standard | full）"
+        )),
+    }
+}
+
+/// 把 `--strategy` 的取值映射为还原策略（`auto` → `None` 表示自动决策）。
+/// Map the `--strategy` value onto a restore strategy (`auto` → `None`).
+fn parse_strategy(value: &str) -> Result<Option<RestoreStrategy>, String> {
+    match value {
+        "auto" => Ok(None),
+        "rebuild" => Ok(Some(RestoreStrategy::Rebuild)),
+        "reinstall" => Ok(Some(RestoreStrategy::Reinstall)),
+        "weak-modules" | "weakmodules" => Ok(Some(RestoreStrategy::WeakModules)),
+        "copy" => Ok(Some(RestoreStrategy::Copy)),
+        other => Err(format!(
+            "`--strategy` 取值非法：`{other}`（可选 auto | rebuild | reinstall | weak-modules | copy）"
         )),
     }
 }
@@ -181,6 +211,12 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut yes = false;
             let mut with_firmware = false;
             let mut allow_kernel_mismatch = false;
+            let mut root: Option<String> = None;
+            let mut strategy: Option<RestoreStrategy> = None;
+            let mut on_immutable = false;
+            let mut strict_links = false;
+            let mut no_sign = false;
+            let mut chroot_exec = false;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -203,6 +239,35 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         allow_kernel_mismatch = true;
                         idx += 1;
                     }
+                    "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
+                    "--strategy" => {
+                        strategy =
+                            parse_strategy(&take_value(args, &mut idx, "--strategy", inline)?)?
+                    }
+                    "--on-immutable" => {
+                        let v = take_value(args, &mut idx, "--on-immutable", inline)?;
+                        on_immutable = match v.as_str() {
+                            "usroverlay" => true,
+                            "refuse" => false,
+                            other => {
+                                return Err(format!(
+                                    "`--on-immutable` 取值非法：`{other}`（可选 refuse | usroverlay）"
+                                ))
+                            }
+                        };
+                    }
+                    "--strict-links" => {
+                        strict_links = true;
+                        idx += 1;
+                    }
+                    "--no-sign" => {
+                        no_sign = true;
+                        idx += 1;
+                    }
+                    "--chroot-exec" => {
+                        chroot_exec = true;
+                        idx += 1;
+                    }
                     other => return Err(format!("`--restore` 不支持参数 `{other}`")),
                 }
             }
@@ -214,7 +279,32 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 yes,
                 with_firmware,
                 allow_kernel_mismatch,
+                root,
+                strategy,
+                on_immutable,
+                strict_links,
+                no_sign,
+                chroot_exec,
             })
+        }
+        "--rollback" => {
+            let mut idx = 1;
+            let mut journal: Option<String> = None;
+            let mut root: Option<String> = None;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
+                    other if other.starts_with('-') => {
+                        return Err(format!("`--rollback` 不支持参数 `{other}`"))
+                    }
+                    other => {
+                        journal = Some(other.to_string());
+                        idx += 1;
+                    }
+                }
+            }
+            Ok(Cmd::Rollback { journal, root })
         }
         "--helper-restore" => {
             let mut idx = 1;
@@ -222,6 +312,12 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut kver: Option<String> = None;
             let mut with_firmware = false;
             let mut allow_kernel_mismatch = false;
+            let mut root: Option<String> = None;
+            let mut strategy: Option<RestoreStrategy> = None;
+            let mut on_immutable = false;
+            let mut strict_links = false;
+            let mut no_sign = false;
+            let mut chroot_exec = false;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -237,6 +333,27 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         allow_kernel_mismatch = true;
                         idx += 1;
                     }
+                    "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
+                    "--strategy" => {
+                        strategy =
+                            parse_strategy(&take_value(args, &mut idx, "--strategy", inline)?)?
+                    }
+                    "--on-immutable" => {
+                        let v = take_value(args, &mut idx, "--on-immutable", inline)?;
+                        on_immutable = matches!(v.as_str(), "usroverlay");
+                    }
+                    "--strict-links" => {
+                        strict_links = true;
+                        idx += 1;
+                    }
+                    "--no-sign" => {
+                        no_sign = true;
+                        idx += 1;
+                    }
+                    "--chroot-exec" => {
+                        chroot_exec = true;
+                        idx += 1;
+                    }
                     other => return Err(format!("`--helper-restore` 不支持参数 `{other}`")),
                 }
             }
@@ -248,6 +365,12 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 kver,
                 with_firmware,
                 allow_kernel_mismatch,
+                root,
+                strategy,
+                on_immutable,
+                strict_links,
+                no_sign,
+                chroot_exec,
             })
         }
         other => Err(format!(
@@ -267,6 +390,9 @@ fn usage() -> String {
          \x20 linux-driver-backup --scan [--mode <m>] [--json]      # 扫描外置驱动 / scan out-of-tree drivers\n\
          \x20 linux-driver-backup --backup --out <f> [--mode <m>] [--kver <k>]\n\
          \x20 linux-driver-backup --restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]\n\
+         \x20                              [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]\n\
+         \x20                              [--on-immutable refuse|usroverlay] [--strict-links] [--no-sign] [--chroot-exec]\n\
+         \x20 linux-driver-backup --rollback [last|<id>] [--root <dir>]   # 回滚上一次还原 / undo the last restore\n\
          \x20 linux-driver-backup --helper-restore --archive <f> [--kver <k>] [--with-firmware]\n\
          \n\
          说明 / Notes:\n\
@@ -307,6 +433,7 @@ fn kind_label(kind: EntryKind) -> &'static str {
         EntryKind::Dkms => "DKMS",
         EntryKind::Config => "配置",
         EntryKind::Firmware => "固件",
+        EntryKind::Symlink => "链接",
     }
 }
 
@@ -550,6 +677,22 @@ fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
     }
 }
 
+/// `--restore` 的 CLI 选项集合（由 `Cmd::Restore` 解构而来）。
+/// CLI options for `--restore`, destructured from `Cmd::Restore`.
+struct RestoreCli {
+    archive: String,
+    dry_run: bool,
+    yes: bool,
+    with_firmware: bool,
+    allow_kernel_mismatch: bool,
+    root: Option<String>,
+    strategy: Option<RestoreStrategy>,
+    on_immutable: bool,
+    strict_links: bool,
+    no_sign: bool,
+    chroot_exec: bool,
+}
+
 /// `--restore`：校验并还原归档。
 /// `--restore`: verify and restore an archive.
 ///
@@ -557,14 +700,8 @@ fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
 /// （GUI 才自动提权）；`--dry-run` 不需要 root，始终可执行。
 /// Without root, the CLI never auto-elevates (only the GUI does): it tells the user to
 /// re-run with sudo. `--dry-run` needs no root and always works.
-fn run_cli_restore(
-    archive: &str,
-    dry_run: bool,
-    yes: bool,
-    with_firmware: bool,
-    allow_kernel_mismatch: bool,
-) -> i32 {
-    let path = expand_tilde(archive);
+fn run_cli_restore(opts: RestoreCli) -> i32 {
+    let path = expand_tilde(&opts.archive);
 
     // 普通权限即可读归档：先 inspect 用于打印确认信息与提示内核不一致。
     let info = match restore::inspect(&path) {
@@ -577,7 +714,7 @@ fn run_cli_restore(
     let current_kver = distro::kernel_release();
     let mismatch = info.manifest.kernel_release != current_kver;
 
-    if !dry_run && !yes {
+    if !opts.dry_run && !opts.yes {
         println!("即将还原 / about to restore:");
         println!("  归档 / archive : {}", path.display());
         println!(
@@ -586,12 +723,22 @@ fn run_cli_restore(
         );
         println!(
             "  发行版 / distro: {}（{}）",
-            info.manifest.distro.pretty_name, info.manifest.mode.label()
+            info.manifest.distro.pretty_name,
+            info.manifest.mode.label()
+        );
+        println!(
+            "  归档格式 / format: v{}（工具 {}，压缩 {}）",
+            info.manifest.format_version,
+            info.manifest.tool_version,
+            info.manifest.compression.as_deref().unwrap_or("unknown")
         );
         println!("  条目 / entries : {}", info.manifest.entries.len());
         println!("  体积 / payload : {}", human_size(info.total_bytes));
+        if let Some(vm) = &info.manifest.kernel_vermagic {
+            println!("  vermagic       : {vm}");
+        }
         if mismatch {
-            println!("  ⚠ 内核不一致，跨内核还原可能导致模块 ABI 不兼容");
+            println!("  ⚠ 内核不一致，跨内核还原可能导致模块 ABI 不兼容（可加 --strategy rebuild）");
         }
         print!("确认继续？[y/N] / continue? ");
         use std::io::Write;
@@ -608,11 +755,12 @@ fn run_cli_restore(
         }
     }
 
-    if !dry_run && !distro::is_root() {
+    // 写 `/` 需要 root；`--root <目录>` 离线还原（救援场景）按目录自身权限判定。
+    if !opts.dry_run && opts.root.is_none() && !distro::is_root() {
         eprintln!(
             "还原需要 root 权限 / restore requires root：请用 `sudo linux-driver-backup --restore …` 运行，\n\
-             或改用图形界面（由 pkexec 弹出系统密码框完成单次提权）。\n\
-             `--dry-run` 预演不需要 root。"
+             或改用图形界面（由 pkexec 弹出系统密码框完成单次提权）；\n\
+             离线还原可加 `--root <目录>`（无需 root）。"
         );
         return 1;
     }
@@ -620,9 +768,20 @@ fn run_cli_restore(
     let request = restore::RestoreRequest {
         archive: path,
         kver: None,
-        dry_run,
-        allow_kernel_mismatch,
-        with_firmware,
+        dry_run: opts.dry_run,
+        allow_kernel_mismatch: opts.allow_kernel_mismatch,
+        with_firmware: opts.with_firmware,
+        root: opts.root.as_deref().map(expand_tilde),
+        strategy: opts.strategy,
+        on_immutable: if opts.on_immutable {
+            restore::ImmutablePolicy::Usroverlay
+        } else {
+            restore::ImmutablePolicy::Refuse
+        },
+        strict_links: opts.strict_links,
+        no_sign: opts.no_sign,
+        chroot_exec: opts.chroot_exec,
+        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
         progress: cli_progress(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
@@ -631,24 +790,26 @@ fn run_cli_restore(
         Ok(report) => {
             if report.dry_run {
                 println!("预演完成 / dry-run finished（未写盘 / nothing written）：");
-                for note in &report.notes {
-                    println!("  - {note}");
-                }
             } else {
                 println!(
-                    "还原完成 / restore finished: 写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                    "还原完成 / restore finished: 写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}（未签名 {}）；depmod={}，initramfs={}",
                     report.written,
+                    report.links_written,
                     report.skipped,
+                    report.rebuilt,
+                    report.reinstalled,
+                    report.signed,
+                    report.unsigned_left,
                     report.depmod_done,
                     match report.initramfs_done {
                         Some(true) => "已更新 / updated",
                         Some(false) => "失败 / failed",
-                        None => "跳过 / skipped（未知发行版）",
+                        None => "跳过 / skipped",
                     }
                 );
-                for note in &report.notes {
-                    println!("  - {note}");
-                }
+            }
+            for note in &report.notes {
+                println!("  - {note}");
             }
             0
         }
@@ -663,13 +824,61 @@ fn run_cli_restore(
     }
 }
 
+/// `--rollback`：按事务日志回滚最近一次（或指定一次）还原。
+/// `--rollback`: undo the most recent (or a specified) restore using its journal.
+fn run_cli_rollback(journal: Option<String>, root: Option<String>) -> i32 {
+    // 回滚 `/` 需要 root；`--root` 指向用户可写目录时按目录权限自行判定。
+    if root.is_none() && !distro::is_root() {
+        eprintln!(
+            "回滚需要 root 权限 / rollback requires root：请用 `sudo linux-driver-backup --rollback …` 运行。"
+        );
+        return 1;
+    }
+    let root_path = root
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let journal_path = match journal.as_deref() {
+        None | Some("last") => None,
+        Some(p) => Some(expand_tilde(p)),
+    };
+
+    match restore::run_rollback(&root_path, journal_path.as_deref(), cli_progress()) {
+        Ok(report) => {
+            println!(
+                "回滚完成 / rollback finished: 恢复 {} 个原文件，删除 {} 个新增文件",
+                report.restored, report.removed
+            );
+            for note in &report.notes {
+                println!("  - {note}");
+            }
+            0
+        }
+        Err(AppError::Cancelled) => {
+            eprintln!("已取消 / cancelled");
+            1
+        }
+        Err(err) => {
+            eprintln!("回滚失败 / rollback failed: {err}");
+            1
+        }
+    }
+}
+
 /// `--helper-restore`：`pkexec` 以 root 重入的无 GUI 分支，按行协议回传。
 /// `--helper-restore`: the GUI-less, root-only re-entry driven by pkexec.
+#[allow(clippy::too_many_arguments)]
 fn run_helper(
     archive: String,
     kver: Option<String>,
     with_firmware: bool,
     allow_kernel_mismatch: bool,
+    root: Option<String>,
+    strategy: Option<RestoreStrategy>,
+    on_immutable: bool,
+    strict_links: bool,
+    no_sign: bool,
+    chroot_exec: bool,
 ) -> i32 {
     let sink_progress = privilege::HelperSink::new();
     let sink_result = privilege::HelperSink::new();
@@ -683,6 +892,17 @@ fn run_helper(
         dry_run: false,
         allow_kernel_mismatch,
         with_firmware,
+        root: root.as_deref().map(expand_tilde),
+        strategy,
+        on_immutable: if on_immutable {
+            restore::ImmutablePolicy::Usroverlay
+        } else {
+            restore::ImmutablePolicy::Refuse
+        },
+        strict_links,
+        no_sign,
+        chroot_exec,
+        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
         progress,
         cancel: Arc::new(AtomicBool::new(false)),
     };
@@ -690,9 +910,14 @@ fn run_helper(
     match restore::run_restore(request) {
         Ok(report) => {
             let message = format!(
-                "还原完成：写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                "还原完成：写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}（未签名 {}）；depmod={}，initramfs={}",
                 report.written,
+                report.links_written,
                 report.skipped,
+                report.rebuilt,
+                report.reinstalled,
+                report.signed,
+                report.unsigned_left,
                 report.depmod_done,
                 match report.initramfs_done {
                     Some(true) => "已更新",
@@ -955,14 +1180,22 @@ fn run_gui() -> AppResult<()> {
                         // 预演无副作用：允许跨内核预览，附带提示信息。
                         allow_kernel_mismatch: true,
                         with_firmware: true,
+                        root: None,
+                        strategy: None,
+                        on_immutable: restore::ImmutablePolicy::Refuse,
+                        strict_links: false,
+                        no_sign: true,
+                        chroot_exec: false,
+                        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
                     match restore::run_restore(request) {
                         Ok(report) => {
                             let mut message = format!(
-                                "预演完成（未写盘）：将写入 {} 个文件（共 {}），跳过 {} 个",
+                                "预演完成（未写盘）：将写入 {} 个文件 + {} 个链接（共 {}），跳过 {} 个",
                                 report.written,
+                                report.links_written,
                                 human_size(inspected.total_bytes),
                                 report.skipped
                             );
@@ -995,22 +1228,39 @@ fn run_gui() -> AppResult<()> {
                         dry_run: false,
                         allow_kernel_mismatch: false,
                         with_firmware: true,
+                        root: None,
+                        strategy: None,
+                        on_immutable: restore::ImmutablePolicy::Refuse,
+                        strict_links: false,
+                        no_sign: false,
+                        chroot_exec: false,
+                        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
                     restore::run_restore(request).map(|report| {
                         format!(
-                            "还原完成：写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                            "还原完成：写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}；depmod={}，initramfs={}",
                             report.written,
+                            report.links_written,
                             report.skipped,
+                            report.rebuilt,
+                            report.reinstalled,
+                            report.signed,
                             report.depmod_done,
                             match report.initramfs_done {
                                 Some(true) => "已更新",
                                 Some(false) => "失败",
-                                None => "已跳过（未知发行版）",
+                                None => "已跳过",
                             }
                         )
                     })
+                } else if !distro::pkexec_available() {
+                    Err(AppError::Privilege(
+                        "未找到 pkexec（polkit 未安装或不可用），无法自动提权。\
+                         请在终端执行：sudo linux-driver-backup --restore --archive <归档>"
+                            .to_string(),
+                    ))
                 } else {
                     let mut args = vec![
                         "--archive".to_string(),
@@ -1092,19 +1342,49 @@ fn main() {
             yes,
             with_firmware,
             allow_kernel_mismatch,
-        } => run_cli_restore(
-            &archive,
+            root,
+            strategy,
+            on_immutable,
+            strict_links,
+            no_sign,
+            chroot_exec,
+        } => run_cli_restore(RestoreCli {
+            archive,
             dry_run,
             yes,
             with_firmware,
             allow_kernel_mismatch,
-        ),
+            root,
+            strategy,
+            on_immutable,
+            strict_links,
+            no_sign,
+            chroot_exec,
+        }),
+        Cmd::Rollback { journal, root } => run_cli_rollback(journal, root),
         Cmd::Helper {
             archive,
             kver,
             with_firmware,
             allow_kernel_mismatch,
-        } => run_helper(archive, kver, with_firmware, allow_kernel_mismatch),
+            root,
+            strategy,
+            on_immutable,
+            strict_links,
+            no_sign,
+            chroot_exec,
+        } => run_helper(
+            archive,
+            kver,
+            with_firmware,
+            allow_kernel_mismatch,
+            root,
+            strategy,
+            on_immutable,
+            strict_links,
+            no_sign,
+            chroot_exec,
+        ),
         Cmd::Gui => match run_gui() {
             Ok(()) => 0,
             Err(err) => {
@@ -1215,9 +1495,120 @@ mod tests {
                 dry_run: true,
                 yes: true,
                 with_firmware: true,
-                allow_kernel_mismatch: true
+                allow_kernel_mismatch: true,
+                root: None,
+                strategy: None,
+                on_immutable: false,
+                strict_links: false,
+                no_sign: false,
+                chroot_exec: false
             }
         );
+    }
+
+    #[test]
+    fn restore_v2_flags_are_parsed() {
+        assert_eq!(
+            parse_args(&args(&[
+                "--restore",
+                "--archive",
+                "/tmp/a.tar.gz",
+                "--root",
+                "/mnt/target",
+                "--strategy",
+                "rebuild",
+                "--on-immutable",
+                "usroverlay",
+                "--strict-links",
+                "--no-sign",
+                "--chroot-exec"
+            ]))
+            .unwrap(),
+            Cmd::Restore {
+                archive: "/tmp/a.tar.gz".to_string(),
+                dry_run: false,
+                yes: false,
+                with_firmware: false,
+                allow_kernel_mismatch: false,
+                root: Some("/mnt/target".to_string()),
+                strategy: Some(RestoreStrategy::Rebuild),
+                on_immutable: true,
+                strict_links: true,
+                no_sign: true,
+                chroot_exec: true
+            }
+        );
+        // `--strategy auto` 等价于自动决策（None）
+        assert_eq!(
+            parse_args(&args(&["--restore", "--archive", "a", "--strategy=auto"])).unwrap(),
+            Cmd::Restore {
+                archive: "a".to_string(),
+                dry_run: false,
+                yes: false,
+                with_firmware: false,
+                allow_kernel_mismatch: false,
+                root: None,
+                strategy: None,
+                on_immutable: false,
+                strict_links: false,
+                no_sign: false,
+                chroot_exec: false
+            }
+        );
+        assert!(parse_args(&args(&["--restore", "--archive", "a", "--strategy", "magic"])).is_err());
+        assert!(
+            parse_args(&args(&["--restore", "--archive", "a", "--on-immutable", "maybe"])).is_err()
+        );
+    }
+
+    #[test]
+    fn rollback_is_parsed() {
+        assert_eq!(
+            parse_args(&args(&["--rollback"])).unwrap(),
+            Cmd::Rollback {
+                journal: None,
+                root: None
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["--rollback", "last"])).unwrap(),
+            Cmd::Rollback {
+                journal: Some("last".to_string()),
+                root: None
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--rollback",
+                "/var/lib/linux-driver-backup/restore-1.json",
+                "--root",
+                "/mnt/t"
+            ]))
+            .unwrap(),
+            Cmd::Rollback {
+                journal: Some("/var/lib/linux-driver-backup/restore-1.json".to_string()),
+                root: Some("/mnt/t".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn strategy_parser_covers_all_values() {
+        assert_eq!(parse_strategy("auto").unwrap(), None);
+        assert_eq!(
+            parse_strategy("rebuild").unwrap(),
+            Some(RestoreStrategy::Rebuild)
+        );
+        assert_eq!(
+            parse_strategy("reinstall").unwrap(),
+            Some(RestoreStrategy::Reinstall)
+        );
+        assert_eq!(
+            parse_strategy("weak-modules").unwrap(),
+            Some(RestoreStrategy::WeakModules)
+        );
+        assert_eq!(parse_strategy("copy").unwrap(), Some(RestoreStrategy::Copy));
+        assert!(parse_strategy("bogus").is_err());
     }
 
     #[test]
@@ -1228,7 +1619,13 @@ mod tests {
                 archive: "/tmp/a.tar.gz".to_string(),
                 kver: None,
                 with_firmware: false,
-                allow_kernel_mismatch: false
+                allow_kernel_mismatch: false,
+                root: None,
+                strategy: None,
+                on_immutable: false,
+                strict_links: false,
+                no_sign: false,
+                chroot_exec: false
             }
         );
         assert!(parse_args(&args(&["--helper-restore"])).is_err());
@@ -1259,8 +1656,11 @@ mod tests {
             "--scan",
             "--backup",
             "--restore",
+            "--rollback",
             "--helper-restore",
             "--dry-run",
+            "--strategy",
+            "--root",
         ] {
             assert!(text.contains(needle), "用法说明缺少 {needle}");
         }

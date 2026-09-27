@@ -350,8 +350,447 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+// ===========================================================================
+// v0.2.0 新增：不可变系统 / Secure Boot / 重建命令（设计文档 P0-2…P0-4）
+// v0.2.0 additions: immutable OS, Secure Boot, rebuild commands (ROADMAP P0-2…P0-4)
+// ===========================================================================
+
+/// 目标系统的可变性模型（决定能否直接写入 `/lib/modules`）。
+/// How mutable the target system is — decides whether `/lib/modules` may be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Immutability {
+    /// 常规可变系统，直接写入。
+    Mutable,
+    /// OSTree / rpm-ostree 系（Silverblue、Bazzite、MicroOS…）：`/usr` 只读。
+    Ostree,
+    /// NixOS：`/run/current-system` 管理，本工具不支持直接还原。
+    Nix,
+    /// `/usr` 以只读方式挂载（但非 OSTree）。
+    ReadOnlyUsr,
+}
+
+impl Immutability {
+    /// 稳定的机器可读标识（写入 manifest）。
+    /// Stable machine-readable tag written into the manifest.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Immutability::Mutable => "mutable",
+            Immutability::Ostree => "ostree",
+            Immutability::Nix => "nix",
+            Immutability::ReadOnlyUsr => "read-only-usr",
+        }
+    }
+
+    /// 中文说明，供 GUI/CLI 展示。
+    /// Chinese description for the GUI/CLI.
+    pub fn label_zh(&self) -> &'static str {
+        match self {
+            Immutability::Mutable => "常规可变系统",
+            Immutability::Ostree => "OSTree 不可变系统（/usr 只读）",
+            Immutability::Nix => "NixOS（声明式，不支持直接还原）",
+            Immutability::ReadOnlyUsr => "/usr 只读挂载",
+        }
+    }
+}
+
+/// 探测目标系统是否不可变：先看 OSTree/Nix 标志文件，再看 `/usr` 挂载选项。
+/// Detect immutability: OSTree/Nix markers first, then the `/usr` mount options.
+pub fn immutability() -> Immutability {
+    if Path::new("/run/ostree-booted").exists() {
+        return Immutability::Ostree;
+    }
+    if Path::new("/run/current-system").exists() {
+        return Immutability::Nix;
+    }
+    if usr_is_read_only() {
+        return Immutability::ReadOnlyUsr;
+    }
+    Immutability::Mutable
+}
+
+/// `/proc/mounts` 中承载 `/usr` 的条目是否带 `ro` 选项。
+/// Whether the mount entry backing `/usr` carries the `ro` option.
+fn usr_is_read_only() -> bool {
+    let Ok(content) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    // 选择挂载点最长的匹配项（`/usr` 可能被单独挂载），并做八进制转义还原。
+    let mut best: Option<(usize, bool)> = None;
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let _dev = fields.next();
+        let Some(mount_point) = fields.next() else { continue };
+        let _fstype = fields.next();
+        let Some(options) = fields.next() else { continue };
+        let mount_point = mount_point.replace("\\040", " ");
+        let is_usr = mount_point == "/usr" || mount_point == "/";
+        if !is_usr {
+            continue;
+        }
+        let ro = options.split(',').any(|o| o == "ro");
+        if best.is_none_or(|(len, _)| mount_point.len() > len) {
+            best = Some((mount_point.len(), ro));
+        }
+    }
+    best.is_some_and(|(_, ro)| ro)
+}
+
+/// Secure Boot 与模块签名强制状态。
+/// Secure Boot state plus whether the kernel enforces module signatures.
+#[derive(Debug, Clone, Default)]
+pub struct SecureBootState {
+    /// 固件 Secure Boot 是否开启（`mokutil --sb-state`）。
+    pub enabled: bool,
+    /// 内核是否强制要求签名（`CONFIG_MODULE_SIG_FORCE` / `module.sig_enforce=1`）。
+    pub sig_enforce: bool,
+}
+
+impl SecureBootState {
+    /// 转为可写入 manifest 的紧凑结构。
+    /// Convert into the compact structure stored in the manifest.
+    pub fn to_info(&self) -> crate::model::SecureBootInfo {
+        crate::model::SecureBootInfo {
+            enabled: self.enabled,
+            sig_enforce: self.sig_enforce,
+        }
+    }
+}
+
+/// 探测 Secure Boot 与签名强制状态；任何一步失败都退化为"未开启/未强制"。
+/// Probe Secure Boot and signature enforcement; failures degrade to "off".
+pub fn secure_boot_state() -> SecureBootState {
+    SecureBootState {
+        enabled: secure_boot_enabled(),
+        sig_enforce: module_sig_enforced(),
+    }
+}
+
+/// 通过 `mokutil --sb-state` 判断 Secure Boot；无 EFI 变量时直接判定为关闭。
+/// Query Secure Boot through `mokutil --sb-state`; without EFI variables it is off.
+fn secure_boot_enabled() -> bool {
+    if !Path::new("/sys/firmware/efi").exists() {
+        return false;
+    }
+    let Ok(output) = std::process::Command::new("mokutil")
+        .arg("--sb-state")
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    text.contains("secureboot enabled") || text.contains("secure boot enabled")
+}
+
+/// 判断内核是否强制要求模块签名：先看 `/sys/module/module/parameters/sig_enforce`，
+/// 再看 `/proc/cmdline` 的 `module.sig_enforce=1`。
+/// Whether module signing is enforced: sysfs parameter first, then the kernel cmdline.
+fn module_sig_enforced() -> bool {
+    if let Ok(value) = fs::read_to_string("/sys/module/module/parameters/sig_enforce") {
+        if value.trim() == "Y" || value.trim() == "1" {
+            return true;
+        }
+    }
+    fs::read_to_string("/proc/cmdline")
+        .map(|c| {
+            c.split_whitespace()
+                .any(|a| a == "module.sig_enforce=1" || a == "module.sig_enforce")
+        })
+        .unwrap_or(false)
+}
+
+/// 一对 MOK 密钥（私钥 + DER 证书），用于给还原的模块签名。
+/// A MOK key pair (private key + DER certificate) used to sign restored modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MokKeyPair {
+    /// 私钥路径（应当仅 root 可读）。
+    pub private: PathBuf,
+    /// DER 证书路径。
+    pub certificate: PathBuf,
+}
+
+/// 在常见位置寻找 MOK 密钥对：Debian/Ubuntu 的 `/var/lib/shim-signed/mok/`，
+/// Fedora/RHEL 的 `/etc/pki/akmods/`（`private_key.priv` + `public_key.der`）。
+/// Look for MOK key pairs in the usual places (Debian's shim-signed path and Fedora's akmods).
+pub fn mok_keys() -> Vec<MokKeyPair> {
+    let mut found = Vec::new();
+
+    let debian = Path::new("/var/lib/shim-signed/mok");
+    let priv_key = debian.join("MOK.priv");
+    let cert = debian.join("MOK.der");
+    if priv_key.is_file() && cert.is_file() {
+        found.push(MokKeyPair {
+            private: priv_key,
+            certificate: cert,
+        });
+    }
+
+    let fedora = Path::new("/etc/pki/akmods");
+    let fedora_priv = fedora.join("private_key.priv");
+    let fedora_cert = fedora.join("public_key.der");
+    if fedora_priv.is_file() && fedora_cert.is_file() {
+        found.push(MokKeyPair {
+            private: fedora_priv,
+            certificate: fedora_cert,
+        });
+    }
+
+    found
+}
+
+/// 返回可用的模块签名命令（优先 `kmodsign`，其次内核头里的 `sign-file`）。
+/// Return an available module signing command (`kmodsign` first, then `sign-file`).
+///
+/// 返回值中的 `args_prefix` 形如 `["sha256"]`（`sign-file` 需要算法参数，
+/// `kmodsign` 则不需要，调用方按需拼接 私钥/证书/模块路径）。
+/// The returned `args_prefix` is `["sha256"]` for `sign-file` and empty for `kmodsign`.
+pub fn sign_tool(kernel_release: &str) -> Option<(String, Vec<String>)> {
+    // 两者**都要求**首个参数是哈希算法：
+    //   sign-file sha256 <key> <x509> <module>        （内核源码树 scripts/sign-file）
+    //   kmodsign  sha256 <key> <x509> <module>        （Debian/Ubuntu 的 sbsigntool 版）
+    // 因此统一返回前缀 ["sha256"]，调用方再拼 私钥/证书/模块路径。
+    // 优先 sign-file（各发行版行为一致），其次 kmodsign。
+    let candidates = [
+        format!("/usr/src/linux-headers-{kernel_release}/scripts/sign-file"),
+        format!("/lib/modules/{kernel_release}/build/scripts/sign-file"),
+        format!("/usr/src/kernels/{kernel_release}/scripts/sign-file"),
+    ];
+    for path in candidates {
+        if is_executable(Path::new(&path)) {
+            return Some((path, vec!["sha256".to_string()]));
+        }
+    }
+    if has_cmd("sign-file") {
+        return Some(("sign-file".to_string(), vec!["sha256".to_string()]));
+    }
+    if has_cmd("kmodsign") {
+        return Some(("kmodsign".to_string(), vec!["sha256".to_string()]));
+    }
+    None
+}
+
+/// 取目标内核的参考 `vermagic`（借用该内核任一 in-tree 模块的元数据）。
+/// Reference `vermagic` for the target kernel, borrowed from any in-tree module.
+pub fn reference_vermagic(kernel_release: &str) -> Option<String> {
+    for root in module_roots() {
+        let kernel_dir = root.join(kernel_release).join("kernel");
+        if let Some(module) = first_file_with_prefix(&kernel_dir) {
+            return module_vermagic(&module);        }
+    }
+    None
+}
+
+/// 在目录树中寻找第一个 `*.ko*` 文件（用于取参考 vermagic）。
+/// Find the first `*.ko*` file in a directory tree (used for the reference vermagic).
+fn first_file_with_prefix(dir: &Path) -> Option<PathBuf> {
+    let walker = walkdir::WalkDir::new(dir).max_depth(6).follow_links(false);
+    for entry in walker.into_iter().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_file() && is_module_path(path) {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+/// 内核模块的压缩后缀白名单（`.ko` 之外的部分由调用方拼接）。
+/// Compression suffixes recognised for kernel modules (the `.ko` part is added by callers).
+pub const MODULE_COMPRESSION_SUFFIXES: [&str; 7] =
+    [".xz", ".zst", ".zstd", ".gz", ".bz2", ".lzo", ".lz4"];
+
+/// 路径是否形如内核模块（`.ko` 及其压缩变体）。
+/// Whether a path looks like a kernel module (`.ko` plus compressed variants).
+pub fn is_module_path(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.ends_with(".ko")
+        || MODULE_COMPRESSION_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(&format!(".ko{suffix}")))
+}
+
+/// 读取模块的 `vermagic`（调用 `modinfo`，失败返回 `None`）。
+/// Read a module's `vermagic` via `modinfo`; returns `None` when unavailable.
+pub fn module_vermagic(module: &Path) -> Option<String> {
+    let output = std::process::Command::new("modinfo")
+        .arg("-F")
+        .arg("vermagic")
+        .arg(module)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// DKMS 重建命令：`dkms install -m <name> -v <version> -k <kver>`。
+/// DKMS rebuild command: `dkms install -m <name> -v <version> -k <kver>`.
+pub fn dkms_install_cmd(name: &str, version: &str, kernel_release: &str) -> Option<SystemCmd> {
+    has_cmd("dkms").then(|| SystemCmd {
+        program: "dkms".to_string(),
+        args: vec![
+            "install".to_string(),
+            // `--force`：已装过的模块也真正重建（否则 DKMS 会提示
+            // "already installed … skip" 并直接返回 0，等于没重建）。
+            "--force".to_string(),
+            "-m".to_string(),
+            name.to_string(),
+            "-v".to_string(),
+            version.to_string(),
+            "-k".to_string(),
+            kernel_release.to_string(),
+        ],
+    })
+}
+
+/// Fedora 系重建命令：`akmods --force --kernels <kver>`。
+/// Fedora rebuild command: `akmods --force --kernels <kver>`.
+pub fn akmods_cmd(kernel_release: &str) -> Option<SystemCmd> {
+    has_cmd("akmods").then(|| SystemCmd {
+        program: "akmods".to_string(),
+        args: vec![
+            "--force".to_string(),
+            "--kernels".to_string(),
+            kernel_release.to_string(),
+        ],
+    })
+}
+
+/// 重装来源包：Debian 用 `apt-get install --reinstall`，RPM 用 `dnf reinstall`。
+/// Reinstall a provenance package: `apt-get install --reinstall` or `dnf reinstall`.
+pub fn reinstall_cmd(manager: &str, package: &str) -> Option<SystemCmd> {
+    match manager {
+        "dpkg" if has_cmd("apt-get") => Some(SystemCmd {
+            program: "apt-get".to_string(),
+            args: vec![
+                "install".to_string(),
+                "--reinstall".to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
+        }),
+        "rpm" if has_cmd("dnf") => Some(SystemCmd {
+            program: "dnf".to_string(),
+            args: vec![
+                "reinstall".to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
+        }),
+        "rpm" if has_cmd("yum") => Some(SystemCmd {
+            program: "yum".to_string(),
+            args: vec![
+                "reinstall".to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// RHEL/SUSE 的 `weak-modules --add-modules`（模块列表经 stdin 传入）。
+/// RHEL/SUSE `weak-modules --add-modules`, with the module list fed on stdin.
+pub fn weak_modules_cmd() -> Option<SystemCmd> {
+    has_cmd("weak-modules").then(|| SystemCmd {
+        program: "weak-modules".to_string(),
+        args: vec!["--add-modules".to_string()],
+    })
+}
+
+/// 触发 `pkexec` 时使用的策略：由调用方拼接 `pkexec <self> --helper-restore …`。
+/// The elevation entry point is assembled by the caller (`pkexec <self> --helper-restore …`).
+pub fn pkexec_available() -> bool {
+    has_cmd("pkexec")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn immutability_tags_and_labels_are_stable() {
+        assert_eq!(Immutability::Mutable.tag(), "mutable");
+        assert_eq!(Immutability::Ostree.tag(), "ostree");
+        assert_eq!(Immutability::Nix.tag(), "nix");
+        assert_eq!(Immutability::ReadOnlyUsr.tag(), "read-only-usr");
+        for v in [
+            Immutability::Mutable,
+            Immutability::Ostree,
+            Immutability::Nix,
+            Immutability::ReadOnlyUsr,
+        ] {
+            assert!(!v.label_zh().is_empty());
+        }
+        // 本机为常规可变系统（CI/开发机均如此）；只断言不 panic 且来自四态之一
+        let detected = immutability();
+        assert!(matches!(
+            detected,
+            Immutability::Mutable
+                | Immutability::Ostree
+                | Immutability::Nix
+                | Immutability::ReadOnlyUsr
+        ));
+        // Secure Boot 探测也不得 panic（本机为关闭态）
+        let sb = secure_boot_state();
+        let info = sb.to_info();
+        assert_eq!(info.enabled, sb.enabled);
+        assert_eq!(info.sig_enforce, sb.sig_enforce);
+    }
+
+    #[test]
+    fn module_path_detection_covers_compressed_variants() {
+        for ok in [
+            "/lib/modules/6.8/x.ko",
+            "/lib/modules/6.8/x.ko.zst",
+            "/lib/modules/6.8/x.ko.xz",
+            "/lib/modules/6.8/x.ko.zstd",
+            "/lib/modules/6.8/x.ko.gz",
+            "/lib/modules/6.8/x.ko.lz4",
+        ] {
+            assert!(is_module_path(Path::new(ok)), "{ok} 应被识别为模块");
+        }
+        for bad in ["/lib/modules/6.8/README", "/etc/modprobe.d/x.conf"] {
+            assert!(!is_module_path(Path::new(bad)), "{bad} 不应被识别为模块");
+        }
+    }
+
+    #[test]
+    fn sign_tool_prefix_is_hash_algorithm() {
+        // 无论选到 sign-file 还是 kmodsign，前缀都必须是 ["sha256"]
+        if let Some((program, prefix)) = sign_tool(&kernel_release()) {
+            assert!(!program.is_empty());
+            assert_eq!(prefix, vec!["sha256".to_string()]);
+        }
+        // 伪造一个不存在的内核版本时不应 panic（可能回退到 PATH 上的 sign-file）
+        let _ = sign_tool("0.0.0-nonexistent-kernel");
+    }
+
+    #[test]
+    fn reinstall_command_maps_package_managers() {
+        // 本机为 Debian 系：dpkg 应映射到 apt-get install --reinstall
+        if has_cmd("apt-get") {
+            let cmd = reinstall_cmd("dpkg", "foo-dkms").expect("应能构造 apt-get 命令");
+            assert_eq!(cmd.program, "apt-get");
+            assert!(cmd.args.contains(&"--reinstall".to_string()));
+            assert!(cmd.args.contains(&"foo-dkms".to_string()));
+        }
+        // 未知包管理器一律返回 None（不猜）
+        assert!(reinstall_cmd("pacman", "foo").is_none());
+        assert!(reinstall_cmd("", "foo").is_none());
+    }
+
+    #[test]
+    fn mok_keys_are_valid_pairs_when_present() {
+        for pair in mok_keys() {
+            assert!(pair.private.is_file(), "私钥必须存在：{:?}", pair.private);
+            assert!(pair.certificate.is_file(), "证书必须存在：{:?}", pair.certificate);
+        }
+    }
+
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {

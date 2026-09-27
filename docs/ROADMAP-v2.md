@@ -515,6 +515,38 @@ modinfo -F vermagic          ──▶   与目标内核 vermagic 比对
 
 ---
 
+## 17. v0.2.0 实施记录 / v0.2.0 implementation record
+
+> 记录 P0 计划的**落地情况与验证证据**（写于 v0.2.0 发布前）。
+
+| 项 | 状态 | 落地内容 | 验证方式 |
+|---|---|---|---|
+| P0-1 符号链接语义 | ✅ | `EntryKind::Symlink`；备份不再实体化链接；还原按受管前缀校验后重建；`/etc` 配置别名（含绝对目标）原样还原 | 单测 + **本机实测**：`/etc/modprobe.d/blacklist-oss.conf -> /lib/linux-sound-base/…`（绝对目标）与 `etc/modules-load.d/modules.conf -> ../modules` 均正确重建 |
+| P0-2 Secure Boot | ✅ | 探测 SB/`sig_enforce`；记录 `vermagic`/`sig_id`/`sig_key`；还原前比对 vermagic；SB 开启时用 MOK 自动签名；强制签名却仍无签名 → 报错 | **本机实测**：临时自签密钥与**系统真实 MOK 密钥**（root）分别用 `kmodsign sha256 …` 与 `sign-file sha256 …` 签名成功，`modinfo -F sig_id = PKCS#7`、vermagic 完好 |
+| P0-3 不可变系统 | ✅ | `immutability()` 探测 OSTree/Nix/只读 `/usr`；默认拒绝直写并给替代路径；`--on-immutable usroverlay` 为临时覆盖（明确警告重启失效） | 单测覆盖 tag/label；**真机（Atomic/NixOS）验证留待 QEMU/实机** |
+| P0-4 重建优先 | ✅ | 决策树：DKMS/`akmods --force` → 重装包 → `weak-modules --add-modules` → 拷贝；**失败自动降级拷贝** | **本机实测**：standard 模式 `v4l2loopback` 命中"重建"；非 root 时 DKMS 失败并自动回退拷贝（落盘 38 文件，sha256 与源一致）；root 下 `dkms install` 走通（已装模块提示 skip） |
+| P0-5 来源包 | ✅ | `dpkg-query -S` / `rpm -qf` 批量查询（分片 + 版本批量），写入 `owner`；还原优先重装 | 单测（含 diversion 脏行）；**本机实测**：手工安装的 `vmmon.ko` 正确判为无来源包 → 策略=拷贝 |
+| P0-6 事务与回滚 | ✅ | 同目录暂存 + 原子 `rename`；覆盖前移入回滚区；JSON 日志；失败自动逆序回滚；`--rollback last`；按 `keep_rollback` 裁剪 | **端到端实测**：还原 39 项后 `--rollback last` → "恢复 1 个原文件，删除 39 个新增文件"，预置内容原样回归、新增模块清除 |
+| 归档格式 v2 | ✅ | `format_version=2` + `kernel_vermagic`/`immutability`/`secure_boot`/`compression`/`dkms[]` + 每条目 v2 字段；v1 仍可读 | 单测：v1 最小 JSON 可读并补默认值；v2 字段往返；未来版本号被拒 |
+
+**相对计划的调整 / Deviations**
+1. **P1-1（离线 `--root`）提前落地**：为让事务/回滚可在本机端到端验证，`--root` 与 `--chroot-exec` 提前到 0.2.0；写 `/` 仍需 root，写 `--root` 目录按该目录权限判定。
+2. **P1-4（polkit policy）仍留 0.3.0**：GUI 在缺少 `pkexec` 时给出明确指引。
+3. **P1-3（固件按需收集）仍留 0.3.0**：`content_stored=false` 机制已就位（包提供的固件只记清单），精确按 `modinfo -F firmware` 收集待 0.3.0。
+
+**尚未在真实环境验证（诚实声明）/ Not yet verified**
+- Secure Boot **开启**下的完整链路（OVMF + MOK 的 QEMU 场景）：签名命令已实测，但"SB 开启 → 还原 → 内核接受模块"需真机/虚拟机。
+- OSTree（Silverblue/Bazzite/MicroOS）与 NixOS 上的还原行为（本机为常规可变系统）。
+- RHEL/SUSE 上 `weak-modules --add-modules` 的接受度（本机无该命令）。
+- UKI（`ukify`/`kernel-install`）重建与重签流程。
+- RPM 侧来源包重装（本机无 `rpm`/`dnf`）。
+
+**质量基线 / Baseline**：`cargo test` **102 项全绿**；`cargo clippy --all-targets -- -D warnings` **零告警**；`cargo build --release` 通过。
+
+---
+
+## 附录 A：与竞品功能对比矩阵 / Appendix A: Feature matrix
+
 | 功能 | v0.1.2 | 0.2.0(计划) | DKMS | akmods | weak-modules | Timeshift | fwupd | Clonezilla | DISM |
 |---|---|---|---|---|---|---|---|---|---|
 | OOT 模块备份 | ✅ | ✅ | 源码 ✅ | 源码 ✅ | — | 快照 ⚠️ | — | 镜像 ✅ | ✅ |

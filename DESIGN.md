@@ -524,6 +524,98 @@ linux-driver-backup --helper-restore --archive <f> …     # 仅由 pkexec 调�
 
 ---
 
+### 5.8 v0.2.0 增补契约 / v0.2.0 contract addendum
+
+> 依 ROADMAP-v2 §3 的 P0 计划实现；**归档格式 v2**，并保证 v1 归档仍可读（serde 默认值补齐）。
+
+**`model.rs`（新增/变更）**
+
+```rust
+pub enum EntryKind { Module, Dkms, Config, Firmware, Symlink }      // +Symlink
+pub struct Provenance { pub manager: String, pub package: String, pub version: String }
+pub struct ModInfo { pub vermagic: Option<String>, pub depends: Vec<String>,
+                     pub firmware: Vec<String>, pub sig_id: Option<String>, pub sig_key: Option<String> }
+impl ModInfo { pub fn is_signed(&self) -> bool; }
+pub enum RestoreStrategy { Rebuild, Reinstall, WeakModules, Copy, Skip }
+impl RestoreStrategy { pub fn label_zh(&self) -> &'static str; }
+pub struct SecureBootInfo { pub enabled: bool, pub sig_enforce: bool }
+pub struct DkmsPackage { pub name: String, pub version: String }
+
+pub struct ScanEntry  { /* 既 4 字段 */ pub link_target: Option<String>, pub owner: Option<Provenance>,
+                        pub modinfo: Option<ModInfo>, pub content_stored: bool }
+pub struct ScanReport { /* 既 4 字段 */ pub dkms: Vec<DkmsPackage> }
+pub struct ManifestEntry { /* 既 4 字段 */ pub link_target: Option<String>, pub owner: Option<Provenance>,
+                            pub modinfo: Option<ModInfo>, pub content_stored: bool,
+                            pub strategy_hint: Option<RestoreStrategy> }
+pub struct Manifest { /* 既字段 */ pub kernel_vermagic: Option<String>, pub immutability: Option<String>,
+                       pub secure_boot: Option<SecureBootInfo>, pub compression: Option<String>,
+                       pub dkms: Vec<DkmsPackage> }
+impl Manifest { pub fn format_supported(&self) -> bool; pub fn is_legacy_v1(&self) -> bool; }
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;      // v2
+pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 1;  // 仍可读 v1
+```
+
+**`distro.rs`（新增）**
+
+```rust
+pub enum Immutability { Mutable, Ostree, Nix, ReadOnlyUsr }
+impl Immutability { pub fn tag(&self) -> &'static str; pub fn label_zh(&self) -> &'static str; }
+pub struct SecureBootState { pub enabled: bool, pub sig_enforce: bool }
+impl SecureBootState { pub fn to_info(&self) -> crate::model::SecureBootInfo; }
+pub struct MokKeyPair { pub private: PathBuf, pub certificate: PathBuf }
+
+pub fn immutability() -> Immutability;                 // /run/ostree-booted、/run/current-system、/usr ro
+pub fn secure_boot_state() -> SecureBootState;         // mokutil --sb-state + sig_enforce
+pub fn mok_keys() -> Vec<MokKeyPair>;                  // /var/lib/shim-signed/mok、/etc/pki/akmods
+pub fn sign_tool(kver: &str) -> Option<(String, Vec<String>)>;   // kmodsign / sign-file
+pub fn reference_vermagic(kver: &str) -> Option<String>;
+pub fn is_module_path(path: &Path) -> bool;
+pub const MODULE_COMPRESSION_SUFFIXES: [&str; 7];
+pub fn dkms_install_cmd(name: &str, version: &str, kver: &str) -> Option<SystemCmd>;
+pub fn akmods_cmd(kver: &str) -> Option<SystemCmd>;
+pub fn reinstall_cmd(manager: &str, package: &str) -> Option<SystemCmd>;
+pub fn weak_modules_cmd() -> Option<SystemCmd>;
+```
+
+**`restore.rs`（新增/变更）**
+
+```rust
+pub enum ImmutablePolicy { Refuse, Usroverlay }
+pub struct RestoreJournal { pub created_at: String, pub target_kver: String,
+                            pub root: String, pub entries: Vec<JournalEntry> }
+impl RestoreJournal { pub fn save(&self, path: &Path) -> AppResult<()>;
+                      pub fn load(path: &Path) -> AppResult<Self>; }
+pub struct RollbackReport { pub restored: usize, pub removed: usize, pub notes: Vec<String> }
+pub const DEFAULT_KEEP_ROLLBACK: usize = 3;
+
+pub struct RestoreRequest { /* 既字段 */ pub root: Option<PathBuf>,
+    pub strategy: Option<RestoreStrategy>, pub on_immutable: ImmutablePolicy,
+    pub strict_links: bool, pub no_sign: bool, pub chroot_exec: bool,
+    pub keep_rollback: usize }
+// 注意：RestoreRequest 现在实现 Default（便于 `..Default::default()` 构造）
+
+pub struct RestoreReport { /* 既字段 */ pub links_written: usize, pub rebuilt: usize,
+    pub reinstalled: usize, pub signed: usize, pub unsigned_left: usize,
+    pub rollback_journal: Option<PathBuf>, pub strategy_counts: Vec<(String, usize)> }
+
+pub fn run_rollback(root: &Path, journal: Option<&Path>, progress: ProgressFn) -> AppResult<RollbackReport>;
+pub fn latest_journal(root: &Path) -> Option<PathBuf>;
+```
+
+**`main.rs`（CLI 增补）**
+
+```
+--restore … [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]
+            [--on-immutable refuse|usroverlay] [--strict-links] [--no-sign] [--chroot-exec]
+--rollback [last|<id>] [--root <dir>]
+```
+
+> 还原顺序（v0.2.0）：**inspect → 内核/架构/vermagic 校验 → 权限 → 不可变系统闸门 →
+> 事务化解压（符号链接 / 来源包 / 回滚日志）→ 重建(DKMS/akmods) → 重装包 → weak-modules →
+> depmod → restorecon → Secure Boot 签名 → initramfs → 汇总**。
+
+---
+
 ## 6. 测试与验收 / Testing & Acceptance
 
 1. `cargo build --release` 无 error；`cargo clippy -- -D warnings` 尽量通过。

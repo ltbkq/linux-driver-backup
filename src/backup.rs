@@ -82,10 +82,11 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 use tar::{Builder as TarBuilder, EntryType, Header};
 
-use crate::distro::DistroInfo;
+use crate::distro::{DistroInfo, Family};
 use crate::model::{
-    human_size, is_safe_kernel_version, AppError, AppResult, BackupMode, Manifest, ManifestDistro,
-    ManifestEntry, ProgressFn, ScanEntry, ScanReport, MANIFEST_FORMAT_VERSION,
+    human_size, is_safe_kernel_version, AppError, AppResult, BackupMode, DkmsPackage, EntryKind,
+    Manifest, ManifestDistro, ManifestEntry, ProgressFn, RestoreStrategy, ScanEntry, ScanReport,
+    MANIFEST_FORMAT_VERSION,
 };
 use crate::scan::{scan, ScanOptions};
 
@@ -529,7 +530,15 @@ fn hasher_main(
             // Walker 已结束：本线程退出并释放发送端。
             Err(_) => return,
         };
-        match hash_file(&entry.abs_path, pipe) {
+        // 符号链接不读取目标：哈希"链接目标字符串"本身（P0-1 归档侧）。
+        // Symlinks do not open their target: hash the link target string instead.
+        let hash_result = if entry.kind == EntryKind::Symlink {
+            let target = entry.link_target.as_deref().unwrap_or("");
+            Ok((sha256_hex(target.as_bytes()), 0))
+        } else {
+            hash_file(&entry.abs_path, pipe)
+        };
+        match hash_result {
             Ok((sha256, hashed_bytes)) => {
                 let item = HashedEntry {
                     index,
@@ -585,6 +594,19 @@ fn hash_file(path: &Path, pipe: &Pipeline) -> AppResult<(String, u64)> {
     Ok((sha256, total))
 }
 
+/// 计算任意字节串的 SHA-256（64 位小写十六进制），用于符号链接目标的语义哈希。
+/// Compute the SHA-256 of arbitrary bytes (lowercase hex); used for symlink target hashing.
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        let b = *byte;
+        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Stage 3: Packer
 // ---------------------------------------------------------------------------
@@ -614,6 +636,9 @@ fn packer_main(
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut local_warnings: Vec<String> = Vec::new();
     let mut packed_bytes: u64 = 0;
+    let family = distro.family;
+    // 扫描阶段的 DKMS 清单（首次真正需要时惰性读取，避免与 Walker 写 scan_slot 竞态）。
+    let mut dkms_cache: Option<Vec<DkmsPackage>> = None;
 
     loop {
         if pipe.stopped() {
@@ -643,12 +668,14 @@ fn packer_main(
             packed_bytes += written;
             pipe.bytes_packed.fetch_add(written, Ordering::SeqCst);
             next += 1;
-            manifest_entries.push(ManifestEntry {
-                path: item.entry.rel_path.clone(),
-                size: written,
-                sha256: item.sha256.clone(),
-                kind: item.entry.kind,
-            });
+            let dkms = dkms_cache.get_or_insert_with(|| manifest_dkms(pipe));
+            manifest_entries.push(build_manifest_entry(
+                &item.entry,
+                item.sha256.clone(),
+                written,
+                dkms.as_slice(),
+                family,
+            ));
 
             let entry_total = pipe.entry_total.load(Ordering::SeqCst);
             pipe.emit_progress(&format!(
@@ -696,17 +723,27 @@ fn packer_main(
     };
     warnings.append(&mut local_warnings);
 
+    // DKMS 清单：优先用条目循环里已缓存的副本；空扫描时补读一次。
+    let dkms = dkms_cache.unwrap_or_else(|| manifest_dkms(pipe));
+
     let entry_count = manifest_entries.len();
     let now = unix_now();
+    // 运行时探测只影响 manifest 的元数据，失败即 `None`，绝不影响打包主流程。
+    // Runtime probes only feed manifest metadata; failures degrade to `None` and never abort packing.
     let manifest = Manifest {
         format_version: MANIFEST_FORMAT_VERSION,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: utc_timestamp(now, false),
         kernel_release: kver.to_string(),
+        kernel_vermagic: crate::distro::reference_vermagic(kver),
         arch: std::env::consts::ARCH.to_string(),
         distro: ManifestDistro::from_distro(distro),
+        immutability: Some(crate::distro::immutability().tag().to_string()),
+        secure_boot: Some(crate::distro::secure_boot_state().to_info()),
         mode,
+        compression: Some("gzip".to_string()),
         entries: manifest_entries,
+        dkms,
         warnings,
     };
 
@@ -743,8 +780,106 @@ fn packer_main(
     })
 }
 
-/// 把一个条目写进 tar，返回实际写入的字节数。
-/// Append one entry to the tar archive and return the number of bytes written.
+/// 取出扫描阶段的 DKMS 清单；`scan_slot` 为空时返回空表（绝不失败）。
+/// Read the DKMS package list collected during scanning; empty when unavailable.
+fn manifest_dkms(pipe: &Pipeline) -> Vec<DkmsPackage> {
+    heal(&pipe.scan_slot)
+        .as_ref()
+        .map(|r| r.dkms.clone())
+        .unwrap_or_default()
+}
+
+/// 由扫描条目构造 manifest 记录：透传 v2 字段并计算 [`RestoreStrategy`] 提示。
+/// Build a manifest record from a scanned entry, carrying v2 metadata and the strategy hint.
+fn build_manifest_entry(
+    entry: &ScanEntry,
+    sha256: String,
+    size: u64,
+    dkms: &[DkmsPackage],
+    family: Family,
+) -> ManifestEntry {
+    ManifestEntry {
+        path: entry.rel_path.clone(),
+        size,
+        sha256,
+        kind: entry.kind,
+        link_target: entry.link_target.clone(),
+        owner: entry.owner.clone(),
+        modinfo: entry.modinfo.clone(),
+        content_stored: entry.content_stored,
+        strategy_hint: strategy_hint(entry, dkms, family),
+    }
+}
+
+/// 计算模块条目的建议还原策略；非模块条目返回 `None`。
+/// Compute the suggested restore strategy for a module entry; non-modules yield `None`.
+///
+/// 判定顺序（ROADMAP §8 重建决策树在**归档侧**的落点）：
+/// 1. 模块位于 DKMS 目录（`/var/lib/dkms/`、`/usr/src/`），或文件名/路径匹配任一
+///    [`DkmsPackage::name`] → [`RestoreStrategy::Rebuild`]；
+/// 2. 否则来源包已知（`owner.is_some()`）→ [`RestoreStrategy::Reinstall`]；
+/// 3. 否则 RHEL 系 → [`RestoreStrategy::WeakModules`]；
+/// 4. 其余（Debian/Arch/Unknown）→ [`RestoreStrategy::Copy`]。
+///
+/// 只写"提示"，真正执行由 `restore.rs` 决定（本模块不执行任何命令）。
+fn strategy_hint(
+    entry: &ScanEntry,
+    dkms: &[DkmsPackage],
+    family: Family,
+) -> Option<RestoreStrategy> {
+    if entry.kind != EntryKind::Module {
+        return None;
+    }
+    if is_dkms_module(entry, dkms) {
+        return Some(RestoreStrategy::Rebuild);
+    }
+    if entry.owner.is_some() {
+        return Some(RestoreStrategy::Reinstall);
+    }
+    if family == Family::Rhel {
+        return Some(RestoreStrategy::WeakModules);
+    }
+    Some(RestoreStrategy::Copy)
+}
+
+/// 模块是否来自 DKMS：位于 DKMS 目录，或文件名/路径匹配已知包名。
+/// Whether a module originates from DKMS: under a DKMS dir, or matching a package name.
+fn is_dkms_module(entry: &ScanEntry, dkms: &[DkmsPackage]) -> bool {
+    in_dkms_dir(&entry.rel_path)
+        || in_dkms_dir(&entry.abs_path.to_string_lossy())
+        || module_matches_dkms(&entry.rel_path, dkms)
+}
+
+/// 路径（去前导 `/` 后）是否位于 `/var/lib/dkms/` 或 `/usr/src/` 之下。
+/// Whether a path sits under `/var/lib/dkms/` or `/usr/src/` (leading `/` optional).
+fn in_dkms_dir(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+    p.starts_with("var/lib/dkms/") || p.starts_with("usr/src/")
+}
+
+/// 模块文件名/路径是否匹配任一 DKMS 包名（`nvidia` ↔ `nvidia.ko` / `nvidia-uvm.ko`）。
+/// Whether the module file name/path matches any DKMS package name.
+fn module_matches_dkms(rel_path: &str, dkms: &[DkmsPackage]) -> bool {
+    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    dkms.iter().filter(|p| !p.name.is_empty()).any(|p| {
+        rel_path.split('/').any(|seg| seg == p.name)
+            || file_name == p.name
+            || file_name.starts_with(&format!("{}.", p.name))
+            || file_name.starts_with(&format!("{}-", p.name))
+    })
+}
+
+/// 把一个条目写进 tar，返回实际写入内容区的字节数（符号链接与未存储内容均为 0）。
+/// Append one entry to the tar archive and return the bytes written for its content.
+///
+/// 三种分支：
+/// - **符号链接**（`kind == Symlink`）：用 `append_link` 写 tar symlink 条目，
+///   **绝不打开/读取目标文件**；链接目标先经 [`validate_link_target`] 安全校验。
+///   该条目的 `sha256` 由哈希阶段按"链接目标字符串"计算，`size = 0`。
+/// - **`content_stored == false`**：文件由系统包提供（典型为 `linux-firmware`），
+///   此处**不写入 tar 内容、也不打开源文件**，仅由调用方在 `manifest.json` 中保留该条目
+///   （`content_stored=false`）；还原侧据此把动作从"解包"改为"校验该路径已存在"。
+/// - **普通文件**：按 `data/<rel_path>` 写入并比对哈希阶段记录的字节数。
 fn write_entry(
     builder: &mut TarWriter,
     entry: &ScanEntry,
@@ -754,6 +889,34 @@ fn write_entry(
 ) -> AppResult<u64> {
     let rel = entry.rel_path.as_str();
     validate_rel_path(rel)?;
+
+    // 符号链接：写链接条目，不读取目标。
+    if entry.kind == EntryKind::Symlink {
+        let target = entry.link_target.as_deref().ok_or_else(|| {
+            AppError::Format(format!(
+                "符号链接缺少 link_target / missing link target: {rel}"
+            ))
+        })?;
+        validate_link_target(rel, target)?;
+
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        let tar_path = format!("data/{rel}");
+        // append_link 写入 linkname（过长时自动补 GNU 'K' longlink 扩展）并计算校验和；
+        // 条目类型须由调用方显式设为 Symlink（append_link 不会代设）。
+        builder.append_link(&mut header, tar_path.as_str(), target)?;
+        return Ok(0);
+    }
+
+    // 由系统包提供、内容不入库：tar 里不出现该路径，manifest 记录由调用方保留。
+    if !entry.content_stored {
+        return Ok(0);
+    }
 
     let file = File::open(&entry.abs_path)?;
     let meta = file.metadata()?;
@@ -865,6 +1028,92 @@ fn validate_rel_path(rel: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// 受管前缀（`rel_path` 命名空间）：符号链接目标归一化后必须落在其中之一。
+/// Managed prefixes in the `rel_path` namespace; a symlink target must stay within one.
+const MANAGED_LINK_PREFIXES: [&str; 2] = ["lib/modules/", "usr/lib/modules/"];
+
+/// 校验符号链接目标：拒绝绝对路径与越界目标，归一化后须仍落在受管前缀内。
+/// Validate a symlink target: reject absolute or escaping targets; after lexical
+/// normalization it must still reside under a managed prefix.
+///
+/// 允许 `..` 组件（RHEL/SUSE 的 `weak-updates/<m>.ko -> ../../<other-kver>/extra/<m>.ko`
+/// 正依赖它），但以 `link_rel` 所在目录为起点做**纯词法归一化**（不触碰文件系统）：
+/// 一旦越过归档根即判为 [`AppError::Format`]。同时拒绝空目标、含 NUL、以 `/` 开头的目标。
+fn validate_link_target(link_rel: &str, target: &str) -> AppResult<()> {
+    // `/etc` 下存在大量**绝对目标**的系统配置别名（如
+    // /etc/modprobe.d/blacklist-oss.conf -> /lib/linux-sound-base/noOSS.modprobe.conf）。
+    // 链接自身仍写在受管的 /etc 路径下，重建它不会带来额外写权限，
+    // 因此这里只做基本合法性检查，按原样保存。
+    if link_rel.starts_with("etc/") {
+        if target.trim().is_empty() {
+            return Err(AppError::Format(format!(
+                "符号链接目标为空：{}",
+                link_rel
+            )));
+        }
+        return Ok(());
+    }
+    if target.is_empty() {
+        return Err(AppError::Format(format!(
+            "符号链接目标为空 / empty link target: {link_rel}"
+        )));
+    }
+    if target.contains('\0') {
+        return Err(AppError::Format(format!(
+            "符号链接目标含 NUL 字节 / NUL byte in link target: {link_rel}"
+        )));
+    }
+    if target.starts_with('/') {
+        return Err(AppError::Format(format!(
+            "符号链接目标不得为绝对路径 / absolute link target not allowed: {link_rel} -> {target}"
+        )));
+    }
+    let parent = match link_rel.rfind('/') {
+        Some(i) => &link_rel[..i],
+        None => "",
+    };
+    let combined = if parent.is_empty() {
+        target.to_string()
+    } else {
+        format!("{parent}/{target}")
+    };
+    let normalized = normalize_lexical(&combined).ok_or_else(|| {
+        AppError::Format(format!(
+            "符号链接目标越界 / link target escapes archive root: {link_rel} -> {target}"
+        ))
+    })?;
+    if MANAGED_LINK_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        Ok(())
+    } else {
+        Err(AppError::Format(format!(
+            "符号链接目标不在受管前缀内 / link target outside managed prefixes: {link_rel} -> {target}"
+        )))
+    }
+}
+
+/// 词法归一化相对路径（不访问文件系统）；因 `..` 越出根时返回 `None`。
+/// Lexically normalize a relative path (no filesystem access); `None` when `..` escapes the root.
+fn normalize_lexical(path: &str) -> Option<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        None
+    } else {
+        Some(stack.join("/"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 进度与时间工具 / progress & time helpers
 // ---------------------------------------------------------------------------
@@ -967,6 +1216,84 @@ fn sanitize_kver_filename(kver: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModInfo, Provenance};
+    use flate2::read::GzDecoder;
+    use tar::Archive as TarArchive;
+
+    /// 构造一个可传入 `write_entry` 的最小 [`Pipeline`]。
+    fn test_pipeline() -> Pipeline {
+        Pipeline {
+            cancel: Arc::new(AtomicBool::new(false)),
+            abort: Arc::new(AtomicBool::new(false)),
+            first_error: Arc::new(Mutex::new(None)),
+            progress: Arc::new(|_, _| {}),
+            throttle: Arc::new(Mutex::new(ProgressState {
+                last_at: Instant::now(),
+                last_value: f32::NEG_INFINITY,
+            })),
+            bytes_hashed: Arc::new(AtomicU64::new(0)),
+            bytes_packed: Arc::new(AtomicU64::new(0)),
+            total_bytes: Arc::new(AtomicU64::new(0)),
+            entry_total: Arc::new(AtomicUsize::new(0)),
+            scan_slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ldb-backup-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    /// 最小扫描条目（默认普通内容、无 v2 元数据）。
+    fn scan_entry(rel: &str, kind: EntryKind) -> ScanEntry {
+        ScanEntry {
+            abs_path: PathBuf::from(format!("/{rel}")),
+            rel_path: rel.to_string(),
+            size: 0,
+            kind,
+            link_target: None,
+            owner: None,
+            modinfo: None,
+            content_stored: true,
+        }
+    }
+
+    /// 把单条 entry 写进临时 tar.gz，再用 `tar::Archive` 读回（名称, 类型, 链接目标）。
+    fn roundtrip_entry(entry: &ScanEntry) -> (u64, Vec<(String, EntryType, Option<String>)>) {
+        let dir = temp_dir("roundtrip");
+        let out = dir.join("out.tar.gz");
+        let file = File::create(&out).expect("create archive");
+        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+        let pipe = test_pipeline();
+        let mut warnings = Vec::new();
+        let written =
+            write_entry(&mut builder, entry, 0, &pipe, &mut warnings).expect("write entry");
+        let file = builder
+            .into_inner()
+            .expect("into_inner")
+            .finish()
+            .expect("finish");
+        file.sync_all().ok();
+
+        let f = File::open(&out).expect("open archive");
+        let mut archive = TarArchive::new(GzDecoder::new(f));
+        let mut items = Vec::new();
+        for e in archive.entries().expect("entries") {
+            let e = e.expect("entry");
+            let path = e.path().expect("path").to_string_lossy().into_owned();
+            let etype = e.header().entry_type();
+            let link = e
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|p| p.to_string_lossy().into_owned());
+            items.push((path, etype, link));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        (written, items)
+    }
 
     #[test]
     fn rel_path_traversal_is_rejected() {
@@ -1079,5 +1406,295 @@ mod tests {
         assert!(progress_value(100, 0, 1_000) < progress_value(200, 0, 1_000));
         assert!(progress_value(1_000, 100, 1_000) < progress_value(1_000, 200, 1_000));
         assert!(progress_value(500, 0, 1_000) < progress_value(500, 500, 1_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.2.0 新增：strategy_hint（P0-4 归档侧）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strategy_hint_rebuild_for_dkms_path() {
+        // /var/lib/dkms 与 /usr/src 下的模块源码树 → 重建
+        let var_lib = scan_entry(
+            "var/lib/dkms/nvidia/550.129.03/modules/nvidia.ko",
+            EntryKind::Module,
+        );
+        assert_eq!(
+            strategy_hint(&var_lib, &[], Family::Debian),
+            Some(RestoreStrategy::Rebuild)
+        );
+        let usr_src = scan_entry("usr/src/vbox-7.0/source/vbox.ko", EntryKind::Module);
+        assert_eq!(
+            strategy_hint(&usr_src, &[], Family::Debian),
+            Some(RestoreStrategy::Rebuild)
+        );
+    }
+
+    #[test]
+    fn strategy_hint_rebuild_for_dkms_name() {
+        let dkms = vec![DkmsPackage {
+            name: "nvidia".to_string(),
+            version: "550.129.03".to_string(),
+        }];
+        // 编译产物位于 updates/dkms，但文件名匹配 DKMS 包名 → 重建
+        let module = scan_entry(
+            "lib/modules/6.8.0/updates/dkms/nvidia.ko",
+            EntryKind::Module,
+        );
+        assert_eq!(
+            strategy_hint(&module, &dkms, Family::Debian),
+            Some(RestoreStrategy::Rebuild)
+        );
+        // nvidia-uvm 命中 `<name>-` 前缀
+        let uvm = scan_entry(
+            "lib/modules/6.8.0/updates/dkms/nvidia-uvm.ko",
+            EntryKind::Module,
+        );
+        assert_eq!(
+            strategy_hint(&uvm, &dkms, Family::Debian),
+            Some(RestoreStrategy::Rebuild)
+        );
+        // 压缩变体同样命中
+        let zst = scan_entry("lib/modules/6.8.0/extra/nvidia.ko.zst", EntryKind::Module);
+        assert_eq!(
+            strategy_hint(&zst, &dkms, Family::Debian),
+            Some(RestoreStrategy::Rebuild)
+        );
+    }
+
+    #[test]
+    fn strategy_hint_reinstall_when_owner_known() {
+        let mut module = scan_entry("lib/modules/6.8.0/extra/foo.ko", EntryKind::Module);
+        module.owner = Some(Provenance {
+            manager: "dpkg".to_string(),
+            package: "foo-dkms".to_string(),
+            version: "1.0".to_string(),
+        });
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Debian),
+            Some(RestoreStrategy::Reinstall)
+        );
+        // 已知来源包优先于 RHEL 的 weak-modules
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Rhel),
+            Some(RestoreStrategy::Reinstall)
+        );
+    }
+
+    #[test]
+    fn strategy_hint_weak_modules_for_rhel() {
+        let module = scan_entry("lib/modules/6.8.0/extra/foo.ko", EntryKind::Module);
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Rhel),
+            Some(RestoreStrategy::WeakModules)
+        );
+    }
+
+    #[test]
+    fn strategy_hint_copy_and_none() {
+        let module = scan_entry("lib/modules/6.8.0/extra/foo.ko", EntryKind::Module);
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Debian),
+            Some(RestoreStrategy::Copy)
+        );
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Arch),
+            Some(RestoreStrategy::Copy)
+        );
+        assert_eq!(
+            strategy_hint(&module, &[], Family::Unknown),
+            Some(RestoreStrategy::Copy)
+        );
+        // 非模块条目一律 None
+        for (rel, kind) in [
+            ("etc/modprobe.d/foo.conf", EntryKind::Config),
+            ("lib/firmware/vendor/fw.bin", EntryKind::Firmware),
+            ("usr/src/nvidia/x.c", EntryKind::Dkms),
+            ("lib/modules/6.8.0/weak-updates/foo.ko", EntryKind::Symlink),
+        ] {
+            let entry = scan_entry(rel, kind);
+            assert_eq!(strategy_hint(&entry, &[], Family::Rhel), None, "{rel}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.2.0 新增：validate_link_target（P0-1 安全守门）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_link_target_accepts_relative_within_managed() {
+        // weak-updates 的典型形态：指向另一内核的同名模块
+        assert!(validate_link_target(
+            "lib/modules/6.8.0-45-generic/weak-updates/foo.ko",
+            "../../6.8.0-40-generic/extra/foo.ko"
+        )
+        .is_ok());
+        // /usr/lib/modules 前缀同样受管
+        assert!(validate_link_target(
+            "usr/lib/modules/6.8.0/weak-updates/foo.ko",
+            "../../6.8.0-40/extra/foo.ko"
+        )
+        .is_ok());
+        // `/etc` 下的配置别名：相对目标与**绝对目标**都允许原样保存
+        // （真实案例：/etc/modprobe.d/blacklist-oss.conf -> /lib/linux-sound-base/…）
+        assert!(
+            validate_link_target("etc/modprobe.d/alias.conf", "../modprobe.d/other.conf").is_ok()
+        );
+        assert!(validate_link_target(
+            "etc/modprobe.d/blacklist-oss.conf",
+            "/lib/linux-sound-base/noOSS.modprobe.conf"
+        )
+        .is_ok());
+        // 模块目录下仍不允许绝对目标
+        assert!(
+            validate_link_target("lib/modules/6.8/a.ko", "/etc/shadow").is_err()
+        );
+        // 同目录相对目标
+        assert!(validate_link_target("lib/modules/6.8.0/extra/a.ko", "b.ko").is_ok());
+    }
+
+    #[test]
+    fn validate_link_target_rejects_absolute_and_escape() {
+        // 模块目录下的绝对路径目标（如 /etc/shadow）一律拒绝
+        assert!(
+            validate_link_target("lib/modules/6.8.0/weak-updates/foo.ko", "/etc/shadow").is_err()
+        );
+        // `/etc` 下的链接按原样重建（符号链接目标只是字符串，重建它不会产生写权限），
+        // 因此其目标即使是越根的相对路径也**不**在此处拒绝 —— 链接自身的路径由
+        // `safe_rel_path` / `data_payload` 严格校验，这才是防越界写入的关键。
+        assert!(
+            validate_link_target("etc/modprobe.d/x.conf", "../../../../etc/shadow").is_ok()
+        );
+        // 归一化后落在受管前缀之外
+        assert!(validate_link_target(
+            "lib/modules/6.8.0/weak-updates/foo.ko",
+            "../../../../srv/foo.ko"
+        )
+        .is_err());
+        // 空目标 / NUL
+        assert!(validate_link_target("lib/modules/x/a.ko", "").is_err());
+        assert!(validate_link_target("lib/modules/x/a.ko", "bad\0target").is_err());
+        // 越界一律是 AppError::Format
+        match validate_link_target("lib/modules/x/a.ko", "/etc/shadow") {
+            Err(AppError::Format(_)) => {}
+            other => panic!("expected AppError::Format, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.2.0 新增：write_entry（P0-1 符号链接归档 + content_stored=false）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_entry_symlink_is_stored_as_link() {
+        let mut entry = scan_entry("lib/modules/6.8.0/weak-updates/foo.ko", EntryKind::Symlink);
+        entry.link_target = Some("../../6.8.0-40-generic/extra/foo.ko".to_string());
+
+        let (written, items) = roundtrip_entry(&entry);
+        assert_eq!(written, 0, "符号链接不写内容字节，size 记为 0");
+        assert_eq!(items.len(), 1);
+        let (path, etype, link) = &items[0];
+        assert_eq!(path, "data/lib/modules/6.8.0/weak-updates/foo.ko");
+        assert_eq!(*etype, EntryType::Symlink, "tar 内必须是 symlink 条目");
+        assert_eq!(link.as_deref(), Some("../../6.8.0-40-generic/extra/foo.ko"));
+    }
+
+    #[test]
+    fn write_entry_rejects_escaping_symlink() {
+        let mut entry = scan_entry("lib/modules/6.8.0/weak-updates/foo.ko", EntryKind::Symlink);
+        entry.link_target = Some("/etc/shadow".to_string());
+        let dir = temp_dir("badlink");
+        let out = dir.join("out.tar.gz");
+        let file = File::create(&out).unwrap();
+        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+        let pipe = test_pipeline();
+        let mut warnings = Vec::new();
+        match write_entry(&mut builder, &entry, 0, &pipe, &mut warnings) {
+            Err(AppError::Format(_)) => {}
+            other => panic!("expected AppError::Format, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_entry_skips_content_not_stored() {
+        let dir = temp_dir("nostore");
+        let src = dir.join("fw.bin");
+        std::fs::write(&src, b"firmware-bytes").expect("write firmware");
+        let out = dir.join("out.tar.gz");
+        let file = File::create(&out).unwrap();
+        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+
+        let mut entry = scan_entry("lib/firmware/vendor/fw.bin", EntryKind::Firmware);
+        entry.abs_path = src.clone();
+        entry.content_stored = false;
+
+        let pipe = test_pipeline();
+        let mut warnings = Vec::new();
+        let written = write_entry(&mut builder, &entry, 14, &pipe, &mut warnings).unwrap();
+        assert_eq!(written, 0, "content_stored=false 不写内容字节");
+        assert!(warnings.is_empty(), "不应触发大小变化告警: {warnings:?}");
+
+        let file = builder.into_inner().unwrap().finish().unwrap();
+        file.sync_all().ok();
+        let f = File::open(&out).unwrap();
+        let mut archive = TarArchive::new(GzDecoder::new(f));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "data/lib/firmware/vendor/fw.bin"),
+            "tar 内不得出现未存储内容的路径: {names:?}"
+        );
+
+        // manifest 记录仍然生成（build_manifest_entry 负责）
+        let me = build_manifest_entry(&entry, "deadbeef".to_string(), written, &[], Family::Debian);
+        assert_eq!(me.path, "lib/firmware/vendor/fw.bin");
+        assert!(
+            !me.content_stored,
+            "manifest 记录须标记 content_stored=false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_entry_transfers_v2_fields_and_sets_strategy() {
+        let mut entry = scan_entry(
+            "lib/modules/6.8.0/updates/dkms/nvidia.ko",
+            EntryKind::Module,
+        );
+        entry.content_stored = false;
+        entry.link_target = Some("ignored-for-module".to_string());
+        entry.owner = Some(Provenance {
+            manager: "dpkg".to_string(),
+            package: "nvidia-dkms".to_string(),
+            version: "550".to_string(),
+        });
+        entry.modinfo = Some(ModInfo {
+            vermagic: Some("6.8.0-45-generic SMP".to_string()),
+            ..Default::default()
+        });
+        let dkms = vec![DkmsPackage {
+            name: "nvidia".to_string(),
+            version: "550".to_string(),
+        }];
+
+        let me = build_manifest_entry(&entry, "cafe".to_string(), 0, &dkms, Family::Debian);
+        assert_eq!(me.path, entry.rel_path);
+        assert_eq!(me.sha256, "cafe");
+        assert!(!me.content_stored);
+        assert_eq!(me.link_target.as_deref(), Some("ignored-for-module"));
+        assert_eq!(
+            me.owner.as_ref().map(|o| o.package.as_str()),
+            Some("nvidia-dkms")
+        );
+        assert!(me
+            .modinfo
+            .as_ref()
+            .and_then(|m| m.vermagic.as_deref())
+            .is_some());
+        assert_eq!(me.strategy_hint, Some(RestoreStrategy::Rebuild));
     }
 }

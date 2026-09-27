@@ -39,6 +39,50 @@
 - **非破坏性还原 / Non-destructive restore**：还原前可先 `--dry-run` 预演（只打印计划、不写盘）；目标位置已存在同名文件时先备份为 `*.ldbak` 再覆盖；写入完成后强制执行 `depmod -a <kver>`（RHEL 系并补 `restorecon`），最后按发行版自适应更新 initramfs——没有 `depmod` 就不会有 `modules.dep`/`modules.alias`，还原等于无效。*Dry-run preview, `.ldbak` safety copies, mandatory `depmod`, then distro-adaptive initramfs update.*
 - **多线程流水作业 / Pipelined workers**：扫描 → 哈希 → 压缩三段式流水线（`std::thread` + 有界通道背压），进度实时回传、可随时取消，全程不阻塞 UI。*A three-stage pipeline keeps the UI responsive.*
 
+## v0.2.0 新增能力 / What's new in v0.2.0
+
+> 对应 [docs/ROADMAP-v2.md](docs/ROADMAP-v2.md) 的 **P0（正确性与安全）** 计划，归档格式升级为 **v2**（v1 归档仍可读）。
+> Implements the P0 (correctness & security) items of the roadmap; archive format is now **v2** while v1 stays readable.
+
+| 能力 / Capability | 说明 / Details |
+|---|---|
+| **符号链接语义** / correct symlink semantics | 备份不再"实体化"链接；RHEL/SUSE 的 `weak-updates/<m>.ko -> ../../<kver>/extra/…` 与 `/etc` 下的配置别名（含绝对目标）都能原样还原。/ `weak-updates` chains and `/etc` config aliases (including absolute targets) are restored as real symlinks. |
+| **重建优先** / rebuild-first | 还原策略决策树：DKMS 重建（`dkms install` / `akmods --force`）→ 重装来源包（`apt --reinstall` / `dnf reinstall`）→ `weak-modules --add-modules`（RHEL/SUSE）→ 拷贝兜底；失败自动降级为拷贝并提示。/ Automatic strategy selection with transparent fallback to copying. |
+| **Secure Boot 感知与签名** / Secure Boot aware | 记录模块 `vermagic`/`sig_id`；还原前比对 vermagic，SB 开启时用 MOK 密钥（`/var/lib/shim-signed/mok`、`/etc/pki/akmods`）自动签名（`sign-file`/`kmodsign`）；未签名且内核强制签名时报错而非谎报成功。/ Records and verifies vermagic, signs restored modules with the MOK key, refuses to pretend success when signing is enforced. |
+| **不可变系统防护** / immutable distros | 探测 OSTree（Silverblue/Bazzite/MicroOS）与 NixOS：默认**拒绝**直写 `/usr/lib/modules` 并给出替代路径；`--on-immutable usroverlay` 可用临时覆盖层（重启失效，明确警告）。/ Detects immutable distros and refuses unsafe writes by default. |
+| **事务化还原与回滚** / transactional restore | 每条目先写同目录暂存再原子 `rename`，覆盖前把原文件移入回滚区，全程记录 JSON 事务日志；失败自动逆序回滚；`--rollback last` 可撤销上一次还原。/ Atomic per-entry commit, automatic rollback on failure, and `--rollback last`. |
+| **来源包记录** / provenance | 备份时用 `dpkg-query -S` / `rpm -qf` 记录文件来源包，还原时可优先重装包而不是覆盖文件。/ Records package provenance to prefer reinstalling packages. |
+| **离线/救援还原** / offline restore | `--root <目录>` 把归档还原到未启动的系统（Live USB 修复场景），可选 `--chroot-exec` 在目标根内执行 depmod/initramfs。/ Restore into an offline root, optionally executing depmod/initramfs inside it. |
+
+**归档格式 v2 新增字段** / new manifest v2 fields：`kernel_vermagic`、`immutability`、`secure_boot`、`compression`、`dkms[]`、每条目的 `link_target` / `owner` / `modinfo` / `content_stored` / `strategy_hint`。
+
+### 新增命令行参数 / New CLI options
+
+```bash
+# 跨内核按 DKMS 重建（推荐），而不是拷贝 .ko
+linux-driver-backup --restore --archive b.tar.gz --strategy rebuild
+
+# 离线还原到未启动的系统（救援模式，无需 root，按目标目录权限判定）
+linux-driver-backup --restore --archive b.tar.gz --root /mnt/target --yes --no-sign
+
+# 撤销上一次还原
+sudo linux-driver-backup --rollback last
+```
+
+| 参数 / Option | 说明 / Description |
+|---|---|
+| `--strategy auto\|rebuild\|reinstall\|weak-modules\|copy` | 覆盖自动策略选择 / override strategy selection |
+| `--root <dir>` | 离线还原到指定根（救援场景）/ restore into an offline root |
+| `--on-immutable refuse\|usroverlay` | 不可变系统的处置方式 / policy on immutable distros |
+| `--strict-links` | 符号链接目标缺失即报错（默认仅提示）/ fail when a link target is missing |
+| `--no-sign` | 跳过 Secure Boot 签名 / skip module signing |
+| `--chroot-exec` | 在 `--root` 内执行 depmod/initramfs / run depmod/initramfs inside `--root` |
+| `--rollback [last\|<id>]` | 回滚上一次（或指定）还原 / undo a restore |
+
+> ⚠️ Secure Boot 签名需要 MOK 私钥（root-only）。若系统尚未有密钥，请先生成并登记：
+> `openssl req -new -x509 -nodes -newkey rsa:2048 -keyout MOK.priv -outform DER -out MOK.der -days 36500 -subj "/CN=Driver Backup Module Signing/"`，
+> 然后 `sudo mokutil --import MOK.der` 并在重启时完成登记。
+
 ## 界面预览 / Screenshots
 
 GUI 主窗口（扫描 → 选择模式与输出路径 → 备份 / 还原，含 dry-run 开关）：
@@ -263,6 +307,9 @@ driver-backup-<kver>-<YYYYMMDD-HHMMSS>.tar.gz
 - **不备份 in-tree 模块 / In-tree modules are excluded**：`kernel/**` 下由内核包自带的基线模块不在备份范围内——它们随内核包升级即恢复，备份它们既冗余又容易过期。
 - **跨内核还原需确认 ABI / Cross-kernel restore requires ABI confirmation**：从 `6.8` 备份的 `.ko` 还原到 `6.11` 可能因模块 ABI 不兼容而无法加载；程序会比对 `manifest.kernel_release` 并要求二次确认（`allow_kernel_mismatch`），但**是否兼容需自行判断**。
 - **固件体积大 / Firmware can be huge**：`full` 模式包含 `/lib/firmware`，`linux-firmware` 常达数百 MB，备份耗时长、归档体积大；程序会先估算体积并提示，也支持随时取消。
+- **Secure Boot 需自备 MOK 密钥 / Secure Boot requires a MOK key**：本工具不会自动生成私钥；未配置密钥时只给出指引（若内核 `CONFIG_MODULE_SIG_FORCE` 生效则拒绝"假成功"）。
+- **不可变系统仅提供指引 / immutable distros are guidance-only**：OSTree 系统默认拒绝直写，`usroverlay` 为临时手段（重启失效）；NixOS 明确不支持。
+- **离线还原默认不重建 initramfs / offline restore skips depmod by default**：`--root` 模式下需显式 `--chroot-exec` 才会在目标根内执行。
 - **musl 静态版为实验性 / musl static build is experimental**：主线交付 glibc 版（`x86_64` / `aarch64`，在 ubuntu-22.04 上编译以获得更广的 glibc 兼容面）；Slint 软件渲染 + winit 在 musl 上未充分验证，静态版仅作实验用途。
 - **暂无增量与加密 / No incremental or encrypted archives**：首版不做增量备份、不做加密归档，大归档会重复占用磁盘空间（已列入路线图）。
 - **不替代包管理器 / Not a package manager replacement**：不做 DKMS 之外的内核源码编译，不管理内核包升级。
