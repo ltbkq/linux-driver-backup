@@ -97,7 +97,7 @@
 
 ## 2. v0.1.2 现状与差距 / Current state & gaps
 
-### 2.1 现状（实现事实，非设想）
+### 2.1 现状（实现事实，非设想）/ Current implementation facts
 
 - **扫描**：`/lib/modules` + `/usr/lib/modules` 去重遍历；`kernel/**` 视为 in-tree 排除；`updates|extra|extramodules|weak-updates|其它顶层目录` 收为 OOT；识别 `.ko{,.xz,.zst,.gz,.bz2,.lzo,.lz4}`
 - **三种模式**：`minimal`（OOT + `/etc` 配置）、`standard`（+ DKMS 源码）、`full`（+ 整个 `/lib/firmware`）
