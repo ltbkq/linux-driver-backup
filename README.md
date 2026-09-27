@@ -305,6 +305,8 @@ linux-driver-backup-rust/
 
 完整的技术选型、模块接口冻结契约（§5）、测试与验收标准（§6）、CI 与分发（§7）见 **[DESIGN.md](DESIGN.md)**。并行开发时**只允许依赖 §5 的冻结契约**，不得臆造其它模块的 API。
 
+面向**下一版的优化改进方案**（对标 DKMS/akmods/weak-modules/Timeshift/fwupd/DISM 等同类软件，含 P0–P3 分级建议、归档格式 v2 草案、事务化还原与 Secure Boot 签名流程）见 **[docs/ROADMAP-v2.md](docs/ROADMAP-v2.md)**。
+
 ### 常用开发命令 / Common commands
 
 ```bash
