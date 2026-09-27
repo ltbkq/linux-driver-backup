@@ -38,9 +38,39 @@ License:        GPL-3.0-only
 Summary:        Backup and restore out-of-tree (third-party) Linux kernel drivers
 URL:            https://github.com/ltbkq/linux-driver-backup
 
-# 依赖按 DESIGN.md §11.1 手写，W3 用 ldd 复核：
-# glibc 运行时 + winit 运行期 dlopen 的 libxkbcommon / wayland 客户端库
-Requires:       glibc >= 2.35, fontconfig, freetype, libxkbcommon, libxkbcommon-x11, wayland
+# ---------------------------------------------------------------------------
+# 依赖声明 / Runtime dependencies
+#
+# 原则：**硬链接（DT_NEEDED）依赖交给 rpmbuild 自动生成 soname 依赖**
+# （libc.so.6()(64bit)、libfontconfig.so.1()(64bit)、libfreetype.so.6()(64bit) …），
+# 因为它们的提供包名在各发行版一致，自动生成比手写更准确。
+#
+# 只有**运行期 dlopen** 的库（自动生成抓不到）才手写，且必须用发行版真实
+# 二进制包名 —— 这里曾把 `wayland` 当包名写死，导致 Fedora 报
+#   「wayland 被 linux-driver-backup 需要」而无法安装；
+# Fedora/RHEL 上正确的包名是 `libwayland-client`（见下方条件分支）。
+#
+# Verification: `rpm -qpR <包>` 可查看最终生效的 Requires（CI 中有断言防止回退）。
+# ---------------------------------------------------------------------------
+AutoReqProv:    yes
+
+%if 0%{?fedora} || 0%{?rhel} || 0%{?ldb_target_fedora}
+# Fedora / RHEL / Rocky / AlmaLinux / CentOS Stream / openEuler 的真实包名。
+# 注：CI 在 Ubuntu runner 上构建，因此 build-packages.sh 会显式传入
+# `--define "ldb_target_fedora 1"`，让产物带上 Fedora/RHEL 的包名依赖。
+# fontconfig / freetype / glibc 无需手写 —— 它们由上面的 AutoReqProv
+# 自动生成为 soname 依赖（libfontconfig.so.1()(64bit) 等）。
+Requires:       libwayland-client
+Requires:       libxkbcommon
+Requires:       libxkbcommon-x11
+%else
+# 其它 RPM 发行版（如 openSUSE：libwayland-client0 / libxkbcommon0 …）包名不同，
+# 改用 SoName 文件依赖，避免把某一家的包名硬编码到通用 spec 里。
+# x86_64 与 aarch64 在 Fedora/openSUSE 上库目录均为 /usr/lib64。
+Requires:       /usr/lib64/libxkbcommon.so.0
+Requires:       /usr/lib64/libxkbcommon-x11.so.0
+Requires:       /usr/lib64/libwayland-client.so.0
+%endif
 
 # 构建依赖：无 —— 直接安装已编译产物，不在此处编译 Rust
 # BuildRequires: none — pre-built binary is installed directly.

@@ -8,7 +8,7 @@
 
 [package]
 name = "linux-driver-backup"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.83"
 description = "Linux out-of-tree driver (kernel module) backup & restore tool with adaptive distro support"

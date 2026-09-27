@@ -642,6 +642,7 @@ packaging/
 - AppImage 在 CI 需网络下载 appimagetool；失败则降级为只发 deb/rpm/tar（Release 不因此失败，标记 warning）。
 - Flatpak/Snap 首版**只提供 manifest 不做自动发布**（需外部仓库审核，列入路线图）；`packaging/flatpak/*.yml` 待补（§11.1 已标注路线图）。
 - **W3 实测结论（2026-09-27，Linux Mint 22.3 / glibc 2.39）**：`ldd` 显示的**硬链接**依赖为 `libc6` + `libfontconfig1` + `libfreetype6`；`LD_DEBUG=libs` 实测的**运行期 dlopen** 依赖为 `libxkbcommon.so.0`、`libxkbcommon-x11.so.0`（X11 会话）与 `libwayland-client`（Wayland 会话）。deb/rpm 的依赖字段与 README 运行时依赖表均已按实测更新（首版手写清单漏了 fontconfig/freetype 与 xkbcommon-x11，已补齐）。
+- **RPM 依赖包名（v0.1.2 修复）**：初版 spec 把 `wayland` 当作 Requires 包名，Fedora 上不存在该包（提供 `libwayland-client.so.0` 的包名为 `libwayland-client`），导致 `rpm -ivh` 报「wayland 被 linux-driver-backup 需要」而拒绝安装。现策略：**硬链接依赖由 `AutoReqProv` 自动生成 soname 依赖**（`libfontconfig.so.1()(64bit)` 等），只手写运行期 dlopen 的库，并按 `%if 0%{?fedora} || 0%{?rhel} || 0%{?ldb_target_fedora}` 使用 Fedora/RHEL 真实包名；其它 RPM 发行版退化为 SoName 文件依赖。CI 增加回归断言：Requires 中不得出现裸 `wayland`，且必须含自动生成的 `libfontconfig.so.1`。
 - **lintian 全绿待办**（W4-H 实测本机 lintian 报 3E1W：`copyright-contains-full-gpl-license`、`copyright-not-using-common-license-for-gpl`、`no-changelog`、`no-manual-page`）：首版以「LICENSE 全文即 copyright」为准，不影响安装；路线图为改用 DEP-5 短 copyright + 单列 `LICENSE`、补 `changelog.Debian.gz`（版本加 `-1` 修订位）、补 man page。
 - `AppDir/usr/bin` 为构建产物不入库，`packaging/appimage/AppDir/` 只入库 `AppRun` 骨架。
 - RPM `Source0` 首版不声明（声明后 rpmbuild 强制校验 `_sourcedir` 同名源码包），CI 走 `%build` 留空 + 拷入二进制；将来发 SRPM 时再启用。

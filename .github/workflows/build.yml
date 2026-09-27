@@ -319,6 +319,27 @@ jobs:
           # 报告 rpm 是否产出（rpmbuild 若失败，前面步骤已失败；这里只做清单展示）
           ls dist/*.rpm 2>/dev/null || echo "::warning::未产出 rpm（检查 rpmbuild 步骤日志）"
 
+          # --- RPM 依赖回归断言 / RPM dependency regression guard ---
+          # 历史故障：spec 把 `wayland` 当包名写死 → Fedora 上 rpm -ivh 报
+          #   「wayland 被 linux-driver-backup 需要」而拒绝安装（Fedora 无此包，
+          #   提供 libwayland-client.so.0 的包名是 libwayland-client）。
+          # 这里断言最终 Requires 里不出现裸 `wayland`，且硬链接依赖已由 rpmbuild
+          # 自动生成为 soname（libfontconfig.so.1 / libfreetype.so.6）。
+          for f in dist/*.rpm; do
+            [ -e "$f" ] || continue
+            echo "--- $(basename "$f") 的 Requires / requires ---"
+            reqs="$(rpm -qpR "$f")"
+            printf '%s\n' "$reqs"
+            if printf '%s\n' "$reqs" | awk '{print $1}' | grep -qx 'wayland'; then
+              echo "::error::$(basename "$f") 的 Requires 含非法包名 wayland（Fedora 不存在该包，应为 libwayland-client）"
+              exit 1
+            fi
+            if ! printf '%s\n' "$reqs" | grep -q 'libfontconfig\.so\.1'; then
+              echo "::error::$(basename "$f") 缺少自动生成的 libfontconfig.so.1 依赖（检查 AutoReqProv / rpmdeps）"
+              exit 1
+            fi
+          done
+
       - name: 上传打包产物 / Upload packages
         uses: actions/upload-artifact@v4
         with:

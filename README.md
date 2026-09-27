@@ -70,6 +70,13 @@ GUI 主窗口（扫描 → 选择模式与输出路径 → 备份 / 还原，含
 
 说明 / Notes：
 
+- **v0.1.1 的 RPM 在 Fedora 上的已知问题**：该版本把 `wayland` 写成了 RPM 依赖名，而
+  Fedora 并无此包（提供 `libwayland-client.so.0` 的是 `libwayland-client`），因此
+  `sudo rpm -ivh …x86_64.rpm` 会报「wayland 被 linux-driver-backup 需要」。
+  **v0.1.2 起已修正**（硬链接依赖交由 rpmbuild 自动生成 soname 依赖，只显式声明
+  dlopen 的 `libwayland-client` / `libxkbcommon` / `libxkbcommon-x11`）；
+  在修复前如需应急安装，可用 `sudo rpm -ivh --nodeps <包>`（依赖库在桌面版 Fedora 上均已存在）。
+
 - 无需 root 的方式：**AppImage** 与 **`tar.gz` + `install.sh`（装到自己的前缀）**；`.deb` / `.rpm` 装进 `/usr` 需要 sudo。
 - 卸载 / Uninstall：
   - Debian 系：`sudo apt remove linux-driver-backup`（或 `sudo dpkg -r linux-driver-backup`）

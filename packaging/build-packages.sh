@@ -241,7 +241,13 @@ build_rpm() {
   install -m 0644 "$LICENSE" "$top/SOURCES/LICENSE"
 
   info "[rpm 3/3] rpmbuild -bb --target $ARCH_RPM"
-  rpmbuild -bb --target "$ARCH_RPM" --define "_topdir $top" "$top/SPECS/$NAME.spec"
+  # `ldb_target_fedora` 让 spec 走 Fedora/RHEL 的包名分支：CI 在 Ubuntu 上构建，
+  # 若不显式指定，%{?fedora}/%{?rhel} 均未定义，会退化成 SoName 文件依赖
+  # （虽可用，但与 README 声明的 Fedora/RHEL 目标不符）。
+  rpmbuild -bb --target "$ARCH_RPM" \
+    --define "_topdir $top" \
+    --define "ldb_target_fedora 1" \
+    "$top/SPECS/$NAME.spec"
   out="$(find "$top/RPMS" -name '*.rpm' -type f | head -n1)"
   if [[ -z "$out" ]]; then
     err "rpmbuild 未产出 rpm 文件。"
