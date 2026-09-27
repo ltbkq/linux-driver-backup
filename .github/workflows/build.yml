@@ -205,12 +205,15 @@ jobs:
       - name: 检出源码 / Checkout
         uses: actions/checkout@v4
 
-      - name: 下载 x86_64 二进制产物 / Download x86_64 artifact
-        # 只取 x86_64：deb/rpm/AppImage 首版仅产出 x86_64（aarch64 的二进制仍随 release 发布）
+      - name: 下载两个架构的二进制产物 / Download both arch artifacts
+        # 同时打包 amd64 与 arm64：dpkg-deb 与 rpmbuild 都只做「元数据 + 文件」组装，
+        # 不校验机器码，因此可在 x86_64 runner 上直接为 aarch64 二进制出包
+        # （DESIGN.md §11.1）。AppImage 仅 x86_64（见下一步）。
         uses: actions/download-artifact@v4
         with:
-          name: linux-driver-backup-x86_64-unknown-linux-gnu
-          path: artifact-x86_64
+          pattern: linux-driver-backup-*-unknown-linux-gnu
+          merge-multiple: true
+          path: artifacts
 
       - name: 安装 rpmbuild / Install rpm tooling
         # `rpm` 包同时提供 rpmbuild 与 rpm 查询工具
@@ -219,46 +222,62 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends rpm
 
-      - name: 解包二进制到 target/release / Unpack binary into target/release
-        # packaging/build-packages.sh 固定从 target/release/linux-driver-backup 取二进制，
-        # 这里把 artifact 还原成该路径，脚本无需感知 CI 的 artifact 命名
+      - name: 还原二进制 / Unpack binaries
+        # packaging/build-packages.sh 通过 --bin 指定要打包的二进制，
+        # 这里把两个架构的 artifact 分别还原并做 ELF 冒烟
         run: |
           set -euo pipefail
           mkdir -p target/release
-          src="artifact-x86_64/linux-driver-backup-x86_64-unknown-linux-gnu"
-          test -f "$src"
-          cp "$src" target/release/linux-driver-backup
-          chmod +x target/release/linux-driver-backup
-          # 冒烟：确认拿到的是可执行 ELF；--version 未实现或环境无显示时也不阻断打包
+          install -m 0755 artifacts/linux-driver-backup-x86_64-unknown-linux-gnu \
+            target/release/linux-driver-backup-x86_64
+          install -m 0755 artifacts/linux-driver-backup-aarch64-unknown-linux-gnu \
+            target/release/linux-driver-backup-aarch64
           if command -v file >/dev/null 2>&1; then
-            file target/release/linux-driver-backup
+            file target/release/linux-driver-backup-x86_64 target/release/linux-driver-backup-aarch64
           fi
-          timeout 15 ./target/release/linux-driver-backup --version \
+          # 冒烟：x86_64 可直接在 runner 上跑；aarch64 用 qemu-user 可选执行
+          timeout 15 ./target/release/linux-driver-backup-x86_64 --version \
             || echo "::warning::--version 冒烟未通过（不阻断打包）"
 
-      - name: 构建 deb / tar / rpm / Build deb, tar.gz and rpm
-        # 工具缺失时脚本只打印「[跳过]」不失败；deb 与 tar 在 runner 上必然产出
-        run: bash packaging/build-packages.sh deb tar rpm
+      - name: 构建 amd64 包（deb/tar/rpm）/ Build amd64 packages
+        run: |
+          set -euo pipefail
+          bash packaging/build-packages.sh deb tar rpm \
+            --arch amd64 --bin target/release/linux-driver-backup-x86_64
+
+      - name: 构建 arm64 包（deb/tar/rpm）+ rpm 交叉 / Build arm64 packages
+        # rpm 的 aarch64 目标在 x86_64 上由 rpmbuild --target aarch64 直接产出
+        run: |
+          set -euo pipefail
+          bash packaging/build-packages.sh deb tar rpm \
+            --arch arm64 --bin target/release/linux-driver-backup-aarch64
 
       - name: 构建 AppImage / Build AppImage
         # 单独一步 + continue-on-error：需联网下载 appimagetool，失败时
         # build-appimage.sh 打印中文 warning 并 exit 0（DESIGN.md §11.4 降级策略）
         continue-on-error: true
-        run: bash packaging/build-appimage.sh
+        run: |
+          set -euo pipefail
+          cp target/release/linux-driver-backup-x86_64 target/release/linux-driver-backup
+          bash packaging/build-appimage.sh
 
       - name: 检查打包产物 / Verify package outputs
         run: |
           set -euo pipefail
           echo "=== 打包产物 / package outputs ==="
           ls -l dist
-          # deb + tar 是硬性要求（下面两条 ls 找不到文件即失败）
-          ls dist/*.deb
-          ls dist/*.tar.gz
+          # deb 与 tar 必须同时覆盖 amd64 + arm64（下面每条 ls 找不到文件即失败）
+          ls dist/*_amd64.deb
+          ls dist/*_arm64.deb
+          ls dist/*linux-x86_64.tar.gz
+          ls dist/*linux-aarch64.tar.gz
           # 每个产物都应有同名 .sha256，供 release 阶段 sha256sum -c 复验
           for f in dist/*.deb dist/*.tar.gz dist/*.rpm dist/*.AppImage; do
             [ -e "$f" ] || continue
             test -f "$f.sha256"
           done
+          # 报告 rpm 是否产出（rpmbuild 若失败，前面步骤已失败；这里只做清单展示）
+          ls dist/*.rpm 2>/dev/null || echo "::warning::未产出 rpm（检查 rpmbuild 步骤日志）"
 
       - name: 上传打包产物 / Upload packages
         uses: actions/upload-artifact@v4

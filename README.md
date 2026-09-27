@@ -51,18 +51,21 @@ GUI 主窗口（扫描 → 选择模式与输出路径 → 备份 / 还原，含
 > 本仓库**尚未**接入 apt 源、PPA、Snap Store 或 Flathub（这些需要外部仓库审核，已列入路线图，
 > 见 DESIGN.md §11.4）。因此所有安装方式都是「到 [Releases](../../releases) 页面下载附件 → 本地安装」。
 >
-> 附件由 CI 的 `package` 作业在推送 `v*` 标签时自动产出（`.deb`、`.rpm`、`tar.gz`、`AppImage`），
+> 附件由 CI 的 `package` 作业在推送 `v*` 标签时自动产出，**同时覆盖 x86_64/amd64 与 aarch64/arm64 两个架构**的
+> `.deb`、`.rpm`、`tar.gz`，外加 x86_64 的 `AppImage` 与两个架构的单文件二进制（均附 `.sha256` 校验清单），
 > 构建脚本入口为 [`packaging/build-packages.sh`](packaging/build-packages.sh)。
 
 ### 各发行版安装命令 / Install commands by distro
 
 | 发行版 / Distro | 格式 / Format | 安装命令 / Install command |
 |---|---|---|
-| Debian / Ubuntu / Linux Mint / Kali / deepin | `.deb` | `sudo dpkg -i linux-driver-backup_<版本>_amd64.deb`<br>或 `sudo apt install ./linux-driver-backup_<版本>_amd64.deb`（自动补齐依赖） |
-| Fedora / RHEL / Rocky / AlmaLinux / openEuler | `.rpm` | `sudo dnf install ./linux-driver-backup-<版本>-1.x86_64.rpm` |
+| Debian / Ubuntu / Linux Mint / Kali / deepin（x86_64） | `.deb` | `sudo dpkg -i linux-driver-backup_<版本>_amd64.deb`<br>或 `sudo apt install ./linux-driver-backup_<版本>_amd64.deb`（自动补齐依赖） |
+| Debian / Ubuntu / Linux Mint 等（arm64） | `.deb` | `sudo apt install ./linux-driver-backup_<版本>_arm64.deb`（树莓派 / ARM 服务器 / Apple Silicon 虚拟机） |
+| Fedora / RHEL / Rocky / AlmaLinux / openEuler（x86_64） | `.rpm` | `sudo dnf install ./linux-driver-backup-<版本>-1.x86_64.rpm` |
+| Fedora / RHEL / Rocky / AlmaLinux 等（aarch64） | `.rpm` | `sudo dnf install ./linux-driver-backup-<版本>-1.aarch64.rpm` |
 | Arch / Manjaro / EndeavourOS | 源码包（PKGBUILD，AUR 用） | 本地构建安装：`cd packaging/arch`，先按 [packaging/arch/README.md](packaging/arch/README.md) 渲染模板中的 `@VERSION@`，再执行 `makepkg -si`；若已提交 AUR，可用 `yay -S linux-driver-backup` |
-| 任意发行版 / Any distro | AppImage（免安装，可放 U 盘） | `chmod +x linux-driver-backup-<版本>-linux-x86_64.AppImage`<br>`./linux-driver-backup-<版本>-linux-x86_64.AppImage` |
-| 任意发行版 / Any distro | `tar.gz`（通用兜底） | 解压后执行 `./install.sh`（默认装入 `/usr/local`，可用 `--prefix` 改前缀） |
+| 任意发行版 / Any distro | AppImage（免安装，可放 U 盘，仅 x86_64） | `chmod +x linux-driver-backup-<版本>-linux-x86_64.AppImage`<br>`./linux-driver-backup-<版本>-linux-x86_64.AppImage` |
+| 任意发行版 / Any distro | `tar.gz`（通用兜底，x86_64 + aarch64） | 解压后执行 `./install.sh`（默认装入 `/usr/local`，可用 `--prefix` 改前缀） |
 | 从源码构建 / Build from source | — | 见下方 [快速开始 / Quick Start](#快速开始--quick-start) 的「从源码构建 / Build from source」 |
 
 说明 / Notes：

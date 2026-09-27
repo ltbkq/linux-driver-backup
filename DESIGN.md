@@ -592,7 +592,14 @@ W1 各单元**只写文件、不并行执行 cargo**（避免 target/ 锁竞争�
 | `tar.gz` + `install.sh` | 无包管理器 / 嵌入式 / 通用兜底 | `tar` + 安装脚本（装入 `/usr/local/bin`） | 无 |
 | Flatpak manifest | 沙箱化分发（**路线图，首版不产出**） | `flatpak-builder` + `packaging/flatpak/*.yml` | runtime `org.freedesktop.Platform//24.08` |
 
-**架构范围 / Arch scope**：`build-packages.sh` 按 `uname -m` 自动选 `amd64`/`arm64`，但 CI 的 `package` job 首版**只打 x86_64 包**（deb/rpm/AppImage）；`aarch64` 二进制与 `tar.gz` 照常由 build 矩阵产出 —— 即 **aarch64 首版交付形态为「单文件二进制 + tar.gz」**，deb/rpm 的 arm64 版本待引入原生 runner 或 QEMU 后补齐（见 §11.4）。
+**架构范围 / Arch scope**：`build-packages.sh` 支持 `--arch <amd64|arm64> --bin <路径>`，可在 x86_64 runner 上**直接为 aarch64 二进制出包**（`dpkg-deb` 与 `rpmbuild --target aarch64` 只做「元数据 + 文件」组装，不校验机器码，故无需 QEMU 或原生 runner）。因此 CI 的 `package` job 现在同时产出：
+
+| 架构 | deb | rpm | tar.gz | AppImage | 单文件二进制 |
+|---|---|---|---|---|---|
+| x86_64 / amd64 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| aarch64 / arm64 | ✅ | ✅ | ✅ | ⚠️ 暂不产出（appimagetool 交叉组装意义有限） | ✅ |
+
+脚本另带**架构一致性提示**：若 `--arch` 与二进制 `file` 描述不符，只打印提示（不失败），避免误发。
 
 ### 11.2 桌面集成资产 / Desktop integration
 

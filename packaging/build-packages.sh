@@ -58,15 +58,22 @@ usage() {
 linux-driver-backup 统一打包入口 / unified packaging entry
 
 用法 / Usage:
-  bash packaging/build-packages.sh <子命令...>
+  bash packaging/build-packages.sh <子命令...> [--arch amd64|arm64] [--bin <路径>]
 
 子命令 / Subcommands:
   deb        组装 Debian/Ubuntu 包（需 dpkg-deb）
   tar        组装通用 tar.gz（含 install.sh，任何发行版可用）
   rpm        组装 RPM 包（需 rpmbuild；本机缺失时跳过，由 CI 产出）
-  appimage   组装 AppImage（需 appimagetool；本机缺失时跳过，由 CI 产出）
+  appimage   组装 AppImage（需 appimagetool；仅 x86_64，本机缺失时跳过，由 CI 产出）
   all        以上全部
   -h, --help 显示本帮助
+
+可选参数 / Options:
+  --arch <amd64|arm64>  目标架构（默认按宿主推断）。deb 的 Architecture 字段、
+                        rpm 的 --target 与 tar.gz 的文件名都会随之变化，
+                        因此可在 x86_64 上直接为 arm64 二进制出包。
+  --bin <路径>          指定要打包的二进制（默认 target/release/linux-driver-backup），
+                        便于 CI 分别打包两个架构的产物。
 
 说明 / Notes:
   · 二进制取自 target/release/linux-driver-backup，不存在则报错退出，
@@ -87,9 +94,42 @@ version_of() {
   printf '%s' "$v"
 }
 
-# deb 架构名（amd64/arm64）与通用架构名（x86_64/aarch64）
-deb_arch()   { case "$(uname -m)" in aarch64|arm64) echo arm64 ;; *) echo amd64 ;; esac; }
-plain_arch() { uname -m; }
+# deb 架构名（amd64/arm64）与通用架构名（x86_64/aarch64）—— 由 --arch 覆盖或按宿主推断
+deb_arch()   { printf '%s' "$ARCH_DEB"; }
+plain_arch() { printf '%s' "$ARCH_PLAIN"; }
+
+# 可选参数解析后确定的目标架构（见文件末尾的参数循环）
+ARCH_DEB=""
+ARCH_PLAIN=""
+ARCH_RPM=""
+
+resolve_arch() {
+  local wanted="${1:-}"
+  if [[ -z "$wanted" ]]; then
+    case "$(uname -m)" in
+      aarch64|arm64) wanted=arm64 ;;
+      *)             wanted=amd64 ;;
+    esac
+  fi
+  case "$wanted" in
+    amd64|x86_64)  ARCH_DEB=amd64; ARCH_PLAIN=x86_64;  ARCH_RPM=x86_64 ;;
+    arm64|aarch64) ARCH_DEB=arm64; ARCH_PLAIN=aarch64; ARCH_RPM=aarch64 ;;
+    *) err "不支持的架构 / unsupported arch: $wanted（可选 amd64 | arm64）"; exit 2 ;;
+  esac
+}
+
+# 交叉出包时给出提示：二进制 ELF 架构与目标架构不一致仍然由 rpmbuild/dpkg-deb
+# 照常组装（它们不做机器码校验），但值得提醒，避免误发。
+warn_arch_mismatch() {
+  command -v file >/dev/null 2>&1 || return 0
+  local desc
+  desc="$(file -b "$BIN" 2>/dev/null || true)"
+  case "$ARCH_PLAIN" in
+    x86_64)  [[ "$desc" == *x86-64* ]] || info "提示 / hint: 目标架构 $ARCH_PLAIN，但二进制描述为：$desc" ;;
+    aarch64) [[ "$desc" == *aarch64* || "$desc" == *ARM* ]] || info "提示 / hint: 目标架构 $ARCH_PLAIN，但二进制描述为：$desc" ;;
+  esac
+}
+
 
 need_bin() {
   if [[ ! -f "$BIN" ]]; then
@@ -132,7 +172,8 @@ build_deb() {
   size_kb="$(du -sk "$root" | cut -f1)"
   mkdir -p "$root/DEBIAN"
   # sed 替换占位符，并剥离模板里的 # 注释行（control 不接受注释）
-  sed -e "s/@VERSION@/$ver/g" -e "s/@SIZE_KB@/$size_kb/g" "$CONTROL" \
+  sed -e "s/@VERSION@/$ver/g" -e "s/@SIZE_KB@/$size_kb/g" \
+      -e "s/^Architecture:.*/Architecture: $debarch/" "$CONTROL" \
     | grep -v '^#' > "$root/DEBIAN/control"
   chmod 0755 "$root/DEBIAN"
 
@@ -199,8 +240,8 @@ build_rpm() {
   install -m 0644 "$ICON"    "$top/SOURCES/icon.svg"
   install -m 0644 "$LICENSE" "$top/SOURCES/LICENSE"
 
-  info "[rpm 3/3] rpmbuild -bb"
-  rpmbuild -bb --define "_topdir $top" "$top/SPECS/$NAME.spec"
+  info "[rpm 3/3] rpmbuild -bb --target $ARCH_RPM"
+  rpmbuild -bb --target "$ARCH_RPM" --define "_topdir $top" "$top/SPECS/$NAME.spec"
   out="$(find "$top/RPMS" -name '*.rpm' -type f | head -n1)"
   if [[ -z "$out" ]]; then
     err "rpmbuild 未产出 rpm 文件。"
@@ -218,6 +259,12 @@ build_rpm() {
 
 # ---- appimage ---------------------------------------------
 build_appimage() {
+  # appimagetool 官方仅提供 x86_64 / aarch64 两种宿主工具；交叉组装 AppImage 意义不大，
+  # 首版仅对 x86_64 产出（DESIGN.md §11.1 架构范围）。
+  if [[ "$ARCH_PLAIN" != "x86_64" ]]; then
+    skip "appimage：首版仅支持 x86_64 目标（当前 $ARCH_PLAIN）"
+    return 0
+  fi
   if ! command -v appimagetool >/dev/null 2>&1; then
     skip "appimage：未安装 appimagetool 工具（CI 会产出）"
     info "提示 / hint: 本机如需构建，可直接运行 packaging/build-appimage.sh（会自动下载 appimagetool）。"
@@ -229,20 +276,42 @@ build_appimage() {
 }
 
 # ---- 主流程 / main ----------------------------------------
-if [[ $# -eq 0 ]]; then
+# 先解析可选参数（--arch / --bin），再逐个执行子命令。
+SUBCOMMANDS=()
+BIN_OVERRIDE=""
+ARCH_WANTED=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --arch)   ARCH_WANTED="${2:-}";  shift 2 ;;
+    --arch=*) ARCH_WANTED="${1#*=}"; shift ;;
+    --bin)    BIN_OVERRIDE="${2:-}"; shift 2 ;;
+    --bin=*)  BIN_OVERRIDE="${1#*=}"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *)        SUBCOMMANDS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -n "$BIN_OVERRIDE" ]]; then
+  BIN="$BIN_OVERRIDE"
+fi
+resolve_arch "$ARCH_WANTED"
+
+if [[ ${#SUBCOMMANDS[@]} -eq 0 ]]; then
   usage
   exit 2
 fi
 
 mkdir -p "$DIST"
-for cmd in "$@"; do
+if [[ -f "$BIN" ]]; then
+  warn_arch_mismatch
+fi
+for cmd in "${SUBCOMMANDS[@]}"; do
   case "$cmd" in
     deb)      build_deb ;;
     tar)      build_tar ;;
     rpm)      build_rpm ;;
     appimage) build_appimage ;;
     all)      build_deb; build_tar; build_rpm; build_appimage ;;
-    -h|--help|help) usage; exit 0 ;;
     *)
       err "未知子命令 / unknown subcommand: $cmd"
       usage
