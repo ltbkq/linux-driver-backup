@@ -18,12 +18,14 @@
 
 name: build
 
-# 触发 / Triggers：主干分支 push、PR、以及 v* 标签（标签触发用于自动发版）
+# 触发 / Triggers：主干分支 push、PR、v* 标签（标签触发用于自动发版），
+# 以及手动触发（workflow_dispatch）——用于在打标签前先验证交叉编译/打包链路。
 on:
   push:
     branches: [main, master]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 # 默认只读；仅 release 作业单独提权（遵循最小权限原则）
 permissions:
@@ -139,6 +141,34 @@ jobs:
         with:
           target: aarch64-unknown-linux-gnu
 
+      - name: 安装 aarch64 系统库（fontconfig/freetype）/ Install arm64 sysroot libs
+        # Slint 的软件渲染会**硬链接** libfontconfig 与 libfreetype（本机 ldd 实测，
+        # DESIGN.md §11.4）。交叉到 aarch64 时链接器需要目标架构的开发包，否则报：
+        #   ld: cannot find -lfontconfig / -lfreetype
+        # 这里用 Debian 多架构（multiarch）在同一 runner 上装 arm64 的开发库。
+        # winit 用的 X11/Wayland 是运行期 dlopen，不参与链接，因此无需 arm64 版本。
+        if: matrix.cross
+        run: |
+          set -euo pipefail
+          sudo dpkg --add-architecture arm64
+          # ubuntu-22.04 走 /etc/apt/sources.list（非 deb822）；把既有源显式限定为 amd64，
+          # 再补一条 arm64 的 ports 源，避免 apt 试图从 amd64 源取 arm64 包而 404。
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse' \
+            | sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse' \
+            | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse' \
+            | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev:arm64 \
+            libfreetype-dev:arm64 \
+            libexpat1-dev:arm64
+          # 自检：确认目标架构的 .pc 与静态库确实到位
+          ls -l /usr/lib/aarch64-linux-gnu/libfontconfig* /usr/lib/aarch64-linux-gnu/libfreetype*
+          ls -l /usr/lib/aarch64-linux-gnu/pkgconfig/fontconfig.pc
+
       - name: 缓存 cargo / Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -147,8 +177,18 @@ jobs:
 
       - name: 编译 release / Build release
         # 统一使用 --target：产物路径固定为 target/<target>/release/…，
-        # 两个矩阵项的后续步骤（strip、校验、上传）因此可以完全一致
-        run: cargo build --release --target ${{ matrix.target }}
+        # 两个矩阵项的后续步骤（strip、校验、上传）因此可以完全一致。
+        # 交叉时需要把 pkg-config 指向 arm64 的 .pc，否则 fontconfig-sys 会拿到
+        # 宿主 x86_64 的链接参数（PKG_CONFIG_ALLOW_CROSS 允许交叉查询）。
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+            export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+            export PKG_CONFIG_SYSROOT_DIR=/
+          fi
+          cargo build --release --target ${{ matrix.target }}
 
       - name: strip 二进制 / Strip the binary
         # Cargo.toml 的 [profile.release] 已设 strip = true（DESIGN.md §2.1），
