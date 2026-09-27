@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  手绘开源图标，随 GPL-3.0 分发
+  Hand-drawn open-source icon, distributed under GPL-3.0.
+
+  主题 / Theme：深色圆角方块（终端/内核空间）+ 芯片线条（驱动模块）
+  + 打开的盒子与右向箭头（备份出箱 / 还原入箱）。
+  配色 / Palette：#0f172a 底色、#2563eb 主色、#22c55e 成功态。
+  256×256 viewBox，任意尺寸无损缩放；全部为手写几何图形，
+  未复制任何第三方受版权素材。
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="256" height="256" viewBox="0 0 256 256"
+     role="img" aria-label="Linux Driver Backup">
+  <title>Linux Driver Backup &amp; Restore</title>
+
+  <!-- 背景：深色圆角方块 / dark rounded square -->
+  <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="#0f172a"/>
+
+  <!-- 芯片与引脚 / chip body and pins -->
+  <g fill="none" stroke="#2563eb" stroke-width="7"
+     stroke-linecap="round" stroke-linejoin="round">
+    <rect x="92" y="40" width="72" height="72" rx="14" ry="14"/>
+    <!-- 上下引脚 / top & bottom pins -->
+    <path d="M110 40 V26"/>
+    <path d="M146 40 V26"/>
+    <path d="M110 112 V124"/>
+    <path d="M146 112 V124"/>
+    <!-- 左右引脚 / side pins -->
+    <path d="M92 58 H78"/>
+    <path d="M92 94 H78"/>
+    <path d="M164 58 H178"/>
+    <path d="M164 94 H178"/>
+    <!-- 芯片内部电路线 / inner traces -->
+    <path d="M108 62 H148"/>
+    <path d="M108 90 H148"/>
+  </g>
+
+  <!-- 还原箭头（绿色，芯片 → 盒子）/ green restore arrow, chip into box -->
+  <g fill="none" stroke="#22c55e" stroke-width="8"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 130 V158"/>
+    <path d="M114 144 L128 158 L142 144"/>
+  </g>
+
+  <!-- 打开的盒子（承载备份产物）/ open box holding the archive -->
+  <g fill="none" stroke="#2563eb" stroke-width="8"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M60 170 H196 V212 a10 10 0 0 1 -10 10 H70 a10 10 0 0 1 -10 -10 Z"/>
+    <path d="M60 170 L44 146"/>
+    <path d="M196 170 L212 146"/>
+    <!-- 盒身分隔线 / box seam -->
+    <path d="M60 186 H196" stroke-width="6" opacity="0.6"/>
+  </g>
+
+  <!-- 进度点（扫描→哈希→压缩）/ progress dots -->
+  <g fill="#22c55e">
+    <circle cx="104" cy="236" r="6"/>
+    <circle cx="128" cy="236" r="6" opacity="0.7"/>
+    <circle cx="152" cy="236" r="6" opacity="0.45"/>
+  </g>
+</svg>

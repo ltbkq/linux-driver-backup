@@ -1,0 +1,19 @@
+# 桌面入口 / Desktop Entry —— 规范版本 v1.5
+# 规范 / Spec: https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-1.5.html
+# 由 packaging/build-packages.sh 与各打包模板复用；
+# 校验 / validate: desktop-file-validate packaging/linux-driver-backup.desktop
+[Desktop Entry]
+Type=Application
+# 中文为主名称，英文名通过 Name[en] 覆盖 / Chinese default name, English override
+Name=Linux 驱动备份与还原工具
+Name[en]=Linux Driver Backup & Restore
+Comment=备份与还原 Linux 外置（out-of-tree）驱动模块 / Back up and restore out-of-tree Linux kernel drivers
+# Exec 只写命令名（不带路径）：deb/rpm 装到 /usr/bin、install.sh 装到 /usr/local/bin，
+# 桌面环境会按 PATH 解析 / bare command name resolved via PATH wherever it is installed
+Exec=linux-driver-backup
+Icon=linux-driver-backup
+Terminal=false
+# Categories 必须以分号结尾；主类 System，次类 Utility，Settings 为补充类
+# Must end with a semicolon; System is the main category, Utility secondary
+Categories=System;Utility;Settings;
+Keywords=driver;kernel;module;backup;restore;驱动;备份;还原;

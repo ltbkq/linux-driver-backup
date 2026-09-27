@@ -1,0 +1,233 @@
+// 模块：声明式 GUI —— 主窗口 ui/app_window.slint（W1-A 工程骨架）
+// Module: declarative GUI — main window ui/app_window.slint (W1-A skeleton).
+//
+// 【冻结契约】本文件实现 DESIGN.md §4.6 的界面契约：下列属性名与回调名禁止改动，
+//             Rust 侧 src/main.rs 依据生成的 set_*/get_*/on_* API 对接（短横线 → 下划线）。
+// [Frozen contract] Property/callback names below are frozen by DESIGN.md §4.6;
+//                  src/main.rs binds via the generated set_*/get_*/on_* API.
+//
+// 【控件来源】全部取自 "std-widgets.slint"。该套件不含文件对话框（DESIGN.md 核查：
+//             "无文件选择能力"），因此备份输出路径与还原归档路径由 LineEdit 手输。
+// [Widgets] Everything comes from std-widgets.slint, which ships no file dialog,
+//           so both paths are typed into LineEdit controls.
+//
+// 【线程约定】本文件只声明 UI；耗时工作（扫描/备份/还原）在 src/main.rs 里以
+//             std::thread 工作线程执行，经 slint::invoke_from_event_loop 回写属性。
+// [Threading] This file only declares the UI; long work runs on std::thread workers
+//             and feeds these properties back via slint::invoke_from_event_loop.
+
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ListView, ProgressIndicator, VerticalBox } from "std-widgets.slint";
+
+// 扫描条目列表项，对应 src/model.rs 的 ScanEntry；size/kind 由 Rust 侧预格式化。
+// List row for a scanned entry (mirrors ScanEntry); size/kind are pre-formatted strings.
+export struct ModuleItem {
+    name: string,   // 文件名，如 "nvidia.ko" / file name
+    path: string,   // 归档内相对路径 / relative path inside the archive
+    size: string,   // 人类可读体积，如 "1.2 MiB" / human readable size
+    kind: string,   // 分类 module | dkms | config | firmware / entry kind
+}
+
+export component AppWindow inherits Window {
+    title: "Linux 驱动备份与还原工具";
+    min-width: 640px;
+    min-height: 480px;
+    background: #f4f6f8;
+
+    // ===== 冻结属性 / frozen properties (DESIGN.md §4.6) =====
+    in property <string> system-info: "系统信息加载中…";   // 发行版/内核/架构一行摘要
+    in property <string> status-text: "准备就绪";           // 底部状态行
+    in property <float> progress: 0.0;                      // 进度 0.0 .. 1.0
+    in property <bool> busy: false;                         // 忙碌时禁用操作按钮
+    // 需被控件双向写回（LineEdit / ComboBox / CheckBox）的属性声明为 in-out，
+    // 生成的 set_*/get_* 与 DESIGN.md §4.6 列出的 Rust API 完全一致。
+    in-out property <[ModuleItem]> modules: [];             // 扫描结果，由 VecModel 提供
+    in-out property <string> out-path;                      // 备份输出路径 .tar.gz
+    in-out property <string> archive-path;                  // 待还原归档路径
+    in-out property <int> mode-index: 1;                    // 0 minimal / 1 standard / 2 full
+    in-out property <bool> dry-run: true;                   // 还原前仅预演
+
+    // ===== 冻结回调 / frozen callbacks (DESIGN.md §4.6) =====
+    callback start-backup();
+    callback start-restore();
+    callback refresh-scan();
+    callback cancel();
+
+    VerticalBox {
+        padding: 14px;
+        spacing: 10px;
+
+        // 1) 系统信息：distro / kver / arch，由 Rust 侧 set_system_info 写入。
+        Text {
+            text: root.system-info;
+            color: #1f2933;
+            font-size: 13px;
+            overflow: elide;
+            vertical-stretch: 0;
+        }
+
+        // 2) 扫描结果列表：ListView 无固有高度，外层 Rectangle 必须给定高度，
+        //    min-height 双保险避免在 VerticalBox 中被压成 0。
+        Rectangle {
+            min-height: 180px;
+            vertical-stretch: 1;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d5d9de;
+            border-radius: 4px;
+
+            // 空列表提示 / empty state hint
+            if (root.modules.length == 0) : Text {
+                text: "未扫描到外置驱动模块";
+                color: #8a8f98;
+                font-size: 13px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            ListView {
+                visible: root.modules.length > 0;
+
+                for item in root.modules : Rectangle {
+                    height: 30px;
+                    horizontal-stretch: 1;
+                    background: #ffffff;
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        padding: 5px;
+
+                        Text {
+                            text: item.name;
+                            color: #111827;
+                            font-size: 13px;
+                            overflow: elide;
+                            horizontal-stretch: 3;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: item.kind;
+                            color: #2b6cb0;
+                            font-size: 12px;
+                            horizontal-stretch: 0;
+                            preferred-width: 76px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: item.size;
+                            color: #111827;
+                            font-size: 12px;
+                            horizontal-alignment: right;
+                            horizontal-stretch: 0;
+                            preferred-width: 80px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3) 进度条：progress 由 Rust 侧加权回写；忙碌但尚无进度时转为不确定态。
+        ProgressIndicator {
+            progress: root.progress;
+            indeterminate: root.busy && root.progress == 0.0;
+            min-height: 10px;
+            vertical-stretch: 0;
+        }
+
+        // 4) 状态行：阶段信息 / 错误提示，由 set_status_text 写入。
+        Text {
+            text: root.status-text;
+            color: gray;
+            font-size: 12px;
+            overflow: elide;
+            vertical-stretch: 0;
+        }
+
+        // 5) 备份设置：三级模式 ComboBox（写回 mode-index）+ 输出路径 LineEdit（写回 out-path）。
+        HorizontalBox {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Text {
+                text: "备份模式";
+                color: #1f2933;
+                font-size: 13px;
+                horizontal-stretch: 0;
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: ["minimal 最小", "standard 标准 (默认)", "full 完整 (含固件)"];
+                current-index <=> root.mode-index;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "输出路径";
+                color: #1f2933;
+                font-size: 13px;
+                horizontal-stretch: 0;
+                vertical-alignment: center;
+            }
+            LineEdit {
+                text <=> root.out-path;
+                placeholder-text: "~/driver-backup-<kver>-<时间>.tar.gz";
+                horizontal-stretch: 2;
+            }
+        }
+
+        // 6) 还原设置：归档路径 LineEdit（写回 archive-path）+ dry-run CheckBox（写回 dry-run）。
+        HorizontalBox {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Text {
+                text: "还原归档";
+                color: #1f2933;
+                font-size: 13px;
+                horizontal-stretch: 0;
+                vertical-alignment: center;
+            }
+            LineEdit {
+                text <=> root.archive-path;
+                placeholder-text: "~/driver-backup-<kver>-<时间>.tar.gz";
+                horizontal-stretch: 2;
+            }
+            CheckBox {
+                text: "还原前仅预演 (dry-run)";
+                checked <=> root.dry-run;
+                horizontal-stretch: 0;
+            }
+        }
+
+        // 7) 按钮行：扫描 / 开始备份 / 还原驱动 / 取消，分别触发冻结回调。
+        //    空闲时可操作；忙碌时仅“取消”可用（enabled: root.busy）。
+        HorizontalBox {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Button {
+                text: "扫描";
+                enabled: !root.busy;
+                horizontal-stretch: 1;
+                clicked => { root.refresh-scan(); }
+            }
+            Button {
+                text: "开始备份";
+                enabled: !root.busy;
+                horizontal-stretch: 1;
+                clicked => { root.start-backup(); }
+            }
+            Button {
+                text: "还原驱动";
+                enabled: !root.busy;
+                horizontal-stretch: 1;
+                clicked => { root.start-restore(); }
+            }
+            Button {
+                text: "取消";
+                enabled: root.busy;
+                horizontal-stretch: 1;
+                clicked => { root.cancel(); }
+            }
+        }
+    }
+}

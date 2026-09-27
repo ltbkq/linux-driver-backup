@@ -1,0 +1,477 @@
+//! 共享类型与错误定义 —— 全项目的依赖根。
+//! Shared types and errors — the dependency root of the whole crate.
+//!
+//! 本文件实现 DESIGN.md **§5.1 的冻结契约（frozen contract）**：并行开发的其它单元
+//! （`distro` / `scan` / `restore` / `privilege` / `main`）只能按下述签名引用本文件，
+//! 任何签名偏差都会导致 W3 集成编译失败，因此只允许**增补**辅助方法，不得改动既有签名。
+//! This file implements the frozen contract of DESIGN.md §5.1. Sibling modules may only
+//! rely on the signatures below; additions are allowed, changes to existing signatures
+//! are not.
+//!
+//! 文档规范见 DESIGN.md 附录 A：中文为主，公共 API 的 doc comment 首句为英文。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::distro::{DistroInfo, Family};
+
+/// UI/CLI 共用的进度回调：`Arc<dyn Fn(0.0..1.0, 消息)>`。
+/// Progress callback shared by the GUI and the CLI.
+pub type ProgressFn = Arc<dyn Fn(f32, String) + Send + Sync>;
+
+/// 三级备份模式（`minimal` / `standard` / `full`）。
+/// Three-level backup mode, serialized in lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupMode {
+    /// 最小：OOT 模块 + `/etc` 配置。
+    Minimal,
+    /// 标准（默认）：minimal + DKMS 源码。
+    Standard,
+    /// 完整：standard + `/lib/firmware`。
+    Full,
+}
+
+impl BackupMode {
+    /// 由 UI ComboBox / CLI 下标构造模式，非法下标回退到 `Standard`。
+    /// Build a mode from a UI/CLI index; an out-of-range index falls back to `Standard`.
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            0 => BackupMode::Minimal,
+            1 => BackupMode::Standard,
+            2 => BackupMode::Full,
+            _ => BackupMode::Standard,
+        }
+    }
+
+    /// 下标表示法：`0` / `1` / `2`。
+    /// Index form used by `mode-index` bindings: `0` / `1` / `2`.
+    ///
+    /// 冻结契约方法（DESIGN.md §5.1）：与 [`BackupMode::from_index`] 互为逆运算，
+    /// 供未来「把 CLI 模式回写到 GUI」等场景使用。
+    #[allow(dead_code)]
+    pub fn index(&self) -> i32 {
+        match self {
+            BackupMode::Minimal => 0,
+            BackupMode::Standard => 1,
+            BackupMode::Full => 2,
+        }
+    }
+
+    /// 用于 UI/CLI 展示的英文标签。
+    /// Human readable English label for the UI/CLI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackupMode::Minimal => "Minimal",
+            BackupMode::Standard => "Standard",
+            BackupMode::Full => "Full",
+        }
+    }
+}
+
+/// 归档内单个条目的分类。
+/// Classification of one archived entry, serialized in lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    /// 内核模块（`.ko`，含 in-tree 之外的 updates/extra 等）。
+    Module,
+    /// DKMS 源码树（`/usr/src`、`/var/lib/dkms`）。
+    Dkms,
+    /// 配置（`/etc/modprobe.d`、`/etc/udev/rules.d`、`/etc/depmod.d` …）。
+    Config,
+    /// 固件 blob（`/lib/firmware`，仅 full 模式）。
+    Firmware,
+}
+
+/// 扫描得到的一个待备份文件。
+/// One scanned file that is about to be backed up.
+#[derive(Debug, Clone)]
+pub struct ScanEntry {
+    /// 源文件绝对路径（读取用）。
+    pub abs_path: PathBuf,
+    /// 归档内相对路径：去掉前导 `/`，写入时位于 `data/` 之下。
+    pub rel_path: String,
+    /// 扫描时刻的字节数。
+    pub size: u64,
+    /// 条目分类。
+    pub kind: EntryKind,
+}
+
+/// 一次扫描的完整结果（`scan::scan` 的返回值）。
+/// Full result of one scan pass, as returned by `scan::scan`.
+#[derive(Debug, Clone, Default)]
+pub struct ScanReport {
+    /// 按遍历顺序排列的条目；顺序即归档顺序。
+    pub entries: Vec<ScanEntry>,
+    /// 因 in-tree 基线而跳过的条目数（不备份，仅统计）。
+    pub skipped_in_tree: usize,
+    /// `/lib/firmware` 在该模式下的预估体积（用于 UI 提示）。
+    pub firmware_bytes: u64,
+    /// 扫描期的可恢复问题（不会中止扫描，但会写入 manifest）。
+    pub warnings: Vec<String>,
+}
+
+/// manifest 中的逐文件记录。
+/// Per-file record inside `manifest.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestEntry {
+    /// 归档内相对路径（不含 `data/` 前缀）。
+    pub path: String,
+    /// 归档中的字节数。
+    pub size: u64,
+    /// 内容的 SHA-256（64 位小写十六进制）。
+    pub sha256: String,
+    /// 条目分类。
+    pub kind: EntryKind,
+}
+
+/// manifest 中的发行版快照。
+/// Distro snapshot embedded into `manifest.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestDistro {
+    /// `/etc/os-release` 的 `ID`。
+    pub id: String,
+    /// `VERSION_ID`。
+    pub version_id: String,
+    /// `PRETTY_NAME`。
+    pub pretty_name: String,
+    /// 归一化后的发行版家族。
+    pub family: Family,
+}
+
+impl ManifestDistro {
+    /// 从发行版探测结果构造 manifest 用的发行版快照。
+    /// Build the manifest distro snapshot from a detected `DistroInfo`.
+    pub fn from_distro(info: &DistroInfo) -> Self {
+        ManifestDistro {
+            id: info.id.clone(),
+            version_id: info.version_id.clone(),
+            pretty_name: info.pretty_name.clone(),
+            family: info.family,
+        }
+    }
+}
+
+/// 归档根目录下的 `manifest.json`：元数据 + 逐文件 SHA-256。
+/// The `manifest.json` at the archive root: metadata plus per-file SHA-256.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    /// 归档格式版本，恒为 [`MANIFEST_FORMAT_VERSION`]（供未来演进）。
+    pub format_version: u32,
+    /// 生成该归档的工具版本（`CARGO_PKG_VERSION`）。
+    pub tool_version: String,
+    /// 生成时刻（UTC，RFC3339：`YYYY-MM-DDTHH:MM:SSZ`）。
+    pub created_at: String,
+    /// 内核版本串（`uname -r`）。
+    pub kernel_release: String,
+    /// 架构（如 `x86_64`）。
+    pub arch: String,
+    /// 发行版快照。
+    pub distro: ManifestDistro,
+    /// 备份模式。
+    pub mode: BackupMode,
+    /// 逐文件记录，顺序与归档内 `data/` 的写入顺序一致。
+    pub entries: Vec<ManifestEntry>,
+    /// 扫描与打包期的可恢复问题。
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// 归档格式版本号（当前恒为 1）。
+/// Archive format version; currently always 1.
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+
+/// 统一错误类型：IO / JSON / 归档格式 / 输入校验 / 取消 / 外部命令 / 提权。
+/// Unified error type for the whole crate.
+///
+/// 注意：本枚举内嵌 `std::io::Error` 与 `serde_json::Error`（二者不可克隆、不可比较），
+/// 因此只能 `#[derive(Debug)]`，不要试图给它加 `Clone` / `PartialEq`。
+#[derive(Debug)]
+pub enum AppError {
+    /// 文件/目录等 IO 失败。
+    Io(std::io::Error),
+    /// `serde_json` 解析或序列化失败。
+    Json(serde_json::Error),
+    /// 归档 / manifest 不合法。
+    Format(String),
+    /// 输入不合法（如 `kver` 含非法字符）。
+    Validation(String),
+    /// 用户取消。
+    Cancelled,
+    /// 外部命令非零退出。
+    Command {
+        /// 命令程序名。
+        program: String,
+        /// 退出码（信号杀掉时为 `128 + sig` 之类的约定值）。
+        status: i32,
+        /// 捕获到的标准错误。
+        stderr: String,
+    },
+    /// 提权失败 / 未获得 root。
+    Privilege(String),
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::Io(e) => write!(f, "I/O 错误 / I/O error: {e}"),
+            AppError::Json(e) => write!(f, "JSON 错误 / JSON error: {e}"),
+            AppError::Format(m) => write!(f, "归档格式错误 / archive format error: {m}"),
+            AppError::Validation(m) => write!(f, "输入校验失败 / validation error: {m}"),
+            AppError::Cancelled => write!(f, "操作已取消 / operation cancelled"),
+            AppError::Command {
+                program,
+                status,
+                stderr,
+            } => {
+                let stderr = stderr.trim();
+                write!(
+                    f,
+                    "命令 `{program}` 失败（退出码 {status}）/ command failed: {stderr}"
+                )
+            }
+            AppError::Privilege(m) => write!(f, "提权失败 / privilege error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AppError::Io(e) => Some(e),
+            AppError::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(e: std::io::Error) -> Self {
+        AppError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(e: serde_json::Error) -> Self {
+        AppError::Json(e)
+    }
+}
+
+/// 所有模块统一的结果类型。
+/// Result alias used by every module.
+pub type AppResult<T> = Result<T, AppError>;
+
+/// 把字节数格式化为 1024 进制的人类可读体积，例如 `"512 B"`、`"1.2 KiB"`。
+/// Format a byte count into a human readable binary-unit string such as `1.2 KiB`.
+///
+/// 规则：小于 1024 时输出整数 + ` B`（`0 B` / `512 B`），否则保留一位小数
+/// （`1.2 KiB` / `3.4 MiB` / `1.1 GiB`），单位依次为 KiB / MiB / GiB / TiB。
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// 校验内核版本串是否可安全进入命令行参数与文件名。
+/// Check whether a kernel release string is safe to embed in command-line arguments.
+///
+/// 规则：非空、字节长度 ≤ 128、首字符为 ASCII 字母或数字、其余字符仅限
+/// `[0-9A-Za-z._+-]` —— 即 DESIGN.md §4.5 的 `^[0-9A-Za-z][0-9A-Za-z._+-]*$`
+/// 再加长度上限。
+pub fn is_safe_kernel_version(s: &str) -> bool {
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    let first = match s.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distro::Family;
+    use std::error::Error; // 让 `source()` 在作用域内 / bring `source()` into scope
+
+    fn sample_manifest() -> Manifest {
+        Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            tool_version: "0.1.0".to_string(),
+            created_at: "2026-09-27T12:00:00Z".to_string(),
+            kernel_release: "6.8.0-45-generic".to_string(),
+            arch: "x86_64".to_string(),
+            distro: ManifestDistro {
+                id: "linuxmint".to_string(),
+                version_id: "22.3".to_string(),
+                pretty_name: "Linux Mint 22.3".to_string(),
+                family: Family::Debian,
+            },
+            mode: BackupMode::Standard,
+            entries: vec![ManifestEntry {
+                path: "lib/modules/6.8.0-45-generic/updates/dkms/foo.ko".to_string(),
+                size: 123_456,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                kind: EntryKind::Module,
+            }],
+            warnings: vec!["测试告警 / test warning".to_string()],
+        }
+    }
+
+    #[test]
+    fn human_size_uses_binary_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1), "1 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1234), "1.2 KiB");
+        assert_eq!(human_size(3_565_158), "3.4 MiB");
+        assert_eq!(human_size(1_181_116_006), "1.1 GiB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn kernel_version_validation() {
+        assert!(is_safe_kernel_version("6.8.0-45-generic"));
+        assert!(is_safe_kernel_version("6.1.0-1-amd64"));
+        assert!(is_safe_kernel_version("6.6.8-arch1-1"));
+        assert!(is_safe_kernel_version("5.15.0+foo_bar.baz"));
+        assert!(is_safe_kernel_version(&"a".repeat(128)));
+
+        assert!(!is_safe_kernel_version(""));
+        assert!(!is_safe_kernel_version(&"a".repeat(129)));
+        assert!(!is_safe_kernel_version("6.8.0/../x"));
+        assert!(!is_safe_kernel_version("-6.8.0"));
+        assert!(!is_safe_kernel_version("_6.8.0"));
+        assert!(!is_safe_kernel_version("6.8.0 x"));
+        assert!(!is_safe_kernel_version("6.8.0;rm -rf /"));
+        assert!(!is_safe_kernel_version("6.8.0$(id)"));
+        assert!(!is_safe_kernel_version("6.8.0-α"));
+        assert!(!is_safe_kernel_version("\n"));
+    }
+
+    #[test]
+    fn manifest_json_roundtrip() {
+        let m = sample_manifest();
+        let json = serde_json::to_string_pretty(&m).expect("manifest serialize");
+        let back: Manifest = serde_json::from_str(&json).expect("manifest deserialize");
+
+        assert_eq!(back.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(back.tool_version, m.tool_version);
+        assert_eq!(back.created_at, m.created_at);
+        assert_eq!(back.kernel_release, m.kernel_release);
+        assert_eq!(back.arch, m.arch);
+        assert_eq!(back.mode, m.mode);
+        assert_eq!(back.distro.id, m.distro.id);
+        assert_eq!(back.distro.version_id, m.distro.version_id);
+        assert_eq!(back.distro.pretty_name, m.distro.pretty_name);
+        assert_eq!(back.distro.family, m.distro.family);
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.entries[0].path, m.entries[0].path);
+        assert_eq!(back.entries[0].size, m.entries[0].size);
+        assert_eq!(back.entries[0].sha256, m.entries[0].sha256);
+        assert_eq!(back.entries[0].kind, m.entries[0].kind);
+        assert_eq!(back.warnings, m.warnings);
+
+        // 往返稳定：重新序列化应与首次序列化逐字节一致
+        assert_eq!(serde_json::to_string_pretty(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn enums_serialize_in_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&BackupMode::Minimal).unwrap(),
+            "\"minimal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupMode::Standard).unwrap(),
+            "\"standard\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupMode::Full).unwrap(),
+            "\"full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntryKind::Module).unwrap(),
+            "\"module\""
+        );
+        assert_eq!(serde_json::to_string(&EntryKind::Dkms).unwrap(), "\"dkms\"");
+        assert_eq!(
+            serde_json::to_string(&EntryKind::Config).unwrap(),
+            "\"config\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntryKind::Firmware).unwrap(),
+            "\"firmware\""
+        );
+
+        let mode: BackupMode = serde_json::from_str("\"full\"").unwrap();
+        assert_eq!(mode, BackupMode::Full);
+        let kind: EntryKind = serde_json::from_str("\"dkms\"").unwrap();
+        assert_eq!(kind, EntryKind::Dkms);
+        // warnings 字段缺省时应能反序列化（#[serde(default)]）
+        let no_warn: Manifest = serde_json::from_str(
+            r#"{"format_version":1,"tool_version":"0.1.0","created_at":"2026-09-27T12:00:00Z",
+                "kernel_release":"6.8.0-45-generic","arch":"x86_64",
+                "distro":{"id":"debian","version_id":"12","pretty_name":"Debian GNU/Linux 12",
+                          "family":"debian"},
+                "mode":"standard","entries":[]}"#,
+        )
+        .unwrap();
+        assert!(no_warn.warnings.is_empty());
+    }
+
+    #[test]
+    fn mode_index_roundtrip_and_fallback() {
+        assert_eq!(BackupMode::from_index(0), BackupMode::Minimal);
+        assert_eq!(BackupMode::from_index(1), BackupMode::Standard);
+        assert_eq!(BackupMode::from_index(2), BackupMode::Full);
+        // 非法下标回退 Standard（DESIGN.md §5.1）
+        assert_eq!(BackupMode::from_index(-1), BackupMode::Standard);
+        assert_eq!(BackupMode::from_index(3), BackupMode::Standard);
+        assert_eq!(BackupMode::from_index(99), BackupMode::Standard);
+
+        assert_eq!(BackupMode::Minimal.index(), 0);
+        assert_eq!(BackupMode::Standard.index(), 1);
+        assert_eq!(BackupMode::Full.index(), 2);
+        assert_eq!(BackupMode::Standard.label(), "Standard");
+    }
+
+    #[test]
+    fn app_error_display_and_source() {
+        let io_err = AppError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert!(io_err.to_string().contains("I/O"));
+        assert!(io_err.source().is_some());
+
+        let fmt = AppError::Format("bad entry".to_string());
+        assert!(fmt.to_string().contains("bad entry"));
+        assert!(fmt.source().is_none());
+
+        let cmd = AppError::Command {
+            program: "depmod".to_string(),
+            status: 1,
+            stderr: "oops".to_string(),
+        };
+        assert!(cmd.to_string().contains("depmod"));
+        assert!(cmd.to_string().contains("oops"));
+
+        let cancel: AppResult<()> = Err(AppError::Cancelled);
+        assert!(matches!(cancel, Err(AppError::Cancelled)));
+    }
+}

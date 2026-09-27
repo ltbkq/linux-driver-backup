@@ -1,0 +1,43 @@
+# 模块：工程清单（W1-A 工程骨架）—— 依赖、构建脚本与发布 profile 的唯一声明处。
+# Module: package manifest (W1-A skeleton) — single source of truth for deps, build script and release profile.
+#
+# 下方 [package] ~ [profile.release] 严格照抄 DESIGN.md §2.1「Cargo.toml（最终形态）」。
+# The sections below are verbatim from DESIGN.md §2.1 (Final Form).
+# 明确禁止加入 tokio 与 sys-info（DESIGN.md 核查 #2 / #3：Slint 不兼容 tokio、sys-info 已停维护）。
+# Forbidden: tokio and sys-info (fact-check #2 / #3 in DESIGN.md).
+
+[package]
+name = "linux-driver-backup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Linux out-of-tree driver (kernel module) backup & restore tool with adaptive distro support"
+license = "GPL-3.0-only"
+build = "build.rs"
+
+[dependencies]
+slint = { version = "1.18", default-features = false, features = [
+    "compat-1-18",   # 强制项：Slint 1.18 语义兼容
+    "compat-1-2",
+    "std",
+    "backend-winit-x11",
+    "backend-winit-wayland",
+    "renderer-winit-software",   # 软件渲染：无需 OpenGL/EGL
+    "renderer-software",
+] }
+tar = "0.4"
+flate2 = "1.1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[build-dependencies]
+slint-build = "1.18"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

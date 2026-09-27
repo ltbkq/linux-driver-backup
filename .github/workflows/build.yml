@@ -1,0 +1,332 @@
+# ============================================================
+# Linux 驱动备份与还原工具 —— CI 流水线
+# Linux driver backup & restore tool — CI pipeline
+#
+# 结构 / Layout:
+#   1) test    —— 轻量单元测试（cargo test --no-fail-fast），失败则整体失败
+#   2) build   —— 矩阵编译 release 产物（x86_64 / aarch64）+ sha256 清单 + 上传
+#   3) package —— 复用 x86_64 二进制，产出 deb / tar.gz / rpm / AppImage（DESIGN.md §11）
+#   4) release —— 仅在推送到 v* 标签时，汇总全部产物（含 package）并创建 GitHub Release
+#
+# 环境事实（来自 DESIGN.md §2 / §7，勿臆造）：
+#   - Slint 使用 default-features = false + backend-winit-x11 / backend-winit-wayland
+#     + renderer-winit-software（软件渲染），因此编译期需要 pkg-config 以及
+#     X11 / Wayland / xkbcommon 的开发头文件；
+#   - 运行期 winit 会 dlopen libxkbcommon.so.0 与 libwayland-client（见 §9 风险表）；
+#   - [profile.release] 已设 strip = true（DESIGN.md §2.1），产物为单个可执行文件。
+# ============================================================
+
+name: build
+
+# 触发 / Triggers：主干分支 push、PR、以及 v* 标签（标签触发用于自动发版）
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+
+# 默认只读；仅 release 作业单独提权（遵循最小权限原则）
+permissions:
+  contents: read
+
+# 同一 ref 的重复运行只保留最新（PR 取消旧的，主干/标签保留以保证可追溯）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ----------------------------------------------------------
+  # 1) 单元测试 / unit tests
+  #    独立 runner、体量轻；任何失败都会使整个 workflow 失败（后续作业被跳过）
+  # ----------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版 / Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装编译期系统依赖 / Install build-time system deps
+        # Slint（winit 后端 + 软件渲染）在编译期需要 pkg-config 与各窗口系统头文件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev
+
+      - name: 缓存 cargo / Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: 运行测试 / Run tests
+        # --no-fail-fast：尽量跑完全部测试再报告，便于一次看全问题
+        run: cargo test --no-fail-fast
+
+  # ----------------------------------------------------------
+  # 2) 矩阵编译 / matrix build
+  #    - x86_64：本机编译，runner 固定 ubuntu-22.04（glibc 2.35），
+  #      保证产物能在较旧的 glibc 发行版上运行（兼容面更广）
+  #    - aarch64：交叉编译，工具链选择见下方「交叉方案选型理由」
+  # ----------------------------------------------------------
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            cross: true
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版与目标 / Install Rust stable + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装编译期系统依赖 / Install build-time system deps
+        # pkg-config + X11/Wayland/xkbcommon 头文件：winit 后端编译所必需
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev
+
+      # --------------------------------------------------------
+      # 交叉方案选型理由 / Why this cross-compilation approach
+      #
+      # 可选方案有二：
+      #   A. taiki-e/setup-cross-toolchain-action（或 docker + `cargo install cross`
+      #      后用 `cross build --release --target ...`）
+      #   B. apt 安装 gcc-aarch64-linux-gnu + 手动设置
+      #      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+      #
+      # 本项目选 A（taiki-e/setup-cross-toolchain-action@v1），原因：
+      #   1) DESIGN.md §7 明确将 aarch64 标注为「cross」方案，本 action 即该方案的
+      #      最小实现：一条步骤装好 gcc-aarch64-linux-gnu 等交叉工具链，并自动设置
+      #      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER，无需在 YAML 里手写环境变量；
+      #   2) 相比 docker + `cargo install cross`：省去每次冷启动编译 cross（约数分钟）
+      #      或拉取 cross 容器镜像的开销，也无需给 runner 额外的 docker 权限；
+      #   3) 相比纯 apt 方案：不依赖维护者记住 linker 环境变量的正确拼写，
+      #      换 target 时只需改 matrix.target。
+      #
+      # 说明：aarch64 同样在宿主（x86_64）安装上述 -dev 包，用于提供头文件与
+      # .pc 元数据；本项目 Slint 关闭默认特性且走运行时 dlopen，交叉构建无需在
+      # 目标 sysroot 内链接 X11/Wayland 动态库。若将来引入必须 pkg-config 链接的
+      # -sys crate，再切换为 cross 容器方案（届时可直接沿用 matrix 结构）。
+      # --------------------------------------------------------
+      - name: 配置 aarch64 交叉工具链 / Set up aarch64 cross toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+
+      - name: 缓存 cargo / Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 按 target 区分缓存键，避免 x86_64/aarch64 互相污染
+          key: ${{ matrix.target }}
+
+      - name: 编译 release / Build release
+        # 统一使用 --target：产物路径固定为 target/<target>/release/…，
+        # 两个矩阵项的后续步骤（strip、校验、上传）因此可以完全一致
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: strip 二进制 / Strip the binary
+        # Cargo.toml 的 [profile.release] 已设 strip = true（DESIGN.md §2.1），
+        # 此步骤是幂等的「兜底」：对已 strip 的文件再次执行为 no-op；
+        # 若交叉工具链未提供对应 strip，也不阻断产物交付。
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/linux-driver-backup"
+          case "${{ matrix.target }}" in
+            x86_64-*)              strip "$bin" || true ;;
+            aarch64-*)             aarch64-linux-gnu-strip "$bin" || true ;;
+            *)                     echo "unknown target: ${{ matrix.target }}"; exit 1 ;;
+          esac
+
+      - name: 打包产物并生成 SHA-256 清单 / Stage artifacts + checksums
+        # 产物与清单的文件名都包含 target，避免多架构上传时互相覆盖
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/linux-driver-backup"
+          name="linux-driver-backup-${{ matrix.target }}"
+          test -f "$src"
+          cp "$src" "dist/$name"
+          chmod +x "dist/$name"
+          # sha256sum 清单内记录的是 dist 内的相对文件名，便于 release 后校验：
+          #   sha256sum -c linux-driver-backup-<target>.sha256
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          echo "=== SHA-256 清单 / checksum manifest ==="
+          cat "dist/$name.sha256"
+
+      - name: 上传构建产物 / Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-driver-backup-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------
+  # 3) 打包 / package
+  #    依赖 build 作业的 x86_64 二进制，产出「下载即装」的四种格式（DESIGN.md §11）：
+  #      .deb  —— Debian / Ubuntu / Mint / Kali …（dpkg-deb，runner 自带）
+  #      .tar.gz + install.sh —— 通用兜底（任意发行版）
+  #      .rpm  —— Fedora / RHEL / Rocky / openEuler（需 apt 安装 rpm 提供 rpmbuild）
+  #      AppImage —— 任意发行版免安装（需网络下载 appimagetool，失败不阻断）
+  #    本机（开发机）没有 rpmbuild/appimagetool 时由本 job 统一补齐（§11.4）。
+  # ----------------------------------------------------------
+  package:
+    name: package
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@v4
+
+      - name: 下载 x86_64 二进制产物 / Download x86_64 artifact
+        # 只取 x86_64：deb/rpm/AppImage 首版仅产出 x86_64（aarch64 的二进制仍随 release 发布）
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-driver-backup-x86_64-unknown-linux-gnu
+          path: artifact-x86_64
+
+      - name: 安装 rpmbuild / Install rpm tooling
+        # `rpm` 包同时提供 rpmbuild 与 rpm 查询工具
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+
+      - name: 解包二进制到 target/release / Unpack binary into target/release
+        # packaging/build-packages.sh 固定从 target/release/linux-driver-backup 取二进制，
+        # 这里把 artifact 还原成该路径，脚本无需感知 CI 的 artifact 命名
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          src="artifact-x86_64/linux-driver-backup-x86_64-unknown-linux-gnu"
+          test -f "$src"
+          cp "$src" target/release/linux-driver-backup
+          chmod +x target/release/linux-driver-backup
+          # 冒烟：确认拿到的是可执行 ELF；--version 未实现或环境无显示时也不阻断打包
+          if command -v file >/dev/null 2>&1; then
+            file target/release/linux-driver-backup
+          fi
+          timeout 15 ./target/release/linux-driver-backup --version \
+            || echo "::warning::--version 冒烟未通过（不阻断打包）"
+
+      - name: 构建 deb / tar / rpm / Build deb, tar.gz and rpm
+        # 工具缺失时脚本只打印「[跳过]」不失败；deb 与 tar 在 runner 上必然产出
+        run: bash packaging/build-packages.sh deb tar rpm
+
+      - name: 构建 AppImage / Build AppImage
+        # 单独一步 + continue-on-error：需联网下载 appimagetool，失败时
+        # build-appimage.sh 打印中文 warning 并 exit 0（DESIGN.md §11.4 降级策略）
+        continue-on-error: true
+        run: bash packaging/build-appimage.sh
+
+      - name: 检查打包产物 / Verify package outputs
+        run: |
+          set -euo pipefail
+          echo "=== 打包产物 / package outputs ==="
+          ls -l dist
+          # deb + tar 是硬性要求（下面两条 ls 找不到文件即失败）
+          ls dist/*.deb
+          ls dist/*.tar.gz
+          # 每个产物都应有同名 .sha256，供 release 阶段 sha256sum -c 复验
+          for f in dist/*.deb dist/*.tar.gz dist/*.rpm dist/*.AppImage; do
+            [ -e "$f" ] || continue
+            test -f "$f.sha256"
+          done
+
+      - name: 上传打包产物 / Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          # 命名必须落在 linux-driver-backup-* 之下，release 作业按该 pattern 下载
+          name: linux-driver-backup-packages
+          path: dist/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------
+  # 4) 发布 / release
+  #    仅在推送 v* 标签（refs/tags/）时运行；下载全部矩阵产物 **与打包产物**，
+  #    逐份 sha256sum -c 复验后，用 softprops/action-gh-release@v2 创建 Release
+  # ----------------------------------------------------------
+  release:
+    name: release
+    needs: [test, build, package]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write   # 创建 Release / 上传资产需要写权限
+    steps:
+      - name: 下载全部产物 / Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true   # 把矩阵产物与打包产物合并到同一目录
+          # pattern 同时命中 build 作业的 linux-driver-backup-<triple> 与
+          # package 作业的 linux-driver-backup-packages（deb/tar/rpm/AppImage）
+          pattern: linux-driver-backup-*
+
+      - name: 校对产物 / Verify checksums
+        run: |
+          set -euo pipefail
+          echo "=== 待发布文件 / files to release ==="
+          ls -l dist
+
+          # 1) 逐份复验 sha256 清单（覆盖 build 的二进制与 package 的 deb/tar/rpm/AppImage）
+          #    清单内记录的是 dist 内的相对文件名，因此在 dist 目录内执行 -c
+          count=0
+          for f in dist/*.sha256; do
+            [ -e "$f" ] || continue
+            count=$((count + 1))
+            echo "--- 复验 / verify: $(basename "$f") ---"
+            (cd dist && sha256sum -c "$(basename "$f")")
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "::error::未找到任何 .sha256 清单"
+            exit 1
+          fi
+
+          # 2) 覆盖性检查：每个待发布文件都必须出现在某份清单里，防止漏校验
+          for f in dist/*; do
+            [ -e "$f" ] || continue
+            case "$f" in *.sha256) continue ;; esac
+            base="$(basename "$f")"
+            if ! grep -qF "  $base" dist/*.sha256; then
+              echo "::error::缺少 SHA-256 记录: $base"
+              exit 1
+            fi
+          done
+          echo "=== 全部校验通过 / all checksums OK ==="
+
+      - name: 创建 GitHub Release / Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 附带：两个架构的单文件二进制 + 各自 .sha256
+          #       + deb / tar.gz / rpm / AppImage（若产出）及其 .sha256
+          files: |
+            dist/*
+          generate_release_notes: true

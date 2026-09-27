@@ -1,0 +1,41 @@
+# debian/control 模板 / Debian control template
+#
+# 用法 / Usage：
+#   构建时由 packaging/build-packages.sh 用 sed 做占位替换：
+#     @VERSION@   ← Cargo.toml 的 version 字段（如 0.1.0）
+#     @SIZE_KB@   ← data 树体积（du -sk，单位 KiB，不含 DEBIAN/）
+#     amd64       ← 目标架构；CI 的 arm64 构建会替换 Architecture 行为 arm64
+#   组装后自检：dpkg-deb -I xxx.deb 与 dpkg-deb -c xxx.deb
+#
+# 注意：dpkg-deb 对 control 文件里的 # 注释行容忍度依版本而定，
+# build-packages.sh 组装时统一先剥离 # 开头的行，再写入 DEBIAN/control。
+#
+# 关于 Depends / About the Depends line：
+#   W3 已用 `ldd target/release/linux-driver-backup` 实测复核（DESIGN.md §11.4）：
+#   - 硬链接（DT_NEEDED）：libc6、libfontconfig1、libfreetype6（Slint 软件渲染的
+#     系统字体发现与字形栅格化），以及 libgcc_s1/libz1 等由前两者传递引入；
+#   - 运行期 dlopen：libxkbcommon0（键盘映射）、libwayland-client0（Wayland 会话；
+#     X11 会话不需要）。这些不在 ldd 输出里，但缺了会启动失败。
+#   glibc 下限取 CI 构建机（ubuntu-22.04）的 2.35，以覆盖更广的发行版；
+#   RPM 侧对应 Requires 同步为同一组。
+#   Verified with `ldd` in W3: hard (DT_NEEDED) deps are libc6, libfontconfig1 and
+#   libfreetype6; libxkbcommon0 / libwayland-client0 are dlopen'ed at runtime.
+Package: linux-driver-backup
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Installed-Size: @SIZE_KB@
+Maintainer: ltbkq <ltbkqq@gmail.com>
+Depends: libc6 (>= 2.35), libfontconfig1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
+Homepage: https://github.com/ltbkq/linux-driver-backup
+Description: Backup and restore out-of-tree Linux kernel drivers
+ 备份与还原 Linux 外置（out-of-tree）驱动模块的桌面 + 命令行工具。
+ 支持 minimal / standard / full 三级备份模式、逐文件 SHA-256 校验、
+ 归档格式为 tar.gz 并内含 manifest.json，可跨机还原；还原前支持 dry-run 预演，
+ 写入系统目录时通过 pkexec 完成单次提权。
+ .
+ A single self-contained binary offering both a Slint GUI and a scriptable CLI
+ (--scan / --backup / --restore). Scans out-of-tree modules, DKMS sources and
+ related config files, hashes every entry with SHA-256 and packs them into a
+ verifiable tar.gz archive that can be restored across machines.

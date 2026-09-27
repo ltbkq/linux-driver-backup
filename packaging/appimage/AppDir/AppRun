@@ -1,0 +1,8 @@
+#!/bin/sh
+# AppImage 入口 / AppImage entry point.
+#
+# AppDir 的骨架文件（随仓库版本控制）；build-appimage.sh 会把它复制到
+# 生成的 AppDir 根目录，与 .desktop、图标、usr/bin/linux-driver-backup 组合。
+# 用相对路径定位真实二进制，不依赖 /usr 挂载点，AppImage 移动到任意位置都可运行。
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$HERE/usr/bin/linux-driver-backup" "$@"

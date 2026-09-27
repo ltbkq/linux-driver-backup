@@ -1,0 +1,1268 @@
+//! 模块：程序入口 —— GUI 装配、CLI 分发与 root helper 重入。
+//! Module: entry point — GUI wiring, CLI dispatch and root helper re-entry.
+//!
+//! 【职责 / Responsibilities】
+//! 1. 无参数：启动 Slint GUI，绑定 4 个冻结回调（DESIGN.md §4.6），耗时工作全部放到
+//!    `std::thread` 工作线程，经 `Weak::upgrade_in_event_loop` 回写属性（严禁在回调里
+//!    捕获 `AppWindow` 强引用，否则引用环会导致窗口关不掉）。
+//! 2. CLI：手写参数解析（不引入 clap），实现 `--scan/--backup/--restore/--helper-restore`
+//!    （DESIGN.md §5.7），便于无显示环境、脚本与 CI 冒烟测试。
+//! 3. `--helper-restore`：由 `pkexec <自身> …` 以 root 重入的**无 GUI** 分支，按
+//!    `PROGRESS/NOTE/RESULT` 行协议回传结果（DESIGN.md §4.5）。
+//!
+//! [Summary] GUI mode wires the four frozen callbacks and runs all heavy work on worker
+//! threads; CLI mode implements the hand-rolled argument parsing; helper mode is the
+//! root-only, GUI-less re-entry driven by the `PROGRESS/NOTE/RESULT` line protocol.
+
+mod backup;
+mod distro;
+mod model;
+mod privilege;
+mod restore;
+mod scan;
+
+slint::include_modules!();
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use slint::{ComponentHandle, ModelRc, VecModel};
+
+use crate::distro::DistroInfo;
+use crate::model::{
+    human_size, AppError, AppResult, BackupMode, EntryKind, ProgressFn, ScanReport,
+};
+use crate::scan::ScanOptions;
+
+/// 命令行入口的解析结果。
+/// Parsed command line entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cmd {
+    /// 无参数 → 启动 GUI。 / No arguments → launch the GUI.
+    Gui,
+    /// `--help` / `-h`。
+    Help,
+    /// `--version` / `-V`。
+    Version,
+    /// `--scan [--mode <m>] [--json]`。
+    Scan { mode: BackupMode, json: bool },
+    /// `--backup --out <f> [--mode <m>] [--kver <k>]`。
+    Backup {
+        out: String,
+        mode: BackupMode,
+        kver: Option<String>,
+    },
+    /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`。
+    Restore {
+        archive: String,
+        dry_run: bool,
+        yes: bool,
+        with_firmware: bool,
+        allow_kernel_mismatch: bool,
+    },
+    /// `--helper-restore --archive <f> [--kver <k>] [--with-firmware] [--allow-kernel-mismatch]`。
+    Helper {
+        archive: String,
+        kver: Option<String>,
+        with_firmware: bool,
+        allow_kernel_mismatch: bool,
+    },
+}
+
+// ===========================================================================
+// 参数解析 / Argument parsing
+// ===========================================================================
+
+/// 把 `--mode` 的取值映射为 [`BackupMode`]。
+/// Map the `--mode` value onto [`BackupMode`].
+fn parse_mode(value: &str) -> Result<BackupMode, String> {
+    match value {
+        "minimal" => Ok(BackupMode::Minimal),
+        "standard" => Ok(BackupMode::Standard),
+        "full" => Ok(BackupMode::Full),
+        other => Err(format!(
+            "`--mode` 取值非法：`{other}`（可选 minimal | standard | full）"
+        )),
+    }
+}
+
+/// 取参数值：支持 `--mode standard` 与 `--mode=standard` 两种写法。
+/// Take an option value, accepting both `--mode standard` and `--mode=standard`.
+fn take_value(
+    args: &[String],
+    idx: &mut usize,
+    name: &str,
+    inline: Option<&str>,
+) -> Result<String, String> {
+    if let Some(v) = inline {
+        if v.is_empty() {
+            return Err(format!("`{name}` 缺少取值"));
+        }
+        *idx += 1;
+        return Ok(v.to_string());
+    }
+    *idx += 1;
+    match args.get(*idx) {
+        Some(v) if !v.starts_with('-') => {
+            *idx += 1;
+            Ok(v.clone())
+        }
+        _ => Err(format!("`{name}` 缺少取值")),
+    }
+}
+
+/// 解析 `--name=value` 形式的等号写法。
+/// Split an `--name=value` style argument.
+fn split_inline(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (arg, None),
+    }
+}
+
+/// 解析命令行参数（不含 argv[0]）。
+/// Parse the command line (excluding argv[0]).
+fn parse_args(args: &[String]) -> Result<Cmd, String> {
+    if args.is_empty() {
+        return Ok(Cmd::Gui);
+    }
+
+    let (first, first_inline) = split_inline(&args[0]);
+    if first_inline.is_some() {
+        return Err(format!("未知参数：`{}`", args[0]));
+    }
+
+    match first {
+        "--help" | "-h" => Ok(Cmd::Help),
+        "--version" | "-V" => Ok(Cmd::Version),
+        "--scan" => {
+            let mut idx = 1;
+            let mut mode = BackupMode::Standard;
+            let mut json = false;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--json" => {
+                        if inline.is_some() {
+                            return Err("`--json` 不接受取值".to_string());
+                        }
+                        json = true;
+                        idx += 1;
+                    }
+                    "--mode" => mode = parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?,
+                    other => return Err(format!("`--scan` 不支持参数 `{other}`")),
+                }
+            }
+            Ok(Cmd::Scan { mode, json })
+        }
+        "--backup" => {
+            let mut idx = 1;
+            let mut out: Option<String> = None;
+            let mut mode = BackupMode::Standard;
+            let mut kver: Option<String> = None;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--out" => out = Some(take_value(args, &mut idx, "--out", inline)?),
+                    "--mode" => mode = parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?,
+                    "--kver" => kver = Some(take_value(args, &mut idx, "--kver", inline)?),
+                    other => return Err(format!("`--backup` 不支持参数 `{other}`")),
+                }
+            }
+            let out = out.ok_or_else(|| "`--backup` 必须提供 `--out <归档路径>`".to_string())?;
+            Ok(Cmd::Backup { out, mode, kver })
+        }
+        "--restore" => {
+            let mut idx = 1;
+            let mut archive: Option<String> = None;
+            let mut dry_run = false;
+            let mut yes = false;
+            let mut with_firmware = false;
+            let mut allow_kernel_mismatch = false;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--archive" => {
+                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
+                    }
+                    "--dry-run" => {
+                        dry_run = true;
+                        idx += 1;
+                    }
+                    "--yes" | "-y" => {
+                        yes = true;
+                        idx += 1;
+                    }
+                    "--with-firmware" => {
+                        with_firmware = true;
+                        idx += 1;
+                    }
+                    "--allow-kernel-mismatch" => {
+                        allow_kernel_mismatch = true;
+                        idx += 1;
+                    }
+                    other => return Err(format!("`--restore` 不支持参数 `{other}`")),
+                }
+            }
+            let archive =
+                archive.ok_or_else(|| "`--restore` 必须提供 `--archive <归档路径>`".to_string())?;
+            Ok(Cmd::Restore {
+                archive,
+                dry_run,
+                yes,
+                with_firmware,
+                allow_kernel_mismatch,
+            })
+        }
+        "--helper-restore" => {
+            let mut idx = 1;
+            let mut archive: Option<String> = None;
+            let mut kver: Option<String> = None;
+            let mut with_firmware = false;
+            let mut allow_kernel_mismatch = false;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--archive" => {
+                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
+                    }
+                    "--kver" => kver = Some(take_value(args, &mut idx, "--kver", inline)?),
+                    "--with-firmware" => {
+                        with_firmware = true;
+                        idx += 1;
+                    }
+                    "--allow-kernel-mismatch" => {
+                        allow_kernel_mismatch = true;
+                        idx += 1;
+                    }
+                    other => return Err(format!("`--helper-restore` 不支持参数 `{other}`")),
+                }
+            }
+            let archive = archive.ok_or_else(|| {
+                "`--helper-restore` 必须提供 `--archive <归档路径>`".to_string()
+            })?;
+            Ok(Cmd::Helper {
+                archive,
+                kver,
+                with_firmware,
+                allow_kernel_mismatch,
+            })
+        }
+        other => Err(format!(
+            "未知子命令：`{other}`（参见 `--help` / see `--help`）"
+        )),
+    }
+}
+
+/// 中英双语用法说明。
+/// Bilingual usage text.
+fn usage() -> String {
+    format!(
+        "linux-driver-backup {version} —— Linux 驱动备份与还原工具 / Linux driver backup & restore\n\
+         \n\
+         用法 / Usage:\n\
+         \x20 linux-driver-backup                                   # 启动图形界面 / launch the GUI\n\
+         \x20 linux-driver-backup --scan [--mode <m>] [--json]      # 扫描外置驱动 / scan out-of-tree drivers\n\
+         \x20 linux-driver-backup --backup --out <f> [--mode <m>] [--kver <k>]\n\
+         \x20 linux-driver-backup --restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]\n\
+         \x20 linux-driver-backup --helper-restore --archive <f> [--kver <k>] [--with-firmware]\n\
+         \n\
+         说明 / Notes:\n\
+         \x20 模式 <m>：minimal | standard（默认）| full（含 /lib/firmware）\n\
+         \x20 备份无需 root；真实还原需要 root（GUI 走 pkexec 单次提权，CLI 请用 sudo 运行）。\n\
+         \x20 `--helper-restore` 仅供内部提权重入使用，用户不应手动调用。\n\
+         \x20 Backup needs no root; a real restore does (GUI elevates once via pkexec,\n\
+         \x20 CLI users should run with sudo). `--helper-restore` is internal-only.\n\
+         \n\
+         退出码 / Exit codes: 0 成功 success | 1 业务失败 failure | 2 用法错误 usage error\n",
+        version = env!("CARGO_PKG_VERSION")
+    )
+}
+
+// ===========================================================================
+// 通用小工具 / Small helpers
+// ===========================================================================
+
+/// 展开仅前缀的 `~`（不处理 `~user`），其余原样返回。
+/// Expand a leading `~` only; everything else is returned as-is.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        if path == "~" {
+            return PathBuf::from(home);
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// 条目分类的中文短标签，用于 GUI 列表。
+/// Short Chinese label for an entry kind, used by the GUI list.
+fn kind_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Module => "模块",
+        EntryKind::Dkms => "DKMS",
+        EntryKind::Config => "配置",
+        EntryKind::Firmware => "固件",
+    }
+}
+
+/// 打印到 stderr 的 CLI 进度回调（200ms 或 1% 节流）。
+/// CLI progress callback printing to stderr, throttled to 200ms or 1%.
+fn cli_progress() -> ProgressFn {
+    let last = Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), -1.0f32)));
+    Arc::new(move |value: f32, msg: String| {
+        let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, previous) = *guard;
+        let force = value <= 0.0 || value >= 1.0;
+        if !force && at.elapsed() < Duration::from_millis(200) && (value - previous).abs() < 0.01 {
+            return;
+        }
+        *guard = (Instant::now(), value);
+        let percent = (value.clamp(0.0, 1.0) * 100.0).round() as i32;
+        eprintln!("[{percent:>3}%] {msg}");
+    })
+}
+
+/// GUI 进度回调：节流后经事件循环回写 `progress` / `status-text`。
+/// GUI progress callback: throttled, posted to the event loop to update the UI.
+fn gui_progress(weak: slint::Weak<AppWindow>) -> ProgressFn {
+    let last = Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), -1.0f32)));
+    Arc::new(move |value: f32, msg: String| {
+        let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, previous) = *guard;
+        let force = value <= 0.0 || value >= 1.0;
+        if !force && at.elapsed() < Duration::from_millis(100) && (value - previous).abs() < 0.01 {
+            return;
+        }
+        *guard = (Instant::now(), value);
+        drop(guard);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_progress(value.clamp(0.0, 1.0));
+            if !msg.is_empty() {
+                ui.set_status_text(msg.into());
+            }
+        });
+    })
+}
+
+/// 在事件循环里结束一次 GUI 任务：复位忙碌态并写入结果文案。
+/// Finish a GUI task on the event loop: clear the busy flag and show the result.
+fn finish_gui(weak: &slint::Weak<AppWindow>, running: &Arc<AtomicBool>, ok: bool, msg: String) {
+    let weak = weak.clone();
+    let running = Arc::clone(running);
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        running.store(false, Ordering::SeqCst);
+        ui.set_busy(false);
+        if ok {
+            ui.set_progress(1.0);
+        } else {
+            ui.set_progress(0.0);
+        }
+        ui.set_status_text(msg.into());
+    });
+}
+
+/// 开始一次 GUI 任务：互斥保护 + 复位取消位与进度。
+/// Begin a GUI task: mutual exclusion plus cancel/progress reset.
+fn begin_task(
+    ui: &AppWindow,
+    running: &Arc<AtomicBool>,
+    cancel: &Arc<AtomicBool>,
+    status: &str,
+) -> bool {
+    if running.swap(true, Ordering::SeqCst) {
+        ui.set_status_text("已有任务正在运行，请先取消或等待完成。".into());
+        return false;
+    }
+    cancel.store(false, Ordering::SeqCst);
+    ui.set_busy(true);
+    ui.set_progress(0.0);
+    ui.set_status_text(status.into());
+    true
+}
+
+/// 把扫描结果转成 GUI 列表项：跳过固件条目并限制条数，返回 `(列表, 是否截断, 总数)`。
+/// Convert a scan report into GUI rows: firmware entries are dropped and the list is
+/// capped; returns `(rows, truncated, total_non_firmware)`.
+fn to_module_items(report: &ScanReport) -> (Vec<ModuleItem>, bool, usize) {
+    const MAX_ROWS: usize = 500;
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for entry in &report.entries {
+        if entry.kind == EntryKind::Firmware {
+            continue;
+        }
+        total += 1;
+        if rows.len() >= MAX_ROWS {
+            continue;
+        }
+        let name = entry
+            .abs_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.rel_path.clone());
+        rows.push(ModuleItem {
+            name: name.into(),
+            path: entry.rel_path.clone().into(),
+            size: human_size(entry.size).into(),
+            kind: kind_label(entry.kind).into(),
+        });
+    }
+    let truncated = total > rows.len();
+    (rows, truncated, total)
+}
+
+// ===========================================================================
+// CLI 子命令 / CLI subcommands
+// ===========================================================================
+
+/// `--scan`：扫描并打印（`--json` 输出机器可读 JSON）。
+/// `--scan`: scan and print, optionally as machine-readable JSON.
+fn run_cli_scan(mode: BackupMode, json: bool) -> i32 {
+    let kver = distro::kernel_release();
+    let info = DistroInfo::detect();
+    let cancel = AtomicBool::new(false);
+    let options = ScanOptions {
+        kver: &kver,
+        distro: &info,
+        mode,
+        cancel: Some(&cancel),
+    };
+
+    match scan::scan(&options) {
+        Ok(report) => {
+            if json {
+                print_scan_json(&report, &info, &kver, mode);
+            } else {
+                println!(
+                    "内核 / kernel: {}    发行版 / distro: {}    模式 / mode: {}",
+                    kver,
+                    info,
+                    mode.label()
+                );
+                println!(
+                    "in-tree 跳过 {} 个；共 {} 个条目；固件 {}",
+                    report.skipped_in_tree,
+                    report.entries.len(),
+                    human_size(report.firmware_bytes)
+                );
+                for entry in &report.entries {
+                    println!(
+                        "  [{:<4}] {:>10}  {}",
+                        kind_label(entry.kind),
+                        human_size(entry.size),
+                        entry.rel_path
+                    );
+                }
+                for warning in &report.warnings {
+                    eprintln!("警告 / warning: {warning}");
+                }
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("扫描失败 / scan failed: {err}");
+            1
+        }
+    }
+}
+
+/// 输出 `--scan --json` 的 JSON 结构。
+/// Emit the JSON document for `--scan --json`.
+fn print_scan_json(report: &ScanReport, info: &DistroInfo, kver: &str, mode: BackupMode) {
+    use serde_json::json;
+    let entries: Vec<serde_json::Value> = report
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "path": entry.rel_path,
+                "size": entry.size,
+                "kind": serde_json::to_value(entry.kind).unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    let document = json!({
+        "kernel_release": kver,
+        "arch": distro::arch(),
+        "distro": {
+            "id": info.id,
+            "version_id": info.version_id,
+            "pretty_name": info.pretty_name,
+            "family": info.family,
+        },
+        "mode": mode,
+        "skipped_in_tree": report.skipped_in_tree,
+        "firmware_bytes": report.firmware_bytes,
+        "entry_count": report.entries.len(),
+        "warnings": report.warnings,
+        "entries": entries,
+    });
+    match serde_json::to_string_pretty(&document) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("JSON 序列化失败 / JSON serialization failed: {err}"),
+    }
+}
+
+/// `--backup`：打包外置驱动到 `.tar.gz`。
+/// `--backup`: pack out-of-tree drivers into a `.tar.gz` archive.
+fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
+    let kver = kver.unwrap_or_else(distro::kernel_release);
+    let out_path = expand_tilde(out);
+    let request = backup::BackupRequest {
+        out_file: out_path.clone(),
+        kver: kver.clone(),
+        distro: DistroInfo::detect(),
+        mode,
+        progress: cli_progress(),
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+
+    eprintln!(
+        "开始备份 / starting backup: 内核 {kver}，模式 {}，输出 {}",
+        mode.label(),
+        out_path.display()
+    );
+    match backup::run_backup(request) {
+        Ok(report) => {
+            println!(
+                "备份完成 / done: {}（{} 个条目，{}，耗时 {:.1}s，归档格式 v{}）",
+                report.out_file.display(),
+                report.entry_count,
+                human_size(report.bytes_written),
+                report.duration_ms as f64 / 1000.0,
+                report.manifest.format_version
+            );
+            0
+        }
+        Err(AppError::Cancelled) => {
+            eprintln!("已取消 / cancelled");
+            1
+        }
+        Err(err) => {
+            eprintln!("备份失败 / backup failed: {err}");
+            1
+        }
+    }
+}
+
+/// `--restore`：校验并还原归档。
+/// `--restore`: verify and restore an archive.
+///
+/// CLI 在无 root 且非 `--dry-run` 时**不会**自动 `pkexec`，而是提示用户改用 `sudo`
+/// （GUI 才自动提权）；`--dry-run` 不需要 root，始终可执行。
+/// Without root, the CLI never auto-elevates (only the GUI does): it tells the user to
+/// re-run with sudo. `--dry-run` needs no root and always works.
+fn run_cli_restore(
+    archive: &str,
+    dry_run: bool,
+    yes: bool,
+    with_firmware: bool,
+    allow_kernel_mismatch: bool,
+) -> i32 {
+    let path = expand_tilde(archive);
+
+    // 普通权限即可读归档：先 inspect 用于打印确认信息与提示内核不一致。
+    let info = match restore::inspect(&path) {
+        Ok(info) => info,
+        Err(err) => {
+            eprintln!("读取归档失败 / cannot read archive: {err}");
+            return 1;
+        }
+    };
+    let current_kver = distro::kernel_release();
+    let mismatch = info.manifest.kernel_release != current_kver;
+
+    if !dry_run && !yes {
+        println!("即将还原 / about to restore:");
+        println!("  归档 / archive : {}", path.display());
+        println!(
+            "  备份内核 / kernel: {}  当前内核 / current: {}",
+            info.manifest.kernel_release, current_kver
+        );
+        println!(
+            "  发行版 / distro: {}（{}）",
+            info.manifest.distro.pretty_name, info.manifest.mode.label()
+        );
+        println!("  条目 / entries : {}", info.manifest.entries.len());
+        println!("  体积 / payload : {}", human_size(info.total_bytes));
+        if mismatch {
+            println!("  ⚠ 内核不一致，跨内核还原可能导致模块 ABI 不兼容");
+        }
+        print!("确认继续？[y/N] / continue? ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            eprintln!("读取标准输入失败 / cannot read stdin");
+            return 1;
+        }
+        let answer = answer.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("已取消 / cancelled");
+            return 0;
+        }
+    }
+
+    if !dry_run && !distro::is_root() {
+        eprintln!(
+            "还原需要 root 权限 / restore requires root：请用 `sudo linux-driver-backup --restore …` 运行，\n\
+             或改用图形界面（由 pkexec 弹出系统密码框完成单次提权）。\n\
+             `--dry-run` 预演不需要 root。"
+        );
+        return 1;
+    }
+
+    let request = restore::RestoreRequest {
+        archive: path,
+        kver: None,
+        dry_run,
+        allow_kernel_mismatch,
+        with_firmware,
+        progress: cli_progress(),
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+
+    match restore::run_restore(request) {
+        Ok(report) => {
+            if report.dry_run {
+                println!("预演完成 / dry-run finished（未写盘 / nothing written）：");
+                for note in &report.notes {
+                    println!("  - {note}");
+                }
+            } else {
+                println!(
+                    "还原完成 / restore finished: 写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                    report.written,
+                    report.skipped,
+                    report.depmod_done,
+                    match report.initramfs_done {
+                        Some(true) => "已更新 / updated",
+                        Some(false) => "失败 / failed",
+                        None => "跳过 / skipped（未知发行版）",
+                    }
+                );
+                for note in &report.notes {
+                    println!("  - {note}");
+                }
+            }
+            0
+        }
+        Err(AppError::Cancelled) => {
+            eprintln!("已取消 / cancelled");
+            1
+        }
+        Err(err) => {
+            eprintln!("还原失败 / restore failed: {err}");
+            1
+        }
+    }
+}
+
+/// `--helper-restore`：`pkexec` 以 root 重入的无 GUI 分支，按行协议回传。
+/// `--helper-restore`: the GUI-less, root-only re-entry driven by pkexec.
+fn run_helper(
+    archive: String,
+    kver: Option<String>,
+    with_firmware: bool,
+    allow_kernel_mismatch: bool,
+) -> i32 {
+    let sink_progress = privilege::HelperSink::new();
+    let sink_result = privilege::HelperSink::new();
+    let progress: ProgressFn = Arc::new(move |value: f32, msg: String| {
+        sink_progress.progress(value, &msg);
+    });
+
+    let request = restore::RestoreRequest {
+        archive: expand_tilde(&archive),
+        kver,
+        dry_run: false,
+        allow_kernel_mismatch,
+        with_firmware,
+        progress,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+
+    match restore::run_restore(request) {
+        Ok(report) => {
+            let message = format!(
+                "还原完成：写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                report.written,
+                report.skipped,
+                report.depmod_done,
+                match report.initramfs_done {
+                    Some(true) => "已更新",
+                    Some(false) => "失败",
+                    None => "已跳过（未知发行版）",
+                }
+            );
+            for note in &report.notes {
+                sink_result.note(note);
+            }
+            sink_result.result(true, &message);
+            0
+        }
+        Err(err) => {
+            sink_result.result(false, &err.to_string());
+            1
+        }
+    }
+}
+
+// ===========================================================================
+// GUI 模式 / GUI mode
+// ===========================================================================
+
+/// 启动 Slint 图形界面并绑定 4 个冻结回调。
+/// Launch the Slint GUI and wire the four frozen callbacks.
+fn run_gui() -> AppResult<()> {
+    let app = AppWindow::new().map_err(|err| {
+        AppError::Privilege(format!(
+            "无法初始化图形界面（缺少显示服务器或窗口系统库？）：{err}"
+        ))
+    })?;
+
+    // ---- 启动时的静态信息 ----
+    let kver = distro::kernel_release();
+    let info = DistroInfo::detect();
+    app.set_system_info(
+        format!(
+            "内核 / kernel {} · {} · 架构 {} · {} · 发行版 {} {}",
+            kver,
+            info,
+            distro::arch(),
+            if distro::is_root() { "root" } else { "普通用户" },
+            info.id,
+            info.version_id
+        )
+        .into(),
+    );
+    app.set_out_path(
+        backup::default_out_path(&kver)
+            .to_string_lossy()
+            .to_string()
+            .into(),
+    );
+
+    // ---- 跨回调共享状态 ----
+    let running = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // ---- 回调 1：扫描 ----
+    {
+        let weak = app.as_weak();
+        let running = Arc::clone(&running);
+        let cancel = Arc::clone(&cancel);
+        app.on_refresh_scan(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !begin_task(&ui, &running, &cancel, "正在扫描外置驱动模块…") {
+                return;
+            }
+            let mode = BackupMode::from_index(ui.get_mode_index());
+            let weak_thread = weak.clone();
+            let running_thread = Arc::clone(&running);
+            let cancel_thread = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let kver = distro::kernel_release();
+                let info = DistroInfo::detect();
+                let options = ScanOptions {
+                    kver: &kver,
+                    distro: &info,
+                    mode,
+                    cancel: Some(&cancel_thread),
+                };
+                let outcome = scan::scan(&options);
+                let _ = weak_thread.upgrade_in_event_loop(move |ui| {
+                    running_thread.store(false, Ordering::SeqCst);
+                    ui.set_busy(false);
+                    match outcome {
+                        Ok(report) => {
+                            let (rows, truncated, total) = to_module_items(&report);
+                            let modules = report
+                                .entries
+                                .iter()
+                                .filter(|e| e.kind == EntryKind::Module)
+                                .count();
+                            let dkms = report
+                                .entries
+                                .iter()
+                                .filter(|e| e.kind == EntryKind::Dkms)
+                                .count();
+                            let configs = report
+                                .entries
+                                .iter()
+                                .filter(|e| e.kind == EntryKind::Config)
+                                .count();
+                            ui.set_modules(ModelRc::new(VecModel::from(rows)));
+                            ui.set_progress(1.0);
+                            let firmware = if report.firmware_bytes > 0 {
+                                format!(" · 固件 {}", human_size(report.firmware_bytes))
+                            } else {
+                                String::new()
+                            };
+                            let truncated_note = if truncated {
+                                format!("（列表仅显示前 500 条，共 {total} 条）")
+                            } else {
+                                String::new()
+                            };
+                            ui.set_status_text(
+                                format!(
+                                    "扫描完成：模块 {modules} · DKMS {dkms} · 配置 {configs}{firmware}\
+                                     ；in-tree 跳过 {} 个{truncated_note}",
+                                    report.skipped_in_tree
+                                )
+                                .into(),
+                            );
+                        }
+                        Err(err) => {
+                            ui.set_progress(0.0);
+                            ui.set_status_text(format!("扫描失败：{err}").into());
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    // ---- 回调 2：备份 ----
+    {
+        let weak = app.as_weak();
+        let running = Arc::clone(&running);
+        let cancel = Arc::clone(&cancel);
+        app.on_start_backup(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let out = ui.get_out_path().to_string();
+            let kver = distro::kernel_release();
+            let out_path = if out.trim().is_empty() {
+                backup::default_out_path(&kver)
+            } else {
+                expand_tilde(out.trim())
+            };
+            if !begin_task(
+                &ui,
+                &running,
+                &cancel,
+                &format!("正在打包驱动到 {}…", out_path.display()),
+            ) {
+                return;
+            }
+            let mode = BackupMode::from_index(ui.get_mode_index());
+            let progress = gui_progress(weak.clone());
+            let weak_thread = weak.clone();
+            let running_thread = Arc::clone(&running);
+            let cancel_thread = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let request = backup::BackupRequest {
+                    out_file: out_path,
+                    kver,
+                    distro: DistroInfo::detect(),
+                    mode,
+                    progress,
+                    cancel: Arc::clone(&cancel_thread),
+                };
+                match backup::run_backup(request) {
+                    Ok(report) => {
+                        let message = format!(
+                            "备份成功：{}（{} 个条目，{}，耗时 {:.1}s）",
+                            report.out_file.display(),
+                            report.entry_count,
+                            human_size(report.bytes_written),
+                            report.duration_ms as f64 / 1000.0
+                        );
+                        let archive = report.out_file.to_string_lossy().to_string();
+                        let running_finish = Arc::clone(&running_thread);
+                        let _ = weak_thread.upgrade_in_event_loop(move |ui| {
+                            ui.set_archive_path(archive.into());
+                            running_finish.store(false, Ordering::SeqCst);
+                            ui.set_busy(false);
+                            ui.set_progress(1.0);
+                            ui.set_status_text(message.into());
+                        });
+                    }
+                    Err(AppError::Cancelled) => {
+                        finish_gui(&weak_thread, &running_thread, false, "备份已取消。".to_string());
+                    }
+                    Err(err) => {
+                        finish_gui(
+                            &weak_thread,
+                            &running_thread,
+                            false,
+                            format!("备份失败：{err}"),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    // ---- 回调 3：还原 ----
+    {
+        let weak = app.as_weak();
+        let running = Arc::clone(&running);
+        let cancel = Arc::clone(&cancel);
+        app.on_start_restore(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let archive = ui.get_archive_path().to_string().trim().to_string();
+            if archive.is_empty() {
+                ui.set_status_text("请先填写还原归档路径。".into());
+                return;
+            }
+            let dry_run = ui.get_dry_run();
+            let path = expand_tilde(&archive);
+            if !begin_task(
+                &ui,
+                &running,
+                &cancel,
+                if dry_run {
+                    "正在预演还原（不写盘）…"
+                } else {
+                    "正在准备还原…"
+                },
+            ) {
+                return;
+            }
+            let progress = gui_progress(weak.clone());
+            let weak_thread = weak.clone();
+            let running_thread = Arc::clone(&running);
+            let cancel_thread = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let current_kver = distro::kernel_release();
+
+                // 先只读 inspect：普通权限即可，失败直接回写状态。
+                let inspected = match restore::inspect(&path) {
+                    Ok(info) => info,
+                    Err(err) => {
+                        finish_gui(
+                            &weak_thread,
+                            &running_thread,
+                            false,
+                            format!("读取归档失败：{err}"),
+                        );
+                        return;
+                    }
+                };
+                let same_kernel = inspected.manifest.kernel_release == current_kver;
+
+                if dry_run {
+                    let request = restore::RestoreRequest {
+                        archive: path.clone(),
+                        kver: None,
+                        dry_run: true,
+                        // 预演无副作用：允许跨内核预览，附带提示信息。
+                        allow_kernel_mismatch: true,
+                        with_firmware: true,
+                        progress,
+                        cancel: Arc::clone(&cancel_thread),
+                    };
+                    match restore::run_restore(request) {
+                        Ok(report) => {
+                            let mut message = format!(
+                                "预演完成（未写盘）：将写入 {} 个文件（共 {}），跳过 {} 个",
+                                report.written,
+                                human_size(inspected.total_bytes),
+                                report.skipped
+                            );
+                            if !same_kernel {
+                                message.push_str(&format!(
+                                    "；⚠ 归档内核 {} 与当前 {current_kver} 不一致",
+                                    inspected.manifest.kernel_release
+                                ));
+                            }
+                            for note in report.notes.iter().take(3) {
+                                message.push_str(&format!("；{note}"));
+                            }
+                            finish_gui(&weak_thread, &running_thread, true, message);
+                        }
+                        Err(err) => finish_gui(
+                            &weak_thread,
+                            &running_thread,
+                            false,
+                            format!("预演失败：{err}"),
+                        ),
+                    }
+                    return;
+                }
+
+                // 真实还原：root 直接做；否则 pkexec 单次提权重入本二进制。
+                let outcome: AppResult<String> = if distro::is_root() {
+                    let request = restore::RestoreRequest {
+                        archive: path.clone(),
+                        kver: None,
+                        dry_run: false,
+                        allow_kernel_mismatch: false,
+                        with_firmware: true,
+                        progress,
+                        cancel: Arc::clone(&cancel_thread),
+                    };
+                    restore::run_restore(request).map(|report| {
+                        format!(
+                            "还原完成：写入 {} 个文件，跳过 {} 个；depmod={}，initramfs={}",
+                            report.written,
+                            report.skipped,
+                            report.depmod_done,
+                            match report.initramfs_done {
+                                Some(true) => "已更新",
+                                Some(false) => "失败",
+                                None => "已跳过（未知发行版）",
+                            }
+                        )
+                    })
+                } else {
+                    let mut args = vec![
+                        "--archive".to_string(),
+                        path.to_string_lossy().to_string(),
+                        "--with-firmware".to_string(),
+                    ];
+                    if !same_kernel {
+                        args.push("--kver".to_string());
+                        args.push(inspected.manifest.kernel_release.clone());
+                    }
+                    privilege::run_helper_via_pkexec(
+                        &args,
+                        progress,
+                        Arc::clone(&cancel_thread),
+                    )
+                };
+
+                match outcome {
+                    Ok(message) => finish_gui(&weak_thread, &running_thread, true, message),
+                    Err(AppError::Cancelled) => {
+                        finish_gui(&weak_thread, &running_thread, false, "还原已取消。".to_string())
+                    }
+                    Err(err) => finish_gui(
+                        &weak_thread,
+                        &running_thread,
+                        false,
+                        format!("还原失败：{err}"),
+                    ),
+                }
+            });
+        });
+    }
+
+    // ---- 回调 4：取消 ----
+    {
+        let weak = app.as_weak();
+        let cancel = Arc::clone(&cancel);
+        app.on_cancel(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            cancel.store(true, Ordering::SeqCst);
+            ui.set_status_text("正在取消，请稍候…".into());
+        });
+    }
+
+    app.run().map_err(|err| {
+        AppError::Privilege(format!("图形界面事件循环异常退出：{err}"))
+    })
+}
+
+// ===========================================================================
+// 入口 / Entry point
+// ===========================================================================
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = match parse_args(&args) {
+        Ok(command) => command,
+        Err(err) => {
+            eprintln!("参数错误 / invalid arguments: {err}\n");
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+    };
+
+    let code = match command {
+        Cmd::Help => {
+            println!("{}", usage());
+            0
+        }
+        Cmd::Version => {
+            println!("linux-driver-backup {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Cmd::Scan { mode, json } => run_cli_scan(mode, json),
+        Cmd::Backup { out, mode, kver } => run_cli_backup(&out, mode, kver),
+        Cmd::Restore {
+            archive,
+            dry_run,
+            yes,
+            with_firmware,
+            allow_kernel_mismatch,
+        } => run_cli_restore(
+            &archive,
+            dry_run,
+            yes,
+            with_firmware,
+            allow_kernel_mismatch,
+        ),
+        Cmd::Helper {
+            archive,
+            kver,
+            with_firmware,
+            allow_kernel_mismatch,
+        } => run_helper(archive, kver, with_firmware, allow_kernel_mismatch),
+        Cmd::Gui => match run_gui() {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("GUI 启动失败 / GUI failed: {err}");
+                1
+            }
+        },
+    };
+
+    std::process::exit(code);
+}
+
+// ===========================================================================
+// 单元测试 / Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_launches_gui() {
+        assert_eq!(parse_args(&args(&[])).unwrap(), Cmd::Gui);
+    }
+
+    #[test]
+    fn help_and_version_are_recognised() {
+        assert_eq!(parse_args(&args(&["--help"])).unwrap(), Cmd::Help);
+        assert_eq!(parse_args(&args(&["-h"])).unwrap(), Cmd::Help);
+        assert_eq!(parse_args(&args(&["--version"])).unwrap(), Cmd::Version);
+        assert_eq!(parse_args(&args(&["-V"])).unwrap(), Cmd::Version);
+    }
+
+    #[test]
+    fn scan_defaults_and_flags() {
+        assert_eq!(
+            parse_args(&args(&["--scan"])).unwrap(),
+            Cmd::Scan {
+                mode: BackupMode::Standard,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["--scan", "--mode", "full", "--json"])).unwrap(),
+            Cmd::Scan {
+                mode: BackupMode::Full,
+                json: true
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["--scan", "--mode=minimal"])).unwrap(),
+            Cmd::Scan {
+                mode: BackupMode::Minimal,
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn backup_requires_out_and_parses_options() {
+        assert!(parse_args(&args(&["--backup"])).is_err());
+        assert_eq!(
+            parse_args(&args(&["--backup", "--out", "/tmp/a.tar.gz"])).unwrap(),
+            Cmd::Backup {
+                out: "/tmp/a.tar.gz".to_string(),
+                mode: BackupMode::Standard,
+                kver: None
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "--backup",
+                "--out=/tmp/b.tar.gz",
+                "--mode",
+                "minimal",
+                "--kver",
+                "6.8.0-45-generic"
+            ]))
+            .unwrap(),
+            Cmd::Backup {
+                out: "/tmp/b.tar.gz".to_string(),
+                mode: BackupMode::Minimal,
+                kver: Some("6.8.0-45-generic".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn restore_flags_are_parsed() {
+        assert!(parse_args(&args(&["--restore"])).is_err());
+        assert_eq!(
+            parse_args(&args(&[
+                "--restore",
+                "--archive",
+                "/tmp/a.tar.gz",
+                "--dry-run",
+                "--yes",
+                "--with-firmware",
+                "--allow-kernel-mismatch"
+            ]))
+            .unwrap(),
+            Cmd::Restore {
+                archive: "/tmp/a.tar.gz".to_string(),
+                dry_run: true,
+                yes: true,
+                with_firmware: true,
+                allow_kernel_mismatch: true
+            }
+        );
+    }
+
+    #[test]
+    fn helper_mode_is_parsed() {
+        assert_eq!(
+            parse_args(&args(&["--helper-restore", "--archive", "/tmp/a.tar.gz"])).unwrap(),
+            Cmd::Helper {
+                archive: "/tmp/a.tar.gz".to_string(),
+                kver: None,
+                with_firmware: false,
+                allow_kernel_mismatch: false
+            }
+        );
+        assert!(parse_args(&args(&["--helper-restore"])).is_err());
+    }
+
+    #[test]
+    fn invalid_mode_and_unknown_arguments_are_rejected() {
+        assert!(parse_args(&args(&["--scan", "--mode", "huge"])).is_err());
+        assert!(parse_args(&args(&["--scan", "--mode"])).is_err());
+        assert!(parse_args(&args(&["--unknown"])).is_err());
+        assert!(parse_args(&args(&["--scan", "--out", "/tmp/x"])).is_err());
+        assert!(parse_args(&args(&["--scan", "--json=true"])).is_err());
+    }
+
+    #[test]
+    fn tilde_and_labels_helpers() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        assert_eq!(expand_tilde("~/a.tar.gz"), PathBuf::from(&home).join("a.tar.gz"));
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(kind_label(EntryKind::Module), "模块");
+        assert_eq!(kind_label(EntryKind::Firmware), "固件");
+    }
+
+    #[test]
+    fn usage_mentions_every_subcommand() {
+        let text = usage();
+        for needle in [
+            "--scan",
+            "--backup",
+            "--restore",
+            "--helper-restore",
+            "--dry-run",
+        ] {
+            assert!(text.contains(needle), "用法说明缺少 {needle}");
+        }
+    }
+}

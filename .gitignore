@@ -1,0 +1,42 @@
+# 模块：Git 忽略规则（W1-A 工程骨架）
+# Module: git ignore rules (W1-A skeleton)
+#
+# 只忽略构建产物、备份产物与本地编辑器配置；
+# Cargo.lock 不忽略 —— 本项目产出可执行文件，须提交锁文件以锁定依赖版本。
+# Only build/backup artifacts and editor config are ignored; Cargo.lock is committed
+# because this crate produces a binary whose dependency versions must be pinned.
+
+# Rust 构建产物 / Rust build artifacts
+/target/
+**/*.rs.bk
+
+# 备份产物（tar.gz 归档）与流水线半成品 / backup archives and partial pipeline outputs
+*.tar.gz
+*.tgz
+*.tar
+*.part
+
+# 打包/还原过程的临时校验文件 / temporary checksum dumps
+*.sha256
+checksums.txt
+
+# IDE / 编辑器 / IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统杂项 / OS junk
+.DS_Store
+Thumbs.db
+
+# 日志 / logs
+*.log
+
+# 打包产物 / Packaging artifacts（由 packaging/build-packages.sh 生成，不入库）
+/dist/
+*.deb
+*.rpm
+*.AppImage
+*.sha256

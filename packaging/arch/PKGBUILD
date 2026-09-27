@@ -1,0 +1,66 @@
+# Maintainer: ltbkq <ltbkqq@gmail.com>
+#
+# Arch Linux / AUR 源码包模板 —— PKGBUILD template for linux-driver-backup
+#
+# 占位 / Placeholders：@VERSION@ 由 packaging/build-packages.sh 用 sed 替换
+# （取自 Cargo.toml 的 version 字段）；pkgrel 为打包修订号，人工维护。
+#
+# ⚠ 这是**源码包**模板，供 AUR 提交与本机 `makepkg -si` 使用：
+#   source 指向 GitHub Release 的 tag 归档，因此**必须先发布 v<版本> release**，
+#   否则 makepkg 会在下载阶段失败（AUR 规范同样要求 source 指向可获取的上游归档）。
+#   Source points at the GitHub release tarball, so a v<x.y.z> release must be
+#   published first; otherwise `makepkg` fails at the download step.
+#
+# 生成 .SRCINFO（AUR 必需）/ regenerate after every edit:
+#   makepkg --printsrcinfo > .SRCINFO
+# 提交 AUR / publish to AUR：
+#   git init && git add PKGBUILD .SRCINFO
+#   git commit -m "linux-driver-backup 0.1.0"
+#   ssh clone aur@aur.archlinux.org/linux-driver-backup.git
+#   cp PKGBUILD .SRCINFO …/ && git push
+# 详见 packaging/arch/README.md
+pkgname=linux-driver-backup
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Backup and restore out-of-tree (third-party) Linux kernel drivers, with a GUI and a CLI'
+arch=('x86_64' 'aarch64')
+url='https://github.com/ltbkq/linux-driver-backup'
+license=('GPL-3.0-only')
+# 运行期依赖与 deb/rpm 一致（winit 运行时 dlopen，DESIGN.md §9）
+depends=('glibc' 'wayland' 'libxkbcommon')
+# 编译依赖：Rust 工具链（makepkg 默认不假设 cargo 存在）
+makedepends=('cargo')
+# 上游归档：tag 归档内含 Cargo.lock，配合 --locked 锁定依赖版本
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# 发布 release 前用 `updpkgsums` 或 `makepkg -g` 生成真实校验和；
+# 占位期用 SKIP，AUR 提交前必须替换。
+sha256sums=('SKIP')
+
+# 说明：无 check() —— `cargo test` 需要网络与构建期依赖，
+# AUR 构建环境默认离线；CI 已在 test job 中运行全部单元测试。
+
+build() {
+  cd "$pkgname-$pkgver"
+  # --locked：按 Cargo.lock 构建，保证可复现 / build reproducibly from Cargo.lock
+  cargo build --locked --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  # 二进制 → /usr/bin
+  install -Dm755 target/release/linux-driver-backup \
+    "$pkgdir/usr/bin/linux-driver-backup"
+
+  # 桌面入口 → /usr/share/applications
+  install -Dm644 packaging/linux-driver-backup.desktop \
+    "$pkgdir/usr/share/applications/linux-driver-backup.desktop"
+
+  # 可缩放图标 → /usr/share/icons/hicolor/scalable/apps（Arch 图标命名约定）
+  install -Dm644 packaging/icon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/linux-driver-backup.svg"
+
+  # 许可全文 → /usr/share/licenses/<pkgname>（Arch 的 license 放置约定）
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
