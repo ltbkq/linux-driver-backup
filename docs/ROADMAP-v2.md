@@ -146,7 +146,7 @@
 
 ### P0（0.2.0 必做）/ Correctness & security
 
-#### P0-1 符号链接语义正确化（修 D1）
+#### P0-1 符号链接语义正确化（修 D1）/ Correct symlink semantics
 - **方案**：
   1. **备份**：`scan` 不再跟随叶子符号链接，把 `kind=symlink` 与 `link_target` 记入 manifest；tar 中以 symlink 条目存储。
   2. **还原**：允许符号链接，但**只允许相对且解析后仍落在受管根**（`/lib/modules/<kver>`、`/usr/lib/modules/<kver>`、`/etc/...`）之内的目标；拒绝绝对路径与越界目标；`weak-updates/` 的典型形态（指向其它 kver 的模块）在受管根内 → **放行**，并额外校验目标在归档中被恢复或本机已存在；目标缺失时给 `NOTE` 提示（可 `--strict-links` 升级为错误）。
@@ -164,7 +164,7 @@
 - **风险**：私钥处理必须仅 root 可读；签名失败不得静默；MOK 登记需重启，属用户动作。
 - **验证**：OVMF + `sbctl`/自签 MOK 的 QEMU 场景；断言 `modinfo -F sig_id` 非空且 `modprobe` 成功。
 
-#### P0-3 不可变发行版策略（修 D3）
+#### P0-3 不可变发行版策略（修 D3）/ Immutable distro strategy
 - **方案**：启动时探测（`/run/ostree-booted` 存在、`rpm-ostree` 可用、`/usr` 只读挂载）→
   - **备份**：完全支持（只读不影响读）。
   - **还原**：**默认拒绝直写**，改为三条受支持路径，按可用性排序：
@@ -176,7 +176,7 @@
 - **风险**：`usroverlay` 会误导用户以为"永久生效"，输出必须显式警告。
 - **验证**：容器无法模拟 OSTree，改在 QEMU 里用 Fedora Atomic 镜像做一次真实还原演练（见 §13）。
 
-#### P0-4 "重建优先"还原策略（修 D4）
+#### P0-4 "重建优先"还原策略（修 D4）/ Rebuild-first restore
 - **方案**：还原决策树（详见 §8）
   ```
   归档含该模块的 DKMS 源码？ ── 是 ─→ dkms install / dkms autoinstall（Fedora: akmods --force）
@@ -191,12 +191,12 @@
 - **风险**：重建需要内核头文件/编译工具链，缺失时应**降级并说明**，而不是失败。
 - **验证**：容器内用 `dkms` 真包（如 `v4l2loopback-dkms`）做"备份 → 安装新内核 → 还原 → `modprobe` 成功"的流水线。
 
-#### P0-5 来源包记录与"清单式还原"（修 D6）
+#### P0-5 来源包记录与"清单式还原"（修 D6）/ Package provenance
 - **方案**：备份时对每个文件执行 `dpkg-query -S` / `rpm -qf`（失败则记 `owner: null`），写入 manifest v2 的 `owner` 字段；还原时若 `owner` 已知且仓库可用，**优先建议/执行重装**（`--strategy reinstall`），并把"文件已被更新版本覆盖"的情况识别出来（包版本差异）。
 - **接口**：`ManifestEntry.owner: Option<Provenance{manager, package, version}>`。
 - **验证**：本机 Mint（dpkg）与 Fedora 容器（rpm）各跑一次，断言 `owner.package` 正确（如 `linux-image-...`、`kmod-...`）。
 
-#### P0-6 还原事务与回滚（修 D9）
+#### P0-6 还原事务与回滚（修 D9）/ Transactional restore & rollback
 - **方案**：
   1. **staging + 原子替换**：先解压到受管根内的临时目录（`.ldb-staging-<ts>`），全部校验通过后再逐文件 `rename` 替换；替换前把原文件**移入回滚区**（保留时间戳，不再只是同名 `.ldbak` 覆盖）。
   2. **还原日志**：`/var/lib/linux-driver-backup/restore-<ts>.json` 记录每个路径的"原状态（不存在/回滚区路径）/ 新 sha256 / 策略"。
@@ -462,7 +462,7 @@ modinfo -F vermagic          ──▶   与目标内核 vermagic 比对
 > 验证日期 2026-09-27；环境：Linux Mint 22.3（Ubuntu 20.04+ 系）/ 内核 7.3.0-070300rc3 / kmod 31 / dkms 3.0.11 / rustc 1.98.1。
 > 方法代号：**S**=源码逐条核对（file:line）、**E**=本机实验、**U**=上游文档/包页面。
 
-### 16.1 对 v0.1.2 实现的断言（全部与源码一致）
+### 16.1 对 v0.1.2 实现的断言（全部与源码一致）/ Claims about the v0.1.2 implementation
 
 | # | 断言 | 方法 | 证据 | 结论 |
 |---|---|---|---|---|
@@ -482,7 +482,7 @@ modinfo -F vermagic          ──▶   与目标内核 vermagic 比对
 | 14 | 项数声明（P0=6 / P1=8 / P2=6 / P3=7 / D=13） | S | 脚本统计文档编号 | ✅ 一致 |
 | 15 | 13 项缺口均有对应的优化项 | S | 脚本映射：D1→P0-1 … D13→P3-6，无孤立项 | ✅ 一致 |
 
-### 16.2 外部技术断言
+### 16.2 外部技术断言 / External technical claims
 
 | # | 断言 | 方法 | 证据 | 结论 |
 |---|---|---|---|---|
@@ -496,7 +496,7 @@ modinfo -F vermagic          ──▶   与目标内核 vermagic 比对
 | 23 | **Alpine 的 initramfs 工具名** | U | Alpine Wiki *Initramfs init*：`mkinitfs -c /etc/mkinitfs/mkinitfs.conf -b / <kernelvers>`（`mkinitramfs` 是 Debian `initramfs-tools` 的低层内部脚本，非 Alpine 工具） | ❌ **原稿误写 `mkinitramfs -k <kver>`** → 已在 §1.1/§1.8/D11/P1-2 全部修正为 `mkinitfs <kver>` |
 | 24 | 归档签名的路线图版本归属 | S | 一致性检查发现附录 A 写 `0.2.0(v2)`，与 §3 P3-2、§14 的 `1.0` 冲突 | ❌ **自相矛盾** → 已统一为 `1.0（v2 预留 manifest.sig 字段）` |
 
-### 16.3 文档质量检查
+### 16.3 文档质量检查 / Document quality checks
 
 | 项 | 方法 | 结果 | 处置 |
 |---|---|---|---|
