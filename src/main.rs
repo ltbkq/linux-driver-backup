@@ -782,6 +782,10 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             info.manifest.compression.as_deref().unwrap_or("unknown")
         );
         println!("  条目 / entries : {}", info.manifest.entries.len());
+        if let Some(st) = opts.strategy {
+            // C-48：英文 label 与中文 label_zh 并存，此处消费英文文案。
+            println!("  策略 / strategy : {}（{}）", st.label(), st.label_zh());
+        }
         println!("  体积 / payload : {}", human_size(info.total_bytes));
         if let Some(vm) = &info.manifest.kernel_vermagic {
             println!("  vermagic       : {vm}");

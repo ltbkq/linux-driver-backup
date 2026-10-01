@@ -745,6 +745,7 @@ fn packer_main(
         entries: manifest_entries,
         dkms,
         warnings,
+        firmware_policy: None, // 预置字段：W5 阶段由 --firmware 策略接线
     };
 
     let json = serde_json::to_vec_pretty(&manifest)?;

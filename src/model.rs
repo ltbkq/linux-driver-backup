@@ -148,6 +148,18 @@ pub enum RestoreStrategy {
 }
 
 impl RestoreStrategy {
+    /// 英文短标签（W6/C-48：与 `label_zh` 并存，CLI 英文文案用此方法）。
+    /// Short English label (W6/C-48: pairs with `label_zh` for English CLI copy).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RestoreStrategy::Rebuild => "rebuild",
+            RestoreStrategy::Reinstall => "reinstall",
+            RestoreStrategy::WeakModules => "weak-update",
+            RestoreStrategy::Copy => "copy",
+            RestoreStrategy::Skip => "skip",
+        }
+    }
+
     /// 中文短标签，供 GUI/CLI 展示。
     /// Short Chinese label for the GUI/CLI.
     pub fn label_zh(&self) -> &'static str {
@@ -319,6 +331,12 @@ pub struct Manifest {
     /// 扫描与打包期的可恢复问题。
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 固件收集策略（v0.3.0 W5/P1-3，可选）：`"all"` | `"needed"` | `"none"`。
+    /// 缺省 = 不记录 → 视为 `needed`（与 v2 归档现有行为一致，向后兼容）。
+    /// Firmware collection policy (v0.3.0 W5): `"all"` | `"needed"` | `"none"`.
+    /// Absent = existing v2 behaviour (`needed`) for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_policy: Option<String>,
 }
 
 impl Manifest {
@@ -335,8 +353,8 @@ impl Manifest {
     }
 }
 
-/// 归档格式版本号（当前恒为 1）。
-/// Archive format version; currently always 1.
+/// 归档格式版本号（当前为 2；v0.2.0 起，注释此前误写为 1 —— C-49 已修正）。
+/// Archive format version; currently 2 (the comment wrongly said 1 — fixed per C-49).
 pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// 仍然可读的最低归档格式版本（v1 归档向后兼容）。
@@ -530,6 +548,7 @@ mod tests {
                 version: "1.0".to_string(),
             }],
             warnings: vec!["测试告警 / test warning".to_string()],
+            firmware_policy: None,
         }
     }
 
