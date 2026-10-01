@@ -770,6 +770,7 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         kver: None,
         dry_run: opts.dry_run,
         allow_kernel_mismatch: opts.allow_kernel_mismatch,
+        allow_arch_mismatch: false, // TODO(W0): 由 --allow-arch-mismatch 接线
         with_firmware: opts.with_firmware,
         root: opts.root.as_deref().map(expand_tilde),
         strategy: opts.strategy,
@@ -891,6 +892,7 @@ fn run_helper(
         kver,
         dry_run: false,
         allow_kernel_mismatch,
+        allow_arch_mismatch: false, // TODO(W0): 由 --allow-arch-mismatch 接线
         with_firmware,
         root: root.as_deref().map(expand_tilde),
         strategy,
@@ -1179,6 +1181,7 @@ fn run_gui() -> AppResult<()> {
                         dry_run: true,
                         // 预演无副作用：允许跨内核预览，附带提示信息。
                         allow_kernel_mismatch: true,
+                        allow_arch_mismatch: false, // TODO(W0): 由 GUI 确认框接线
                         with_firmware: true,
                         root: None,
                         strategy: None,
@@ -1227,6 +1230,7 @@ fn run_gui() -> AppResult<()> {
                         kver: None,
                         dry_run: false,
                         allow_kernel_mismatch: false,
+                        allow_arch_mismatch: false, // TODO(W0): 由 GUI 确认框接线
                         with_firmware: true,
                         root: None,
                         strategy: None,

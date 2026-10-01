@@ -149,8 +149,10 @@ pub struct RestoreRequest {
     pub kver: Option<String>,
     /// 预演模式：只统计不落盘，也不执行 depmod/initramfs。
     pub dry_run: bool,
-    /// 用户已确认"备份内核/架构与当前不符"时为 true。
+    /// 用户已确认"备份内核与当前不符"时为 true（仅影响内核/vermagic 检查）。
     pub allow_kernel_mismatch: bool,
+    /// 用户已确认"备份架构与当前不符"时为 true；与内核检查解耦（ITERATION §2.1 C-32）。
+    pub allow_arch_mismatch: bool,
     /// 是否还原 `EntryKind::Firmware` 条目（默认关闭）。
     pub with_firmware: bool,
     /// 目标根：`None` = `/`；`Some(dir)` 用于离线/救援还原（ROADMAP P1-1）。
@@ -182,6 +184,7 @@ impl Default for RestoreRequest {
             kver: None,
             dry_run: false,
             allow_kernel_mismatch: false,
+            allow_arch_mismatch: false,
             with_firmware: false,
             root: None,
             strategy: None,
@@ -2237,6 +2240,7 @@ mod tests {
             kver: None,
             dry_run: true,
             allow_kernel_mismatch: false,
+            allow_arch_mismatch: false,
             with_firmware: false,
             progress,
             cancel: Arc::new(AtomicBool::new(false)),
