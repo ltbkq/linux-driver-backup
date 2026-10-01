@@ -46,11 +46,20 @@ export component AppWindow inherits Window {
     in-out property <int> mode-index: 1;                    // 0 minimal / 1 standard / 2 full
     in-out property <bool> dry-run: true;                   // 还原前仅预演
 
+    // ===== 扩展属性 / extended properties（ITERATION §5.3，新增非冻结） =====
+    in-out property <bool> confirm-visible: false;          // 真实还原确认框是否可见（C-35）
+    in-out property <string> confirm-detail;                // 确认框详情（归档/内核/架构差异）
+    in-out property <bool> restore-ack: false;              // 用户已在确认框确认（内部传递）
+
     // ===== 冻结回调 / frozen callbacks (DESIGN.md §4.6) =====
     callback start-backup();
     callback start-restore();
     callback refresh-scan();
     callback cancel();
+
+    // ===== 扩展回调 / extended callbacks（ITERATION §5.3，新增非冻结） =====
+    callback confirm-restore();                             // 确认框：确认还原（C-35）
+    callback dismiss-confirm();                             // 确认框：取消（C-35）
 
     VerticalBox {
         padding: 14px;
@@ -206,19 +215,19 @@ export component AppWindow inherits Window {
 
             Button {
                 text: "扫描";
-                enabled: !root.busy;
+                enabled: !root.busy && !root.confirm-visible;
                 horizontal-stretch: 1;
                 clicked => { root.refresh-scan(); }
             }
             Button {
                 text: "开始备份";
-                enabled: !root.busy;
+                enabled: !root.busy && !root.confirm-visible;
                 horizontal-stretch: 1;
                 clicked => { root.start-backup(); }
             }
             Button {
                 text: "还原驱动";
-                enabled: !root.busy;
+                enabled: !root.busy && !root.confirm-visible;
                 horizontal-stretch: 1;
                 clicked => { root.start-restore(); }
             }
@@ -227,6 +236,61 @@ export component AppWindow inherits Window {
                 enabled: root.busy;
                 horizontal-stretch: 1;
                 clicked => { root.cancel(); }
+            }
+        }
+    }
+
+    // 8) 真实还原确认框（ITERATION C-35）：半透明遮罩 + 详情 + 二次确认。
+    //    Real-restore confirmation overlay (C-35): dimming mask + details + explicit consent.
+    if (root.confirm-visible) : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: min(600px, parent.width - 40px);
+                background: #ffffff;
+                border-radius: 6px;
+                border-color: #c0392b;
+                border-width: 2px;
+
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "⚠ 确认真实还原 / Confirm real restore";
+                        color: #c0392b;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-stretch: 0;
+                    }
+                    Text {
+                        text: root.confirm-detail;
+                        color: #1f2933;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        overflow: clip;
+                        vertical-stretch: 1;
+                    }
+                    HorizontalBox {
+                        spacing: 10px;
+                        alignment: end;
+                        vertical-stretch: 0;
+                        Button {
+                            text: "取消";
+                            clicked => { root.dismiss-confirm(); }
+                        }
+                        Button {
+                            text: "确认还原";
+                            primary: true;
+                            clicked => { root.confirm-restore(); }
+                        }
+                    }
+                }
             }
         }
     }

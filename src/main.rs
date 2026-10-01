@@ -62,6 +62,7 @@ enum Cmd {
         yes: bool,
         with_firmware: bool,
         allow_kernel_mismatch: bool,
+        allow_arch_mismatch: bool,
         root: Option<String>,
         strategy: Option<RestoreStrategy>,
         on_immutable: bool,
@@ -77,6 +78,7 @@ enum Cmd {
         kver: Option<String>,
         with_firmware: bool,
         allow_kernel_mismatch: bool,
+        allow_arch_mismatch: bool,
         root: Option<String>,
         strategy: Option<RestoreStrategy>,
         on_immutable: bool,
@@ -211,6 +213,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut yes = false;
             let mut with_firmware = false;
             let mut allow_kernel_mismatch = false;
+            let mut allow_arch_mismatch = false;
             let mut root: Option<String> = None;
             let mut strategy: Option<RestoreStrategy> = None;
             let mut on_immutable = false;
@@ -237,6 +240,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     }
                     "--allow-kernel-mismatch" => {
                         allow_kernel_mismatch = true;
+                        idx += 1;
+                    }
+                    "--allow-arch-mismatch" => {
+                        allow_arch_mismatch = true;
                         idx += 1;
                     }
                     "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
@@ -279,6 +286,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 yes,
                 with_firmware,
                 allow_kernel_mismatch,
+                allow_arch_mismatch,
                 root,
                 strategy,
                 on_immutable,
@@ -312,6 +320,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut kver: Option<String> = None;
             let mut with_firmware = false;
             let mut allow_kernel_mismatch = false;
+            let mut allow_arch_mismatch = false;
             let mut root: Option<String> = None;
             let mut strategy: Option<RestoreStrategy> = None;
             let mut on_immutable = false;
@@ -333,14 +342,28 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         allow_kernel_mismatch = true;
                         idx += 1;
                     }
+                    "--allow-arch-mismatch" => {
+                        allow_arch_mismatch = true;
+                        idx += 1;
+                    }
                     "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
                     "--strategy" => {
                         strategy =
                             parse_strategy(&take_value(args, &mut idx, "--strategy", inline)?)?
                     }
                     "--on-immutable" => {
+                        // 提权路径与 `--restore` 同样严格校验取值（ITERATION C-34）。
+                        // Strict value validation on the privileged path, matching `--restore`.
                         let v = take_value(args, &mut idx, "--on-immutable", inline)?;
-                        on_immutable = matches!(v.as_str(), "usroverlay");
+                        on_immutable = match v.as_str() {
+                            "usroverlay" => true,
+                            "refuse" => false,
+                            other => {
+                                return Err(format!(
+                                    "`--on-immutable` 取值非法：{other}（可选 refuse | usroverlay）"
+                                ))
+                            }
+                        };
                     }
                     "--strict-links" => {
                         strict_links = true;
@@ -365,6 +388,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 kver,
                 with_firmware,
                 allow_kernel_mismatch,
+                allow_arch_mismatch,
                 root,
                 strategy,
                 on_immutable,
@@ -390,7 +414,7 @@ fn usage() -> String {
          \x20 linux-driver-backup --scan [--mode <m>] [--json]      # 扫描外置驱动 / scan out-of-tree drivers\n\
          \x20 linux-driver-backup --backup --out <f> [--mode <m>] [--kver <k>]\n\
          \x20 linux-driver-backup --restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]\n\
-         \x20                              [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]\n\
+         \x20                              [--allow-arch-mismatch] [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]\n\
          \x20                              [--on-immutable refuse|usroverlay] [--strict-links] [--no-sign] [--chroot-exec]\n\
          \x20 linux-driver-backup --rollback [last|<id>] [--root <dir>]   # 回滚上一次还原 / undo the last restore\n\
          \x20 linux-driver-backup --helper-restore --archive <f> [--kver <k>] [--with-firmware]\n\
@@ -402,7 +426,8 @@ fn usage() -> String {
          \x20 Backup needs no root; a real restore does (GUI elevates once via pkexec,\n\
          \x20 CLI users should run with sudo). `--helper-restore` is internal-only.\n\
          \n\
-         退出码 / Exit codes: 0 成功 success | 1 业务失败 failure | 2 用法错误 usage error\n",
+         退出码 / Exit codes: 0 成功或用户主动取消 success or user cancellation\n\
+         \x20                      | 1 业务失败 failure | 2 用法错误 usage error\n",
         version = env!("CARGO_PKG_VERSION")
     )
 }
@@ -563,7 +588,12 @@ fn run_cli_scan(mode: BackupMode, json: bool) -> i32 {
     match scan::scan(&options) {
         Ok(report) => {
             if json {
-                print_scan_json(&report, &info, &kver, mode);
+                // JSON 输出失败必须以非零退出，脚本/CI 不应把残缺输出当成功（C-33）。
+                // A failed JSON emit must exit non-zero so scripts never treat partial output as success.
+                if let Err(err) = print_scan_json(&report, &info, &kver, mode) {
+                    eprintln!("{err}");
+                    return 1;
+                }
             } else {
                 println!(
                     "内核 / kernel: {}    发行版 / distro: {}    模式 / mode: {}",
@@ -600,7 +630,7 @@ fn run_cli_scan(mode: BackupMode, json: bool) -> i32 {
 
 /// 输出 `--scan --json` 的 JSON 结构。
 /// Emit the JSON document for `--scan --json`.
-fn print_scan_json(report: &ScanReport, info: &DistroInfo, kver: &str, mode: BackupMode) {
+fn print_scan_json(report: &ScanReport, info: &DistroInfo, kver: &str, mode: BackupMode) -> Result<(), String> {
     use serde_json::json;
     let entries: Vec<serde_json::Value> = report
         .entries
@@ -629,9 +659,18 @@ fn print_scan_json(report: &ScanReport, info: &DistroInfo, kver: &str, mode: Bac
         "warnings": report.warnings,
         "entries": entries,
     });
-    match serde_json::to_string_pretty(&document) {
-        Ok(text) => println!("{text}"),
-        Err(err) => eprintln!("JSON 序列化失败 / JSON serialization failed: {err}"),
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|err| format!("JSON 序列化失败 / JSON serialization failed: {err}"))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// 业务错误 → 进程退出码：用户主动取消为 0，其余失败为 1（ITERATION §5.1 / C-33）。
+/// Map a business error to an exit code: user cancellation is 0, any other failure is 1.
+fn exit_code(err: &AppError) -> i32 {
+    match err {
+        AppError::Cancelled => 0,
+        _ => 1,
     }
 }
 
@@ -666,13 +705,13 @@ fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
             );
             0
         }
-        Err(AppError::Cancelled) => {
-            eprintln!("已取消 / cancelled");
-            1
-        }
         Err(err) => {
-            eprintln!("备份失败 / backup failed: {err}");
-            1
+            let code = exit_code(&err);
+            match &err {
+                AppError::Cancelled => eprintln!("已取消 / cancelled"),
+                other => eprintln!("备份失败 / backup failed: {other}"),
+            }
+            code
         }
     }
 }
@@ -685,6 +724,7 @@ struct RestoreCli {
     yes: bool,
     with_firmware: bool,
     allow_kernel_mismatch: bool,
+    allow_arch_mismatch: bool,
     root: Option<String>,
     strategy: Option<RestoreStrategy>,
     on_immutable: bool,
@@ -713,6 +753,15 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
     };
     let current_kver = distro::kernel_release();
     let mismatch = info.manifest.kernel_release != current_kver;
+    let arch_mismatch = info.manifest.arch != distro::arch();
+    // 架构不匹配需独立确认（C-32）：交互式 y/N 确认或 `--allow-arch-mismatch`。
+    // Arch mismatch needs its own consent: interactive y/N or `--allow-arch-mismatch`.
+    let mut allow_arch_mismatch = opts.allow_arch_mismatch;
+    // 预演只读不落盘：放行全部不一致检查，任何归档都应能被体检（与 GUI dry-run 一致）。
+    // A dry-run is read-only, so waive every mismatch check: any archive can be previewed.
+    if opts.dry_run {
+        allow_arch_mismatch = true;
+    }
 
     if !opts.dry_run && !opts.yes {
         println!("即将还原 / about to restore:");
@@ -738,7 +787,14 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             println!("  vermagic       : {vm}");
         }
         if mismatch {
-            println!("  ⚠ 内核不一致，跨内核还原可能导致模块 ABI 不兼容（可加 --strategy rebuild）");
+            println!("  ⚠ 内核不一致：默认按当前内核重建（可加 --strategy rebuild 指定策略）");
+        }
+        if arch_mismatch {
+            println!(
+                "  ⚠ 架构不一致：归档 {} vs 当前 {}（确认即视为接受，或使用 --allow-arch-mismatch）",
+                info.manifest.arch,
+                distro::arch()
+            );
         }
         print!("确认继续？[y/N] / continue? ");
         use std::io::Write;
@@ -753,6 +809,9 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             println!("已取消 / cancelled");
             return 0;
         }
+        // 用户在交互提示中确认 = 接受上方列出的全部不一致项。
+        // Answering yes at the prompt counts as accepting every mismatch listed above.
+        allow_arch_mismatch = true;
     }
 
     // 写 `/` 需要 root；`--root <目录>` 离线还原（救援场景）按目录自身权限判定。
@@ -770,7 +829,7 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         kver: None,
         dry_run: opts.dry_run,
         allow_kernel_mismatch: opts.allow_kernel_mismatch,
-        allow_arch_mismatch: false, // TODO(W0): 由 --allow-arch-mismatch 接线
+        allow_arch_mismatch,
         with_firmware: opts.with_firmware,
         root: opts.root.as_deref().map(expand_tilde),
         strategy: opts.strategy,
@@ -814,13 +873,13 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             }
             0
         }
-        Err(AppError::Cancelled) => {
-            eprintln!("已取消 / cancelled");
-            1
-        }
         Err(err) => {
-            eprintln!("还原失败 / restore failed: {err}");
-            1
+            let code = exit_code(&err);
+            match &err {
+                AppError::Cancelled => eprintln!("已取消 / cancelled"),
+                other => eprintln!("还原失败 / restore failed: {other}"),
+            }
+            code
         }
     }
 }
@@ -855,13 +914,13 @@ fn run_cli_rollback(journal: Option<String>, root: Option<String>) -> i32 {
             }
             0
         }
-        Err(AppError::Cancelled) => {
-            eprintln!("已取消 / cancelled");
-            1
-        }
         Err(err) => {
-            eprintln!("回滚失败 / rollback failed: {err}");
-            1
+            let code = exit_code(&err);
+            match &err {
+                AppError::Cancelled => eprintln!("已取消 / cancelled"),
+                other => eprintln!("回滚失败 / rollback failed: {other}"),
+            }
+            code
         }
     }
 }
@@ -874,6 +933,7 @@ fn run_helper(
     kver: Option<String>,
     with_firmware: bool,
     allow_kernel_mismatch: bool,
+    allow_arch_mismatch: bool,
     root: Option<String>,
     strategy: Option<RestoreStrategy>,
     on_immutable: bool,
@@ -892,7 +952,7 @@ fn run_helper(
         kver,
         dry_run: false,
         allow_kernel_mismatch,
-        allow_arch_mismatch: false, // TODO(W0): 由 --allow-arch-mismatch 接线
+        allow_arch_mismatch,
         with_firmware,
         root: root.as_deref().map(expand_tilde),
         strategy,
@@ -1140,6 +1200,74 @@ fn run_gui() -> AppResult<()> {
             }
             let dry_run = ui.get_dry_run();
             let path = expand_tilde(&archive);
+
+            // 真实还原（非 dry-run）且尚未确认 → 先只读 inspect，再弹确认框（C-35）。
+            // A real restore (not dry-run) without acknowledgement: read-only inspect,
+            // then show the confirmation dialog (C-35).
+            if !dry_run && !ui.get_restore_ack() {
+                if ui.get_confirm_visible() || running.swap(true, Ordering::SeqCst) {
+                    ui.set_status_text("已有任务正在运行，或确认框已打开。".into());
+                    return;
+                }
+                ui.set_status_text("正在读取归档信息…".into());
+                let weak_inspect = weak.clone();
+                let running_inspect = Arc::clone(&running);
+                let path_inspect = path.clone();
+                std::thread::spawn(move || {
+                    let outcome = restore::inspect(&path_inspect).map(|info| {
+                        let manifest = &info.manifest;
+                        let current_kver = distro::kernel_release();
+                        let mut detail = String::new();
+                        detail.push_str(&format!("归档：{}\n", path_inspect.display()));
+                        detail.push_str(&format!(
+                            "备份内核：{}　当前内核：{}\n",
+                            manifest.kernel_release, current_kver
+                        ));
+                        if manifest.kernel_release != current_kver {
+                            detail.push_str("⚠ 跨内核：确认后将按当前内核重建（DKMS 优先）\n");
+                        }
+                        detail.push_str(&format!(
+                            "归档架构：{}　当前架构：{}\n",
+                            manifest.arch,
+                            distro::arch()
+                        ));
+                        if manifest.arch != distro::arch() {
+                            detail.push_str("⚠ 架构不一致：错误架构的模块通常无法加载！\n");
+                        }
+                        detail.push_str(&format!(
+                            "发行版：{}（模式 {}）\n",
+                            manifest.distro.pretty_name,
+                            manifest.mode.label()
+                        ));
+                        detail.push_str(&format!(
+                            "条目：{}　体积：{}\n",
+                            manifest.entries.len(),
+                            human_size(info.total_bytes)
+                        ));
+                        detail.push_str(
+                            "\n⚠ 确认后将以 root 权限写入系统目录（/lib/modules 等）。\n\
+                             还原可用 `--rollback last` 撤销上一次。",
+                        );
+                        detail
+                    });
+                    let _ = weak_inspect.upgrade_in_event_loop(move |ui| {
+                        running_inspect.store(false, Ordering::SeqCst);
+                        match outcome {
+                            Ok(detail) => {
+                                ui.set_confirm_detail(detail.as_str().into());
+                                ui.set_confirm_visible(true);
+                                ui.set_status_text("请确认还原操作。".into());
+                            }
+                            Err(err) => {
+                                ui.set_status_text(format!("读取归档失败：{err}").as_str().into());
+                            }
+                        }
+                    });
+                });
+                return;
+            }
+            ui.set_restore_ack(false);
+
             if !begin_task(
                 &ui,
                 &running,
@@ -1179,9 +1307,9 @@ fn run_gui() -> AppResult<()> {
                         archive: path.clone(),
                         kver: None,
                         dry_run: true,
-                        // 预演无副作用：允许跨内核预览，附带提示信息。
+                        // 预演无副作用：允许跨内核/跨架构预览，附带提示信息。
                         allow_kernel_mismatch: true,
-                        allow_arch_mismatch: false, // TODO(W0): 由 GUI 确认框接线
+                        allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
                         strategy: None,
@@ -1230,7 +1358,9 @@ fn run_gui() -> AppResult<()> {
                         kver: None,
                         dry_run: false,
                         allow_kernel_mismatch: false,
-                        allow_arch_mismatch: false, // TODO(W0): 由 GUI 确认框接线
+                        // 能走到这里说明用户已在确认框点"确认还原"（C-35），
+                        // 架构不一致的警告已列在确认框详情里，视为已确认（C-32）。
+                        allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
                         strategy: None,
@@ -1266,15 +1396,17 @@ fn run_gui() -> AppResult<()> {
                             .to_string(),
                     ))
                 } else {
-                    let mut args = vec![
+                    // C-31：不再向 helper 传归档内核 —— helper（联网、root=None）会按
+                    // 新默认语义"以当前内核为目标"执行重建；旧分支传的正是默认值，是死逻辑。
+                    // C-31: no `--kver` here — the helper defaults to the current kernel
+                    // (rebuild-first); the old branch passed the default value, i.e. dead logic.
+                    let args = vec![
                         "--archive".to_string(),
                         path.to_string_lossy().to_string(),
                         "--with-firmware".to_string(),
+                        // 确认框已展示架构差异并获得用户确认（C-32/C-35）。
+                        "--allow-arch-mismatch".to_string(),
                     ];
-                    if !same_kernel {
-                        args.push("--kver".to_string());
-                        args.push(inspected.manifest.kernel_release.clone());
-                    }
                     privilege::run_helper_via_pkexec(
                         &args,
                         progress,
@@ -1298,7 +1430,30 @@ fn run_gui() -> AppResult<()> {
         });
     }
 
-    // ---- 回调 4：取消 ----
+    // ---- 回调 4：确认框 —— 用户点击"确认还原"（C-35） ----
+    {
+        let weak = app.as_weak();
+        app.on_confirm_restore(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_confirm_visible(false);
+            ui.set_restore_ack(true);
+            // 重新进入 start-restore：此时 restore-ack 为真，直接走真实还原分支。
+            // Re-enter start-restore: with restore-ack set it proceeds to the real run.
+            ui.invoke_start_restore();
+        });
+    }
+
+    // ---- 回调 5：确认框 —— 用户点击"取消"（C-35） ----
+    {
+        let weak = app.as_weak();
+        app.on_dismiss_confirm(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_confirm_visible(false);
+            ui.set_status_text("已取消还原（未做任何改动）。".into());
+        });
+    }
+
+    // ---- 回调 6：取消 ----
     {
         let weak = app.as_weak();
         let cancel = Arc::clone(&cancel);
@@ -1346,6 +1501,7 @@ fn main() {
             yes,
             with_firmware,
             allow_kernel_mismatch,
+            allow_arch_mismatch,
             root,
             strategy,
             on_immutable,
@@ -1358,6 +1514,7 @@ fn main() {
             yes,
             with_firmware,
             allow_kernel_mismatch,
+            allow_arch_mismatch,
             root,
             strategy,
             on_immutable,
@@ -1371,6 +1528,7 @@ fn main() {
             kver,
             with_firmware,
             allow_kernel_mismatch,
+            allow_arch_mismatch,
             root,
             strategy,
             on_immutable,
@@ -1382,6 +1540,7 @@ fn main() {
             kver,
             with_firmware,
             allow_kernel_mismatch,
+            allow_arch_mismatch,
             root,
             strategy,
             on_immutable,
@@ -1500,6 +1659,7 @@ mod tests {
                 yes: true,
                 with_firmware: true,
                 allow_kernel_mismatch: true,
+                allow_arch_mismatch: false,
                 root: None,
                 strategy: None,
                 on_immutable: false,
@@ -1534,6 +1694,7 @@ mod tests {
                 yes: false,
                 with_firmware: false,
                 allow_kernel_mismatch: false,
+                allow_arch_mismatch: false,
                 root: Some("/mnt/target".to_string()),
                 strategy: Some(RestoreStrategy::Rebuild),
                 on_immutable: true,
@@ -1551,6 +1712,7 @@ mod tests {
                 yes: false,
                 with_firmware: false,
                 allow_kernel_mismatch: false,
+                allow_arch_mismatch: false,
                 root: None,
                 strategy: None,
                 on_immutable: false,
@@ -1624,6 +1786,7 @@ mod tests {
                 kver: None,
                 with_firmware: false,
                 allow_kernel_mismatch: false,
+                allow_arch_mismatch: false,
                 root: None,
                 strategy: None,
                 on_immutable: false,
@@ -1665,8 +1828,81 @@ mod tests {
             "--dry-run",
             "--strategy",
             "--root",
+            "--allow-arch-mismatch",
         ] {
             assert!(text.contains(needle), "用法说明缺少 {needle}");
         }
+        // 退出码契约（C-33）：0 必须包含"用户主动取消"。
+        assert!(text.contains("0 成功或用户主动取消"));
+    }
+
+    // ---- C-32：--allow-arch-mismatch 旗标 ----
+    #[test]
+    fn restore_allow_arch_mismatch_flag_is_parsed() {
+        let parsed = parse_args(&args(&[
+            "--restore",
+            "--archive",
+            "/tmp/a.tar.gz",
+            "--allow-arch-mismatch",
+        ]))
+        .unwrap();
+        match parsed {
+            Cmd::Restore {
+                allow_arch_mismatch, ..
+            } => assert!(allow_arch_mismatch),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let helper = parse_args(&args(&[
+            "--helper-restore",
+            "--archive",
+            "/tmp/a.tar.gz",
+            "--allow-arch-mismatch",
+        ]))
+        .unwrap();
+        match helper {
+            Cmd::Helper {
+                allow_arch_mismatch, ..
+            } => assert!(allow_arch_mismatch),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // ---- C-34：helper 路径对 --on-immutable 严格校验取值 ----
+    #[test]
+    fn helper_on_immutable_rejects_unknown_value() {
+        // 旧实现 matches!(v, "usroverlay") 把任意拼写静默当作 refuse，
+        // 提权路径上可能让用户以为已启用 usroverlay 实则没有（C-34）。
+        assert!(parse_args(&args(&[
+            "--helper-restore",
+            "--archive",
+            "a",
+            "--on-immutable",
+            "bogus"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&[
+            "--helper-restore",
+            "--archive",
+            "a",
+            "--on-immutable",
+            "usroverlay"
+        ]))
+        .is_ok());
+        assert!(parse_args(&args(&[
+            "--helper-restore",
+            "--archive",
+            "a",
+            "--on-immutable",
+            "refuse"
+        ]))
+        .is_ok());
+    }
+
+    // ---- C-33：退出码映射 —— 用户取消为 0，其余失败为 1 ----
+    #[test]
+    fn exit_code_maps_cancelled_to_zero() {
+        assert_eq!(exit_code(&AppError::Cancelled), 0);
+        assert_eq!(exit_code(&AppError::Validation("x".into())), 1);
+        assert_eq!(exit_code(&AppError::Format("bad".into())), 1);
     }
 }

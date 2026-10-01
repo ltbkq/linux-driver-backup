@@ -3,6 +3,8 @@
 //!
 //! - 发送端（GUI 普通用户进程）：[`run_helper_via_pkexec`] 启动
 //!   `pkexec <self> --helper-restore <args…>`，逐行解析行协议驱动进度条。
+//!   交给 `pkexec` 前会先做可执行文件信任校验（C-03：属主 root 且组/其他不可写，
+//!   见 [`check_elevatable`]），拒绝以 root 执行用户可写的二进制。
 //! - 接收端（root helper 进程）：[`HelperSink`] 把 `PROGRESS` / `NOTE` / `RESULT`
 //!   三类行写到 stdout，每行 `println!` 后立即 flush，保证 GUI 实时读取。
 //!
@@ -13,8 +15,11 @@
 //! RESULT\tOK|FAIL\t<消息>
 //! ```
 
+use std::ffi::OsString;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -154,11 +159,92 @@ impl HelperSink {
 // 发送端 / Caller side
 // ---------------------------------------------------------------------------
 
-/// Absolute path of the current executable, canonicalized for the pkexec re-exec.
-/// 当前可执行文件的绝对路径（canonicalize 后），用于 pkexec 自进程重入。
+/// Environment-variable escape hatch that disables [`check_elevatable`]:
+/// only the exact value `1` counts (`0` / `true` / trailing space keep the check on).
+/// 关闭 [`check_elevatable`] 的环境变量逃生口：取值必须**恰为** `1` 才生效
+/// （`0`、`true`、带空格等一律按未开启处理）。
+pub const UNSAFE_ELEVATION_ENV: &str = "LDB_ALLOW_UNSAFE_ELEVATION";
+
+/// Bilingual guidance appended to every rejection from [`check_elevatable`].
+/// [`check_elevatable`] 拒绝提权时附带的双语指引（安装到 /usr、AppImage 不可用、逃生口及其风险）。
+const ELEVATION_GUIDANCE: &str = "请先用安装脚本或包管理器安装到 /usr 后重试 / install to /usr via the install script or a package manager, then retry；AppImage 无法用于图形界面还原 / AppImage cannot be used for GUI restore；仅供开发调试：环境变量 LDB_ALLOW_UNSAFE_ELEVATION=1 可绕过本检查（高危：pkexec 将以 root 执行用户可写的二进制）/ development only: LDB_ALLOW_UNSAFE_ELEVATION=1 bypasses this check (DANGEROUS: pkexec will run a user-writable binary as root)";
+
+/// Whether the [`UNSAFE_ELEVATION_ENV`] escape hatch is on (`Some("1")` only).
+/// 逃生口是否开启：仅 `Some("1")` 算开启。
+fn unsafe_elevation_enabled(raw: Option<OsString>) -> bool {
+    raw.is_some_and(|v| v.to_str() == Some("1"))
+}
+
+/// Pre-elevation trust check for the binary `pkexec` will run as root (C-03).
+/// 提权前的可执行文件信任校验：交给 `pkexec` 以 root 执行的二进制必须可信（C-03）。
+///
+/// # 威胁模型 / Threat model
+///
+/// - **用户可写提权 / user-writable elevation**：`pkexec` 直接以 root 执行 `exe`，
+///   因此开发构建（`target/debug/…`，用户可写目录）与 AppImage（挂载在用户可写的
+///   临时挂载点）都允许同用户攻击者就地替换二进制 → root 执行任意代码。
+///   故要求 `st_uid == 0` **且** `st_mode & 0o022 == 0`（组、其他均不可写），
+///   把"有能力改写该文件"的主体收缩为 root 自身。
+/// - **TOCTOU 收窄 / window narrowing**：`fs::metadata` 跟随符号链接，读取的是
+///   canonicalize 之后那一路径在 **stat 时刻** 的属主与权限；校验点紧贴 `pkexec`
+///   spawn 之前，把原先 canonicalize→spawn 的整段竞态窗口收窄到 stat→spawn 的几行。
+///   残余风险：父目录本身可写时仍可 `rename` 替换整个文件 —— 安装到 `/usr` 后父目录同样不可写。
+/// - **逃生口 / escape hatch**：`allow_unsafe == true`（即 `LDB_ALLOW_UNSAFE_ELEVATION=1`）
+///   跳过校验，仅供开发调试，发行环境绝不可用。
+///
+/// Passes the canonicalized path through unchanged on success; otherwise returns
+/// [`AppError::Privilege`] with bilingual guidance (install to `/usr`, AppImage unusable
+/// for GUI restore, dev-only escape hatch with an explicit risk warning).
+/// 通过时原样返回传入的（canonicalize 后的）路径，否则返回带双语指引的 [`AppError::Privilege`]。
+pub fn check_elevatable(exe: &Path, allow_unsafe: bool) -> AppResult<PathBuf> {
+    let meta = match fs::metadata(exe) {
+        Ok(m) => m,
+        Err(e) => {
+            // stat 失败同样 fail closed：无法证明可信就拒绝提权（逃生口除外）。
+            if allow_unsafe {
+                return Ok(exe.to_path_buf());
+            }
+            return Err(AppError::Privilege(format!(
+                "无法读取可执行文件的属主与权限 / cannot read owner & mode of {}: {e}；\
+                 已拒绝提权 / refusing to elevate；{ELEVATION_GUIDANCE}",
+                exe.display()
+            )));
+        }
+    };
+
+    let uid = meta.uid();
+    let mode = meta.mode();
+    if uid == 0 && (mode & 0o022) == 0 {
+        return Ok(exe.to_path_buf());
+    }
+    if allow_unsafe {
+        return Ok(exe.to_path_buf());
+    }
+    let perm = mode & 0o777;
+    Err(AppError::Privilege(format!(
+        "可执行文件位于用户可写路径，已拒绝提权 / refusing to elevate a user-writable binary: \
+         {}（属主 uid={uid}，模式 {perm:04o} / uid={uid}, mode={perm:04o}）；{ELEVATION_GUIDANCE}",
+        exe.display()
+    )))
+}
+
+/// Absolute path of the current executable, canonicalized **and trust-checked** for the pkexec re-exec.
+/// 当前可执行文件的绝对路径（canonicalize + 信任校验后），用于 pkexec 自进程重入。
+///
+/// 校验语义与威胁模型见 [`check_elevatable`]：属主非 root 或组/其他可写即拒绝提权
+/// （未安装的开发构建与 AppImage 都会被拒）。仅当 [`UNSAFE_ELEVATION_ENV`] 取值恰为 `1`
+/// 时跳过校验，并向 **stderr** 打印一行警告 —— stdout 是 helper 行协议通道，绝不能被污染。
+/// Trust semantics live in [`check_elevatable`]; the escape hatch warns on stderr only,
+/// so the stdout line protocol stays intact.
 pub fn self_exe() -> AppResult<PathBuf> {
-    let exe = std::env::current_exe()?;
-    Ok(exe.canonicalize()?)
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let allow_unsafe = unsafe_elevation_enabled(std::env::var_os(UNSAFE_ELEVATION_ENV));
+    if allow_unsafe {
+        eprintln!(
+            "警告：{UNSAFE_ELEVATION_ENV}=1 已跳过提权前的可执行文件信任校验，pkexec 将以 root 执行用户可写的二进制（仅供开发调试，风险自负） / WARNING: {UNSAFE_ELEVATION_ENV}=1 skipped the pre-elevation trust check; pkexec will run a user-writable binary as root (development only, at your own risk)"
+        );
+    }
+    check_elevatable(&exe, allow_unsafe)
 }
 
 /// Join captured stderr lines into a readable suffix (last [`STDERR_TAIL_LINES`] lines).
@@ -337,6 +423,7 @@ pub fn run_helper_via_pkexec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parses_progress_line() {
@@ -414,5 +501,102 @@ mod tests {
     fn helper_flag_is_stable() {
         // main.rs 与 GUI 依赖该常量，改动会破坏 pkexec 重入契约
         assert_eq!(HELPER_FLAG, "--helper-restore");
+    }
+
+    // -----------------------------------------------------------------------
+    // C-03：提权前的可执行文件信任校验 / pre-elevation trust check
+    // -----------------------------------------------------------------------
+
+    /// 与 scan.rs / backup.rs 夹具同款的临时目录（名字带 pid，避免并行测试互踩）。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ldb-priv-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    /// 造一个夹具二进制：临时文件 + 指定权限位（属主 = 当前测试进程的 euid）。
+    fn make_exe(tag: &str, mode: u32) -> PathBuf {
+        let p = temp_dir(tag).join("app");
+        fs::write(&p, b"#!binary").expect("write exe");
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).expect("chmod");
+        p
+    }
+
+    /// C-03：属主非 root 或组/其他可写的二进制一律拒绝提权。
+    ///
+    /// **属主分支按夹具文件的“实际 uid”分叉**（既无法在普通用户下构造 root 属主文件，
+    /// 也无法在 root 下构造用户属主文件，且不引入 libc/nix 依赖）：
+    /// - 普通用户（`uid != 0`，本机开发）：0755 也必须 `Err` —— 测 uid 分支；
+    /// - root（CI 容器常见，euid == 0）：跳过 uid 分支，只测 mode 分支 ——
+    ///   root 属主 + 0755 → `Ok`，0775（组可写）→ `Err`，0666 → `Err`。
+    #[test]
+    fn rejects_untrusted_elevation_target() {
+        let exe = make_exe("untrusted", 0o755);
+        let uid = fs::metadata(&exe).expect("stat fixture").uid();
+
+        if uid == 0 {
+            // root 属主无法在本分支构造“用户属主”样例，uid 分支由普通用户路径覆盖。
+            assert!(
+                check_elevatable(&exe, false).is_ok(),
+                "root-owned 0755 must be accepted"
+            );
+        } else {
+            let err = check_elevatable(&exe, false)
+                .expect_err("user-owned 0755 must be refused even though mode is clean");
+            match err {
+                AppError::Privilege(m) => {
+                    assert!(m.contains("已拒绝提权"), "{m}");
+                    assert!(m.contains("refusing to elevate a user-writable binary"), "{m}");
+                    assert!(m.contains("/usr"), "{m}");
+                    assert!(m.contains("AppImage"), "{m}");
+                    assert!(m.contains("LDB_ALLOW_UNSAFE_ELEVATION=1"), "{m}");
+                }
+                other => panic!("expected AppError::Privilege, got {other:?}"),
+            }
+        }
+
+        // mode 分支（root / 普通用户皆适用）：组可写 → Err；组与其他可写 → Err。
+        for mode in [0o775u32, 0o666u32] {
+            fs::set_permissions(&exe, fs::Permissions::from_mode(mode)).expect("chmod");
+            assert!(
+                check_elevatable(&exe, false).is_err(),
+                "mode {mode:04o} must be refused"
+            );
+        }
+    }
+
+    /// C-03：`allow_unsafe=true`（`LDB_ALLOW_UNSAFE_ELEVATION=1`）跳过校验并原样返回路径。
+    /// uid/mode 两种不满足情形（普通用户属主 or 0666）在 root 与普通用户下都成立。
+    #[test]
+    fn allow_unsafe_overrides_elevatable_check() {
+        let exe = make_exe("unsafe", 0o666);
+        assert!(
+            check_elevatable(&exe, false).is_err(),
+            "0666 must be refused by default"
+        );
+        let got = check_elevatable(&exe, true).expect("allow_unsafe must pass");
+        assert_eq!(got, exe, "returns the canonicalized path unchanged");
+    }
+
+    /// C-03：无法 stat 的路径（不存在 / 链接断裂）同样 fail closed。
+    #[test]
+    fn refuses_unstatable_elevation_target() {
+        let exe = temp_dir("missing").join("no-such-binary");
+        let err = check_elevatable(&exe, false).expect_err("missing file must be refused");
+        assert!(matches!(err, AppError::Privilege(_)), "got {err:?}");
+        // 逃生口对 stat 失败也放行（开发调试语义，随后 pkexec 自会报文件不存在）。
+        let got = check_elevatable(&exe, true).expect("allow_unsafe must pass");
+        assert_eq!(got, exe);
+    }
+
+    /// 逃生口环境变量只认取值恰为 `1`（`0` / `true` / 带空格一律不生效）。
+    #[test]
+    fn unsafe_elevation_env_requires_exact_one() {
+        assert!(unsafe_elevation_enabled(Some(OsString::from("1"))));
+        assert!(!unsafe_elevation_enabled(Some(OsString::from("0"))));
+        assert!(!unsafe_elevation_enabled(Some(OsString::from("true"))));
+        assert!(!unsafe_elevation_enabled(Some(OsString::from("1 "))));
+        assert!(!unsafe_elevation_enabled(None));
     }
 }

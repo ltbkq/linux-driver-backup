@@ -34,9 +34,9 @@
 //! （如 `lib/modules/6.8.0-45-generic/updates/dkms/foo.ko`），归档直接按它落盘（DESIGN.md §4.3）。
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -559,40 +559,99 @@ fn parse_modinfo(text: &str) -> ModInfo {
     info
 }
 
+/// usr-merge 归一化：把绝对路径根后的首段 `/lib`、`/bin`、`/sbin`、`/lib64` 改写到 `/usr` 下。
+///
+/// Normalize an absolute path to its usr-merged spelling for provenance lookups (C-23).
+///
+/// usr-merge 系统（Debian/Ubuntu usrmerge、Fedora `/usr` 布局）的包数据库记录的是
+/// `/usr/lib/...`，而扫描走 `/lib/modules` 根 —— 直接查 `/lib/...` 必然无匹配
+/// （实测 `dpkg-query -S /lib/x86_64-linux-gnu/libc.so.6` exit=1 无输出，
+/// `/usr/lib/x86_64-linux-gnu/libc.so.6` 返回 `libc6:amd64`，
+/// 见 docs/ITERATION-v0.3.0.md §3.1-5），连带固件 `content_stored=false` 优化失效。
+///
+/// 只改写**根之后的第一个组件**，因此 `/usr/lib/...` 自身、`/var/lib/...`（中段的
+/// `lib` 不是首段）、`/libfoo/...`（前缀相近但非独立段）、相对路径都原样返回。
+/// 归一化只是**查询串**：非 usr-merge 系统（`/lib` 为真实目录）上归一化查询会落空，
+/// 由调用方（[`collect_owners_dpkg`] / [`collect_owners_rpm`]）用原始路径重试一次兜底。
+fn usr_merge_normalize(p: &Path) -> PathBuf {
+    /// usr-merge 会合并进 `/usr` 的根目录段 / Root dirs that usr-merge moves under `/usr`.
+    const MERGED_ROOT_DIRS: &[&str] = &["lib", "bin", "sbin", "lib64"];
+    let mut comps = p.components();
+    if comps.next() != Some(Component::RootDir) {
+        return p.to_path_buf();
+    }
+    let first = match comps.next() {
+        Some(Component::Normal(seg)) => seg,
+        _ => return p.to_path_buf(),
+    };
+    if !MERGED_ROOT_DIRS.iter().any(|d| first == OsStr::new(d)) {
+        return p.to_path_buf();
+    }
+    let mut out = PathBuf::from("/usr");
+    out.push(first);
+    // 余下组件原样追加；`/lib` 这种只剩根段的路径不补尾斜杠。
+    let rest = comps.as_path();
+    if !rest.as_os_str().is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
 /// Resolve package provenance for the given paths (P0-5), `dpkg-query` first, then `rpm`.
 ///
 /// 先尝试 `dpkg-query -S`（按 [`QUERY_CHUNK`] 分片）并对命中的包批量取版本；若无
 /// `dpkg-query` 则回退 `rpm -qf`（逐路径）。两者都缺失或查询失败时返回空 map，
 /// **绝不报错**（调用方保持 `owner = None`）。
+///
+/// 入口先对每个路径做 usr-merge 归一化（C-23，见 [`usr_merge_normalize`]），查询用
+/// 归一化路径，命中的结果**映射回原始路径键**插入 `owners` —— map 的 key 永远是调用方
+/// 传入的 `paths` 中的路径；查询本身走 [`run_command_stdout`]（C-22：不看退出码）。
 fn collect_owners(paths: &[PathBuf]) -> HashMap<PathBuf, Provenance> {
     let mut owners: HashMap<PathBuf, Provenance> = HashMap::new();
     if paths.is_empty() {
         return owners;
     }
+    // 归一化只在入口做一次，dpkg 与 rpm 两条查询路径共用（C-23）。
+    let queries: Vec<PathBuf> = paths.iter().map(|p| usr_merge_normalize(p)).collect();
     if has_cmd("dpkg-query") {
-        collect_owners_dpkg(paths, &mut owners);
+        collect_owners_dpkg(paths, &queries, &mut owners);
     } else if has_cmd("rpm") {
-        collect_owners_rpm(paths, &mut owners);
+        collect_owners_rpm(paths, &queries, &mut owners);
     }
     owners
 }
 
 /// `dpkg-query -S` 批量查来源包，再 `-W` 批量取版本，写入 `owners`。
 /// Query provenance in batch with `dpkg-query -S`, then resolve versions with `-W`.
-fn collect_owners_dpkg(paths: &[PathBuf], owners: &mut HashMap<PathBuf, Provenance>) {
-    // 归档路径字符串 -> 包名
+///
+/// `queries` 与 `paths` 等长且一一对应（C-23 归一化后的查询串）；分片查询走
+/// [`run_command_stdout`]（C-22：无视退出码），命中的包一律以 `paths` 的**原始路径**
+/// 为 key 写入 `owners`，归一化只影响发给 dpkg 的查询串。
+fn collect_owners_dpkg(
+    paths: &[PathBuf],
+    queries: &[PathBuf],
+    owners: &mut HashMap<PathBuf, Provenance>,
+) {
+    // 查询串 -> 包名
     let mut package_by_path: HashMap<String, String> = HashMap::new();
-    for chunk in paths.chunks(QUERY_CHUNK) {
-        let mut args: Vec<OsString> = Vec::with_capacity(chunk.len() + 1);
-        args.push(OsString::from("-S"));
-        args.extend(chunk.iter().map(|p| p.as_os_str().to_os_string()));
-        let Some(text) = run_command("dpkg-query", &args) else {
+    dpkg_query_s(queries, &mut package_by_path);
+
+    // 回退：归一化改变了路径却未命中的条目，用原始路径再查一次。
+    // 设计文档 §4-W0 C-23 允许"自然无归属"与"原路径重试"二选一，这里选重试：
+    // 非 usr-merge 系统（`/lib` 是真实目录）上归一化查询必然落空，重试避免老系统回归；
+    // usr-merge 系统上重试只是一批无命中的空查询（按 QUERY_CHUNK 分片），代价可忽略。
+    let mut retry: Vec<PathBuf> = Vec::new();
+    for (orig, norm) in paths.iter().zip(queries) {
+        if norm == orig {
             continue;
-        };
-        for (package, path) in parse_dpkg_query_s(&text) {
-            package_by_path.entry(path).or_insert(package);
+        }
+        let norm_key = norm.to_string_lossy();
+        if !package_by_path.contains_key(&*norm_key) {
+            retry.push(orig.clone());
         }
     }
+    dpkg_query_s(&retry, &mut package_by_path);
+
     if package_by_path.is_empty() {
         return;
     }
@@ -609,7 +668,9 @@ fn collect_owners_dpkg(paths: &[PathBuf], owners: &mut HashMap<PathBuf, Provenan
         // dpkg-query 会解释格式串里的 `\t` / `\n` 转义。
         args.push(OsString::from("-f=${Package}\\t${Version}\\n"));
         args.extend(chunk.iter().map(|p| OsString::from(p.as_str())));
-        let Some(text) = run_command("dpkg-query", &args) else {
+        // C-22：同样不看退出码 —— 批内包不存在时 exit=1，但已解析的包仍会输出；
+        // 完全无输出（包都不存在）时空串自然解析不出版本。
+        let Some(text) = run_command_stdout("dpkg-query", &args) else {
             continue;
         };
         for line in text.lines() {
@@ -619,9 +680,8 @@ fn collect_owners_dpkg(paths: &[PathBuf], owners: &mut HashMap<PathBuf, Provenan
         }
     }
 
-    for path in paths {
-        let key = path.to_string_lossy();
-        if let Some(package) = package_by_path.get(&*key) {
+    for (path, query) in paths.iter().zip(queries) {
+        if let Some(package) = package_for(&package_by_path, path, query) {
             // `-S` 对 multiarch 包可能给出 `pkg:arch`，而 `-W` 的 `${Package}` 只有 `pkg`。
             let base = package.split(':').next().unwrap_or(package.as_str());
             let version = versions
@@ -643,39 +703,106 @@ fn collect_owners_dpkg(paths: &[PathBuf], owners: &mut HashMap<PathBuf, Provenan
 
 /// `rpm -qf` 逐路径查来源包（`%{NAME}` + `%{VERSION}-%{RELEASE}`），写入 `owners`。
 /// Query provenance per path with `rpm -qf`.
-fn collect_owners_rpm(paths: &[PathBuf], owners: &mut HashMap<PathBuf, Provenance>) {
-    for path in paths {
-        let args: Vec<OsString> = vec![
-            OsString::from("-qf"),
-            OsString::from("--qf"),
-            OsString::from(RPM_QF_FORMAT),
-            path.as_os_str().to_os_string(),
-        ];
-        let Some(text) = run_command("rpm", &args) else {
+///
+/// `queries` 与 `paths` 等长（C-23 归一化后的查询串）：先查归一化路径，未命中且与
+/// 原路径不同（非 usr-merge 系统）时用原始路径重试一次；命中一律回填**原始路径键**。
+/// 与 dpkg 一样走 [`run_command_stdout`]（C-22）：文件无归属时 rpm 非零退出，
+/// stdout 为空，解析自然得 `None`。
+fn collect_owners_rpm(
+    paths: &[PathBuf],
+    queries: &[PathBuf],
+    owners: &mut HashMap<PathBuf, Provenance>,
+) {
+    for (path, query) in paths.iter().zip(queries) {
+        let hit = rpm_owner_of(query).or_else(|| {
+            if query == path {
+                None
+            } else {
+                rpm_owner_of(path)
+            }
+        });
+        let Some((name, version)) = hit else {
             continue;
         };
-        // 单路径查询必为同一包：取首行即可（`FILENAMES` 可能内含该包全部文件）。
-        if let Some((name, version, _)) = parse_rpm_qf(&text).into_iter().next() {
-            owners.insert(
-                path.clone(),
-                Provenance {
-                    manager: "rpm".to_string(),
-                    package: name,
-                    version,
-                },
-            );
+        owners.insert(
+            path.clone(),
+            Provenance {
+                manager: "rpm".to_string(),
+                package: name,
+                version,
+            },
+        );
+    }
+}
+
+/// Single-path `rpm -qf` lookup returning `(package, version)`.
+///
+/// 单条 `rpm -qf` 查询：spawn 失败、文件无归属（非零退出且 stdout 为空）都返回
+/// `None`；命中取首行即可（`FILENAMES` 可能内含该包全部文件，属 C-24 已知问题）。
+fn rpm_owner_of(path: &Path) -> Option<(String, String)> {
+    let args: Vec<OsString> = vec![
+        OsString::from("-qf"),
+        OsString::from("--qf"),
+        OsString::from(RPM_QF_FORMAT),
+        path.as_os_str().to_os_string(),
+    ];
+    let text = run_command_stdout("rpm", &args)?;
+    let (name, version, _) = parse_rpm_qf(&text).into_iter().next()?;
+    Some((name, version))
+}
+
+/// Batch `dpkg-query -S` over `query_paths`, merging hits into `package_by_path`.
+///
+/// 按 [`QUERY_CHUNK`] 分片查来源包；`package_by_path` 的 key 是 dpkg 原样回显的路径串。
+/// C-22：查询走 [`run_command_stdout`] —— 批内只要有一个未归属路径 dpkg 就 `exit=1`，
+/// 但 stdout 仍包含其余路径的匹配（实测见 docs/ITERATION-v0.3.0.md §3.1-4），按退出码
+/// 丢弃会让整批最多 [`QUERY_CHUNK`] 条归属信息全部丢失。
+fn dpkg_query_s(query_paths: &[PathBuf], package_by_path: &mut HashMap<String, String>) {
+    for chunk in query_paths.chunks(QUERY_CHUNK) {
+        let mut args: Vec<OsString> = Vec::with_capacity(chunk.len() + 1);
+        args.push(OsString::from("-S"));
+        args.extend(chunk.iter().map(|p| p.as_os_str().to_os_string()));
+        let Some(text) = run_command_stdout("dpkg-query", &args) else {
+            continue;
+        };
+        for (package, path) in parse_dpkg_query_s(&text) {
+            package_by_path.entry(path).or_insert(package);
         }
     }
 }
 
-/// Run a command and return its stdout on success; any failure yields `None`.
+/// Look up one path's owning package, preferring the usr-merged query spelling (C-23).
 ///
-/// 查询类外部命令一律"尽力而为"：不存在、非零退出、非 UTF-8 都静默降级。
-fn run_command(program: &str, args: &[OsString]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
+/// `package_by_path` 的 key 是 dpkg 回显的路径串（通常就是归一化查询串 `query`）。
+/// 先按 `query` 查；落空且 `query != path` 时回看原始路径 `path`（非 usr-merge 系统的
+/// 回退查询结果）。命中与否只决定要不要回填，**调用方一律用原始 `path` 作 owners 的 key**。
+fn package_for<'a>(
+    package_by_path: &'a HashMap<String, String>,
+    path: &Path,
+    query: &Path,
+) -> Option<&'a String> {
+    let norm_key = query.to_string_lossy();
+    if let Some(package) = package_by_path.get(&*norm_key) {
+        return Some(package);
     }
+    if query != path {
+        let orig_key = path.to_string_lossy();
+        return package_by_path.get(&*orig_key);
+    }
+    None
+}
+
+/// Run a command and return its stdout lossily, ignoring the exit status (C-22).
+///
+/// 归属查询专用的"尽力而为"执行器：只要子进程成功 spawn 就返回 stdout（lossy UTF-8），
+/// **不看退出码**；仅 spawn 失败（命令不存在等）返回 `None`。
+///
+/// 依据（实测，docs/ITERATION-v0.3.0.md §3.1-4）：`dpkg-query -S` 批内只要有一个
+/// 未归属路径就 `exit=1`，而 stdout 仍输出其余匹配（如 `coreutils: /usr/bin/env`）——
+/// 按退出码丢弃会把整批归属信息一起扔掉。`-W` 版本查询失败（包不存在）时 stdout 为空，
+/// 空输出自然不影响解析。
+fn run_command_stdout(program: &str, args: &[OsString]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -1353,6 +1480,153 @@ diversion by foo from: /usr/lib/old
         assert_eq!(
             parsed,
             vec![("real".to_string(), "1.0".to_string(), "/p".to_string())]
+        );
+    }
+
+    /// C-22：`dpkg-query -S` 批内含未归属路径时 exit=1，stdout 里已匹配的部分必须仍被解析。
+    ///
+    /// 进程级实测证据（docs/ITERATION-v0.3.0.md §3.1-4）：`dpkg-query -S <存在路径>
+    /// <不存在路径>` → `exit=1` 且 stdout 输出 `coreutils: /usr/bin/env`（诊断文本走
+    /// stderr，归属查询只读 stdout）。这里把"一次批查询的混合 stdout"直接喂给解析函数，
+    /// 锁定"部分失败不拖垮整批"；进程级的"非零退出仍返回 stdout"由
+    /// [`run_command_stdout_ignores_exit_status`] 覆盖。
+    #[test]
+    fn parse_dpkg_query_s_keeps_matches_from_partial_batch() {
+        // 三个命中路径分属两个包 —— 批内其余未归属路径只体现在退出码上，不在 stdout 里。
+        let stdout = "\
+coreutils: /usr/bin/env
+dash: /bin/sh, /usr/bin/sh
+";
+        let parsed = parse_dpkg_query_s(stdout);
+        assert_eq!(parsed.len(), 3, "exit=1 批次的 stdout 命中必须全部保留");
+        assert_eq!(
+            parsed[0],
+            ("coreutils".to_string(), "/usr/bin/env".to_string())
+        );
+        assert_eq!(
+            parsed[2],
+            ("dash".to_string(), "/usr/bin/sh".to_string())
+        );
+    }
+
+    /// C-22：归属查询读 stdout 而不看退出码 —— exit≠0 仍返回输出，仅 spawn 失败返回 `None`。
+    #[test]
+    fn run_command_stdout_ignores_exit_status() {
+        // 模拟 `dpkg-query -S` 批内含未归属路径：exit=1 但 stdout 仍有匹配（§3.1-4 实测）。
+        let out = run_command_stdout(
+            "sh",
+            &[
+                OsString::from("-c"),
+                OsString::from("printf 'coreutils: /usr/bin/env\\n'; exit 1"),
+            ],
+        )
+        .expect("非零退出必须仍返回 stdout");
+        assert_eq!(out, "coreutils: /usr/bin/env\n");
+
+        // 完全无输出（如 `-W` 查询的包不存在）→ 空串，解析自然得空、不影响其余包。
+        let empty = run_command_stdout(
+            "sh",
+            &[OsString::from("-c"), OsString::from("exit 1")],
+        )
+        .expect("非零退出但成功 spawn");
+        assert!(empty.is_empty());
+
+        // spawn 失败（命令不存在）→ None。
+        assert!(run_command_stdout("ldb-no-such-command-for-test", &[]).is_none());
+    }
+
+    /// C-23：usr-merge 归一化把根首段 `/lib`、`/bin`、`/sbin`、`/lib64` 改写到 `/usr` 下。
+    #[test]
+    fn usr_merge_normalize_maps_merged_root_dirs() {
+        assert_eq!(
+            usr_merge_normalize(Path::new("/lib/modules/6.8.0-generic/updates/dkms/foo.ko")),
+            PathBuf::from("/usr/lib/modules/6.8.0-generic/updates/dkms/foo.ko")
+        );
+        assert_eq!(
+            usr_merge_normalize(Path::new("/lib/firmware/i915/fw.bin")),
+            PathBuf::from("/usr/lib/firmware/i915/fw.bin")
+        );
+        assert_eq!(
+            usr_merge_normalize(Path::new("/bin/sh")),
+            PathBuf::from("/usr/bin/sh")
+        );
+        assert_eq!(
+            usr_merge_normalize(Path::new("/sbin/depmod")),
+            PathBuf::from("/usr/sbin/depmod")
+        );
+        assert_eq!(
+            usr_merge_normalize(Path::new("/lib64/ld-linux-x86-64.so.2")),
+            PathBuf::from("/usr/lib64/ld-linux-x86-64.so.2")
+        );
+        // 恰好只有根段时也不补尾斜杠
+        assert_eq!(usr_merge_normalize(Path::new("/lib")), PathBuf::from("/usr/lib"));
+    }
+
+    /// C-23：只改写"根之后的第一个组件"，其余路径原样返回。
+    #[test]
+    fn usr_merge_normalize_leaves_other_paths_alone() {
+        for p in [
+            "/usr/lib/modules/6.8.0",   // 已是 usr 前缀（扫描的另一个根）
+            "/usr/lib/firmware",        // 不做二次前缀
+            "/var/lib/dkms/nvidia/1.0", // 中段的 lib 不是首段
+            "/libfoo/bar",              // 前缀相近但不是独立段
+            "/etc/modprobe.d/x.conf",
+            "lib/modules/x.ko", // 相对路径
+        ] {
+            assert_eq!(usr_merge_normalize(Path::new(p)), PathBuf::from(p), "{p}");
+        }
+    }
+
+    /// C-23：查包时先按归一化查询串命中，落空再看原始路径（回退查询），两者都不中则无归属。
+    #[test]
+    fn package_lookup_prefers_normalized_query_then_original() {
+        let orig = Path::new("/lib/foo");
+        let norm = usr_merge_normalize(orig);
+        assert_eq!(norm, PathBuf::from("/usr/lib/foo"));
+
+        // usr-merge 系统：dpkg 数据库存的是 /usr/lib/... → 按归一化查询串命中
+        let mut merged = HashMap::new();
+        merged.insert("/usr/lib/foo".to_string(), "libc6:amd64".to_string());
+        assert_eq!(
+            package_for(&merged, orig, &norm).map(String::as_str),
+            Some("libc6:amd64")
+        );
+
+        // 非 usr-merge 系统：数据库存原始 /lib/... → 回退查询命中
+        let mut plain = HashMap::new();
+        plain.insert("/lib/foo".to_string(), "legacy-pkg".to_string());
+        assert_eq!(
+            package_for(&plain, orig, &norm).map(String::as_str),
+            Some("legacy-pkg")
+        );
+
+        // 两者都不中 → None；查询串未变化（query == path）时只按该串查一次
+        let absent = Path::new("/lib/absent");
+        assert!(package_for(&plain, absent, absent).is_none());
+        let etc = Path::new("/etc/only-in-plain");
+        assert!(package_for(&plain, etc, etc).is_none());
+    }
+
+    /// C-23：无论命中与否，`owners` 的 key 只能是调用方传入的原始路径。
+    ///
+    /// 环境相关（dpkg/rpm 都缺失时 owners 为空，断言同样成立）；关键在于归一化查询串
+    /// 永远不会作为 key 泄漏出去 —— 否则 `scan()` 按 `entry.abs_path` 回填时会全部落空。
+    #[test]
+    fn collect_owners_keys_are_caller_paths_not_normalized() {
+        let inputs = vec![PathBuf::from(
+            "/lib/modules/6.8.0-test/updates/dkms/ldb-owner-probe.ko",
+        )];
+        let owners = collect_owners(&inputs);
+        assert!(
+            owners.keys().all(|k| inputs.contains(k)),
+            "owners 只能用原始路径做 key，实际: {:?}",
+            owners.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !owners.contains_key(&PathBuf::from(
+                "/usr/lib/modules/6.8.0-test/updates/dkms/ldb-owner-probe.ko"
+            )),
+            "归一化查询串不得成为 key"
         );
     }
 

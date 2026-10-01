@@ -8,11 +8,11 @@
 //!
 //! Depends only on the frozen contracts `crate::model` (§5.1) and `crate::distro` (§5.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,6 +48,23 @@ const STAGE_PREFIX: &str = ".ldb-staging-";
 /// 允许符号链接指向的受管前缀（相对路径形式）：仅模块目录。
 /// 配置文件以普通文件条目还原，因此链接目标不需要 `/etc` 权限面。
 const MANAGED_PREFIXES: [&str; 2] = ["lib/modules/", "usr/lib/modules/"];
+/// C-01：`etc/` 下符号链接目标归一化后的**绝对路径白名单**（必须落在其中之一）。
+/// C-01: whitelist of absolute prefixes an `etc/` symlink target may resolve into.
+///
+/// 覆盖实测合法样例（`/lib/linux-sound-base/…`）、usr-merge 的 `/usr/lib/…`，
+/// 以及常见的 `/etc/…`、`/usr/share/…`、`/run/…` 别名；`/`、`/home/…` 等一律拒绝。
+/// 与 `backup.rs::validate_link_target` 保持同一规则（v0.3.0 由 W7/C-47 合并为共享函数）。
+const ALLOWED_ETC_LINK_PREFIXES: [&str; 5] =
+    ["/etc/", "/lib/", "/usr/lib/", "/usr/share/", "/run/"];
+/// C-02：usr-merge 系统直接位于**目标根顶层**的别名组件（`/lib -> usr/lib` 等）。
+/// Top-level usr-merge alias components that may legitimately be symlinks.
+///
+/// 仅第 0 层组件享受该例外（在 `root=/` 与 `--root <dir>` 下同样适用），
+/// 以避免 usr-merge 发行版被误杀；其余任何层级的符号链接组件一律拒绝。
+const USRMERGE_TOP_ALIASES: [&str; 4] = ["lib", "bin", "sbin", "lib64"];
+/// C-11：写前日志（WAL）文件后缀；正式日志为 `restore-<id>.json`。
+/// C-11: write-ahead log suffix; the committed journal is `restore-<id>.json`.
+const WAL_SUFFIX: &str = ".jsonl.tmp";
 /// 默认保留的回滚代数（`RestoreRequest::keep_rollback` 的默认值）。
 /// Default number of rollback generations kept.
 pub const DEFAULT_KEEP_ROLLBACK: usize = 3;
@@ -105,24 +122,93 @@ pub struct JournalEntry {
 }
 
 impl RestoreJournal {
-    /// Persist the journal as JSON.
-    /// 将日志写入磁盘（父目录自动创建）。
-    pub fn save(&self, path: &Path) -> AppResult<()> {
+    /// Persist the journal atomically (C-11): write to a sibling temp file, fsync,
+    /// then `rename` over the target so readers never observe a half-written JSON.
+    /// 原子落盘（C-11，取代旧的非原子 `save`）：先写同目录临时文件并 fsync，
+    /// 再 `rename` 覆盖正式路径，任何读者都不会看到写了一半的 JSON。
+    pub fn save_atomic(&self, path: &Path) -> AppResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "restore-journal.json".to_string());
+        let tmp = path.with_file_name(format!("{}.new", name));
         let json = serde_json::to_vec_pretty(self)?;
-        fs::write(path, json)?;
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            // 目录项的持久性由调用方在进程退出前保证；文件内容本身先落盘。
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
-    /// Load a journal from disk.
-    /// 从磁盘读取日志。
+    /// Load a journal from disk: the committed pretty JSON, or (C-11) the
+    /// line-delimited write-ahead log left behind by a failed/crashed run.
+    /// 从磁盘读取日志：正式 JSON，或（C-11）失败/崩溃后残留的逐行写前日志。
+    ///
+    /// JSONL 中每行是一个 [`JournalEntry`]，行序即条目序（回滚按逆序执行）。
     pub fn load(path: &Path) -> AppResult<Self> {
         let text = fs::read_to_string(path)?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.ends_with(WAL_SUFFIX) {
+            let mut entries = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                entries.push(serde_json::from_str::<JournalEntry>(line).map_err(|e| {
+                    AppError::Format(format!("回滚日志(WAL)第 {} 行解析失败：{}", idx + 1, e))
+                })?);
+            }
+            return Ok(RestoreJournal {
+                created_at: format!("wal:{}", name),
+                target_kver: String::new(),
+                root: String::new(),
+                entries,
+            });
+        }
         serde_json::from_str(&text)
             .map_err(|e| AppError::Format(format!("回滚日志解析失败：{}", e)))
     }
+}
+
+/// C-11: companion write-ahead log path of a committed journal file.
+/// C-11：由正式日志路径推导其写前日志路径（`restore-<id>.json` → `restore-<id>.jsonl.tmp`）。
+fn journal_wal_path(journal_path: &Path) -> PathBuf {
+    let name = journal_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "restore-journal.json".to_string());
+    match name.strip_suffix(".json") {
+        Some(stem) => journal_path.with_file_name(format!("{}{}", stem, WAL_SUFFIX)),
+        None => journal_path.with_file_name(format!("{}{}", name, WAL_SUFFIX)),
+    }
+}
+
+/// C-11: append one journal entry to the write-ahead log and fsync it **before**
+/// any filesystem change is made for that entry.
+/// C-11：把单条日志以 JSONL 追加写入写前日志并立即 `fsync`——必须发生在该条目
+/// 任何实际变更（move_aside / rename）**之前**，崩溃后凭此可回滚。
+fn append_journal_wal(wal_path: &Path, entry: &JournalEntry) -> AppResult<()> {
+    if let Some(parent) = wal_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wal_path)?;
+    serde_json::to_writer(&mut f, entry)?;
+    f.write_all(b"\n")?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Result of a rollback run.
@@ -380,19 +466,81 @@ fn is_managed_rel(rel: &Path) -> bool {
 /// （归一化后仍在 `lib/modules/` 之下），必须放行；而 `../../etc/shadow` 之类一律拒绝。
 enum LinkPlan {
     /// 按原样重建（`/etc` 下的配置别名，可含绝对目标）。
+    ///
+    /// C-01：目标已经过 [`resolve_link_abs`] 词法归一化与白名单校验，
+    /// 因此只可能落在 `etc/` 树内或 [`ALLOWED_ETC_LINK_PREFIXES`] 之内。
     Verbatim,
     /// 归一化后落在模块目录内的模块链接（如 weak-updates）。
     Normalized(PathBuf),
 }
 
+/// Lexically resolve a symlink target to an absolute path rooted at the archive
+/// root (C-01): relative targets are joined onto the link's own directory first;
+/// `..` is rejected when it would climb above the archive root for relative
+/// targets, and pinned at `/` for absolute ones.
+/// 把符号链接目标**词法**解析为以归档根为基准的绝对路径（C-01）：
+/// 相对目标先拼到链接所在目录；相对目标的 `..` 越出归档根即返回 `None`，
+/// 绝对目标的 `/..` 则停在根。例：`("etc/a/b.conf", "../x")` → `Some("/etc/x")`。
+fn resolve_link_abs(link_rel: &str, target: &str) -> Option<PathBuf> {
+    let absolute = target.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    if !absolute {
+        if let Some((dir, _)) = link_rel.rsplit_once('/') {
+            for seg in dir.split('/') {
+                if !seg.is_empty() && seg != "." {
+                    stack.push(seg);
+                }
+            }
+        }
+    }
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() && !absolute {
+                    // 相对目标越出归档根（`etc/x -> ../../../../..`）→ 拒绝。
+                    return None;
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(PathBuf::from(format!("/{}", stack.join("/"))))
+}
+
 fn validate_link_target(link_rel: &str, target: &str) -> AppResult<LinkPlan> {
     if link_rel.starts_with("etc/") {
-        // 系统配置别名允许绝对目标（见 backup.rs 同名函数注释）。
+        // ---- C-01/C-02 符号链接禁闭（与 backup.rs::validate_link_target 同步实施）----
+        // 旧实现按 `Verbatim` 原样放行（绝对路径与 `..` 全部允许），恶意归档可用
+        // `data/etc/x -> /` + `data/etc/x/...` 条目以 root 任意写文件；现改为：
+        // 目标必须词法解析后仍落在 `etc/` 树内，或（绝对目标）位于允许前缀白名单。
         if target.trim().is_empty() {
             return Err(AppError::Format(format!("符号链接目标为空：{}", link_rel)));
         }
+        let resolved = resolve_link_abs(link_rel, target).ok_or_else(|| {
+            AppError::Format(format!(
+                "符号链接目标越出归档根，拒绝还原：{} -> {}",
+                link_rel, target
+            ))
+        })?;
+        let s = resolved.to_string_lossy();
+        // (a) 仍在 `etc/` 树内：etc/modules-load.d/modules.conf -> ../modules → /etc/modules
+        let in_etc_tree = s.as_ref() == "/etc" || s.starts_with("/etc/");
+        // (b) 绝对目标位于允许前缀白名单（含 usr-merge 的 /usr/lib/…）。
+        let in_whitelist = ALLOWED_ETC_LINK_PREFIXES
+            .iter()
+            .any(|p| s.as_ref() == p.trim_end_matches('/') || s.starts_with(p));
+        if !(in_etc_tree || in_whitelist) {
+            return Err(AppError::Format(format!(
+                "符号链接目标越出允许前缀，拒绝还原：{} -> {}（归一化：{}）",
+                link_rel,
+                target,
+                resolved.display()
+            )));
+        }
         return Ok(LinkPlan::Verbatim);
     }
+    // 模块前缀链接：维持 `normalize_join` + `is_managed_rel` 既有逻辑（v0.2.0 行为）。
     if target.starts_with('/') {
         return Err(AppError::Format(format!(
             "模块目录下的符号链接不得使用绝对目标，拒绝还原：{} -> {}",
@@ -532,6 +680,93 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// C-02: validate the parent directory chain of `rel` under `root` before creating
+/// or writing anything, and return the (possibly not yet existing) parent path.
+/// C-02：在创建/写入前逐组件校验 `root` 下 `rel` 的父路径，返回该父路径（绝对路径）。
+///
+/// 规则：
+/// - 逐组件 `symlink_metadata`（不跟随链接）；任何已存在的**符号链接组件** → 拒绝，
+///   唯一例外是直接位于 `root` 顶层的 usr-merge 别名组件（`lib` / `bin` / `sbin` / `lib64`，
+///   见 [`USRMERGE_TOP_ALIASES`]，在 `root=/` 与 `--root <dir>` 下均适用）；
+/// - 某组件不存在 → 其后各组件必然也不存在 → 视为安全，提前结束检查；
+/// - 其它 IO 错误原样上抛。
+///
+/// 这堵死了"归档先把 `<root>/etc` 造成指向外部的链接、再经该链接写入"的禁闭逃逸
+/// （C-02：`<root>/etc -> /tmp/evil` 时写入被拒）。
+fn safe_parent(root: &Path, rel: &Path) -> AppResult<PathBuf> {
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let full = root.join(parent_rel);
+    let mut cur = root.to_path_buf();
+    for (idx, comp) in parent_rel.components().enumerate() {
+        let Component::Normal(name) = comp else {
+            return Err(AppError::Format(format!(
+                "写入路径含非法组件，拒绝写入：/{}",
+                rel.display()
+            )));
+        };
+        cur.push(name);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let name = name.to_string_lossy();
+                if idx == 0 && USRMERGE_TOP_ALIASES.contains(&name.as_ref()) {
+                    // usr-merge 顶层别名（/lib -> usr/lib）：放行并继续逐段检查其下各层。
+                    continue;
+                }
+                return Err(AppError::Format(format!(
+                    "写入路径含符号链接组件，拒绝写入（禁闭检查）：/{}（越界组件：{}）",
+                    rel.display(),
+                    cur.display()
+                )));
+            }
+            Ok(_) => continue,
+            // 组件不存在 → 其后均不存在，视为安全（结束检查）。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(full)
+}
+
+/// C-12: delete stale `.ldb-staging-*` leftovers of *this process prefix* inside
+/// `dir` only (no full-tree scan); returns how many files were removed.
+/// C-12：只清扫 `dir` 本目录下匹配本进程暂存前缀 `.ldb-staging-` 的陈旧文件
+/// （不扫全盘），返回删除数量。
+fn sweep_staging(dir: &Path) -> usize {
+    let Ok(iter) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in iter.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(STAGE_PREFIX) && remove_any(&entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// C-12: guard that removes its staged file when dropped, so **every** exit path
+/// (including `?` early returns and panics) leaves no `.ldb-staging-*` behind.
+/// C-12：暂存文件守卫——`drop` 时删除暂存路径，确保 `?` 提前返回等任何退出路径
+/// 都不残留 `.ldb-staging-*`（成功 `rename` 后该路径已不存在，删除是幂等空操作）。
+struct StagingGuard {
+    path: PathBuf,
+}
+
+impl StagingGuard {
+    /// Arm the guard for `path`.
+    /// 为 `path` 布防。
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = remove_any(&self.path);
+    }
+}
+
 /// Copy `src` → `dst` in chunks, honouring the cancel flag; returns bytes copied.
 /// 分块拷贝并逐块检查取消标志，任一块之间取消都会立即返回 `AppError::Cancelled`。
 fn copy_with_cancel<R: Read, W: Write>(src: &mut R, dst: &mut W, cancel: &AtomicBool) -> AppResult<u64> {
@@ -566,6 +801,30 @@ fn run_id() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         .to_string()
+}
+
+/// C-39: format Unix epoch seconds as an RFC3339 UTC timestamp
+/// (`YYYY-MM-DDTHH:MM:SSZ`) **without** pulling in a date-time dependency.
+/// C-39：把 Unix 秒数格式化为 RFC3339 UTC 字符串（手写 civil-from-days，
+/// 不新增 chrono/time 依赖）。日期换算基于 Howard Hinnant 的 `civil_from_days` 算法。
+fn secs_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (hour, min, sec) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // 把 1970-01-01 之后的日数换算为 (年, 月, 日)。
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, min, sec
+    )
 }
 
 /// Directory holding journals and rollback payloads under a given root.
@@ -682,40 +941,80 @@ struct ExtractOutcome {
 ///
 /// 安全与正确性策略（DESIGN.md §4.5 + ROADMAP §3 P0-1/P0-4/P0-5/P0-6）：
 /// - 每条路径先经 [`data_payload`]（逐层 normalize，拒绝 `..` / 绝对路径）；
+/// - **C-10**：manifest 是唯一权威——manifest 路径非法即硬错误，tar 中 manifest
+///   未登记的普通文件/符号链接条目一律拒绝写入（目录条目放行，见循环内注释）；
 /// - 符号链接经 [`validate_link_target`] 校验后按链接语义创建（weak-updates 可还原）；
-/// - 普通文件先写入同目录的 `.ldb-staging-<id>-<name>` 再 `rename` 覆盖（原子替换）；
-/// - 覆盖前把原文件移入回滚区，并逐条写入事务日志（供 `--rollback`）；
+/// - **C-02**：任何写入前用 [`safe_parent`] 逐组件校验父路径（拒绝符号链接组件，
+///   usr-merge 顶层别名除外）；
+/// - 普通文件先写入同目录的 `.ldb-staging-<id>-<name>` 再 `rename` 覆盖（原子替换），
+///   暂存文件由 [`StagingGuard`] 兜底清理（**C-12**，含 `?` 提前返回路径）；
+/// - **C-11（写前日志）**：每条目先 append+`fsync` 到 `restore-<id>.jsonl.tmp`，
+///   **然后**才 move_aside/rename；全部成功后原子写正式 `restore-<id>.json` 并删除 WAL，
+///   失败/崩溃则保留 `.jsonl.tmp` 供 `--rollback` 回退解析；
 /// - 任一环节失败 → 立即按日志逆序回滚已提交的变更，再返回原错误；
 /// - 策略为"重建/重装"的模块不拷贝二进制，改为登记到 [`ExtractOutcome`]，
 ///   在后续步骤由 DKMS/包管理器处理（失败则自动降级为拷贝）。
-fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcome> {
+fn extract(
+    req: &RestoreRequest,
+    manifest: &Manifest,
+    target_kver: &str,
+) -> AppResult<ExtractOutcome> {
     let root = target_root(req);
     let id = run_id();
     let journal_dir = state_dir(&root);
     let rollback_dir = journal_dir.join(format!("rollback-{}", id));
     let journal_path = journal_dir.join(format!("restore-{}.json", id));
+    // C-11：写前日志与正式日志同名不同后缀，成功收尾时删除。
+    let wal_path = journal_wal_path(&journal_path);
     let family = distro::DistroInfo::detect().family;
 
-    // manifest 条目 → 类型/策略查询表（用 `data/` 之后的相对路径作 key）。
-    let by_path: HashMap<String, &crate::model::ManifestEntry> = manifest
-        .entries
-        .iter()
-        .filter_map(|e| {
-            safe_rel_path(&e.path).map(|p| (p.to_string_lossy().into_owned(), e))
-        })
-        .collect();
+    // C-10：manifest 条目 → 类型/策略查询表（用 `data/` 之后的相对路径作 key）。
+    // 路径非法不再静默丢弃（旧实现 `filter_map` 会吞掉非法条目），直接硬错误。
+    let mut by_path: HashMap<String, &crate::model::ManifestEntry> = HashMap::new();
+    for e in &manifest.entries {
+        let p = safe_rel_path(&e.path).ok_or_else(|| {
+            AppError::Format(format!(
+                "manifest 含非法路径条目（绝对路径或越界 ..），拒绝还原：{}",
+                e.path
+            ))
+        })?;
+        by_path.insert(p.to_string_lossy().into_owned(), e);
+    }
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut outcome = ExtractOutcome {
         journal_path: journal_path.clone(),
         journal: RestoreJournal {
-            created_at: format!("epoch:{}", id),
-            target_kver: String::new(),
+            // C-39：写真实的 RFC3339 UTC 时间与真实的目标内核（不再占位）。
+            created_at: secs_to_rfc3339(now_secs),
+            target_kver: target_kver.to_string(),
             root: root.to_string_lossy().into_owned(),
             entries: Vec::new(),
         },
         ..Default::default()
     };
     let mut strategy_counts: HashMap<String, usize> = HashMap::new();
+
+    // C-12：开跑前对本次将写入的父目录各做一次陈旧暂存清扫。
+    // 只扫这些目录（`manifest` 登记路径的父目录）且只删 `.ldb-staging-*`，不扫全盘。
+    let mut swept: HashSet<PathBuf> = HashSet::new();
+    for key in by_path.keys() {
+        let parent = Path::new(key.as_str()).parent().unwrap_or_else(|| Path::new(""));
+        let dir = root.join(parent);
+        if !swept.insert(dir.clone()) || !dir.is_dir() {
+            continue;
+        }
+        let stale = sweep_staging(&dir);
+        if stale > 0 {
+            outcome_push_note(
+                &mut outcome,
+                format!("已清理 {} 个陈旧暂存文件：{}", stale, dir.display()),
+            );
+        }
+    }
 
     let mut arch = open_archive(&req.archive)?;
     let entries = arch.entries()?;
@@ -752,6 +1051,17 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
                 meta.is_some_and(|m| m.kind == EntryKind::Firmware) || looks_like_firmware(&rel),
                 req.with_firmware,
             );
+
+            // C-10：manifest 权威化——tar 中 manifest 没有的**普通文件/符号链接**条目
+            // 一律硬错误拒绝写入（旧实现会照单写盘）。
+            // 目录条目（MakeDir）放行：备份侧从不把目录写进 manifest（backup.rs 只追加
+            // Regular/Symlink 条目），目录本身由写入路径的 [`safe_parent`] 逐段校验兜底。
+            if meta.is_none() && matches!(action, EntryAction::Write | EntryAction::WriteSymlink) {
+                return Err(AppError::Format(format!(
+                    "归档含 manifest 未登记的写入条目，拒绝写入：/{}",
+                    rel
+                )));
+            }
 
             // 由系统包提供的文件（content_stored=false）：只校验存在性。
             if let Some(m) = meta {
@@ -802,20 +1112,34 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
                         }
                     }
 
-                    if let Some(parent) = link_dest.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
+                    // C-02：逐组件校验父路径（拒绝符号链接组件，usr-merge 顶层别名除外）。
+                    let parent = safe_parent(&root, &inner)?;
+                    fs::create_dir_all(&parent)?;
                     let staged = staged_path(&link_dest, &id);
                     remove_any(&staged)?;
+                    // C-12：暂存的符号链接由守卫兜底清理（`?` 提前返回也不残留）。
+                    let _staging = StagingGuard::new(staged.clone());
                     std::os::unix::fs::symlink(&target, &staged)?;
-                    let rollback = move_aside(&link_dest, &rollback_dir, &rel)?;
-                    fs::rename(&staged, &link_dest)?;
-                    outcome.journal.entries.push(JournalEntry {
+
+                    // C-11（写前日志）：先 append + fsync，再 move_aside / rename。
+                    // `rollback_path` 按与 `move_aside` 相同的公式词法预计算，
+                    // `prior_existed` 与其判据同源（`symlink_metadata`），故日志可先行。
+                    let prior_existed = fs::symlink_metadata(&link_dest).is_ok();
+                    let entry = JournalEntry {
                         path: rel.clone(),
-                        prior_existed: rollback.is_some(),
-                        rollback_path: rollback,
+                        prior_existed,
+                        rollback_path: prior_existed.then(|| {
+                            rollback_dir
+                                .join(rollback_file_name(&rel))
+                                .to_string_lossy()
+                                .into_owned()
+                        }),
                         kind: "symlink".to_string(),
-                    });
+                    };
+                    append_journal_wal(&wal_path, &entry)?;
+                    let _rollback = move_aside(&link_dest, &rollback_dir, &rel)?;
+                    fs::rename(&staged, &link_dest)?;
+                    outcome.journal.entries.push(entry);
                     outcome.links_written += 1;
                     processed += 1;
                 }
@@ -843,6 +1167,9 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
                     outcome.skipped += 1;
                 }
                 EntryAction::MakeDir => {
+                    // C-02：目录条目本身不入事务日志，但其父路径必须先过逐段禁闭检查
+                    // （否则 `data/a/b` 在 `root/a` 是外部链接时会被 `create_dir_all` 跟随）。
+                    safe_parent(&root, &inner)?;
                     fs::create_dir_all(root.join(&inner))?;
                 }
                 EntryAction::Write => {
@@ -915,11 +1242,14 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
 
                     if !handled {
                         let dest = root.join(&inner);
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
+                        // C-02：先逐组件校验父路径（符号链接组件一律拒绝，usr-merge
+                        // 顶层别名除外），确认安全后才 `create_dir_all`。
+                        let parent = safe_parent(&root, &inner)?;
+                        fs::create_dir_all(&parent)?;
                         let staged = staged_path(&dest, &id);
                         remove_any(&staged)?;
+                        // C-12：暂存文件由守卫兜底清理（含 `?` 提前返回与取消路径）。
+                        let _staging = StagingGuard::new(staged.clone());
                         let mut out = fs::OpenOptions::new()
                             .write(true)
                             .create(true)
@@ -930,14 +1260,28 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
                         out.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
                         drop(out);
 
-                        let rollback = move_aside(&dest, &rollback_dir, &rel)?;
-                        fs::rename(&staged, &dest)?;
-                        outcome.journal.entries.push(JournalEntry {
+                        // C-11（写前日志）：先 append + fsync，再 move_aside / rename；
+                        // `rollback_path` 与 `move_aside` 的落点公式一致，可词法预计算。
+                        let prior_existed = fs::symlink_metadata(&dest).is_ok();
+                        let journal_entry = JournalEntry {
                             path: rel.clone(),
-                            prior_existed: rollback.is_some(),
-                            rollback_path: rollback,
-                            kind: format!("{:?}", meta.map(|m| m.kind).unwrap_or(EntryKind::Config)).to_lowercase(),
-                        });
+                            prior_existed,
+                            rollback_path: prior_existed.then(|| {
+                                rollback_dir
+                                    .join(rollback_file_name(&rel))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }),
+                            kind: format!(
+                                "{:?}",
+                                meta.map(|m| m.kind).unwrap_or(EntryKind::Config)
+                            )
+                            .to_lowercase(),
+                        };
+                        append_journal_wal(&wal_path, &journal_entry)?;
+                        let _rollback = move_aside(&dest, &rollback_dir, &rel)?;
+                        fs::rename(&staged, &dest)?;
+                        outcome.journal.entries.push(journal_entry);
                         outcome.written += 1;
 
                         if meta.is_some_and(|m| m.kind == EntryKind::Module) {
@@ -969,13 +1313,19 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
     })();
 
     if let Err(err) = result {
+        // C-11：失败路径**不删**写前日志——正式 JSON 尚未写出，`.jsonl.tmp`
+        // 是 `--rollback last` 唯一可据以回滚的凭据（`latest_journal` 会回退到它）。
         let rolled_back = rollback_entries(&root, &outcome.journal, &mut Vec::new());
         let mut message = err.to_string();
+        let journal_hint = if wal_path.exists() {
+            wal_path.display().to_string()
+        } else {
+            journal_path.display().to_string()
+        };
         if let Ok(lines) = rolled_back {
             message.push_str(&format!(
                 "\n已自动回滚 {} 条已提交变更（事务日志：{}）",
-                lines,
-                journal_path.display()
+                lines, journal_hint
             ));
         }
         return Err(match err {
@@ -992,8 +1342,12 @@ fn extract(req: &RestoreRequest, manifest: &Manifest) -> AppResult<ExtractOutcom
         });
     }
 
-    // 提交日志（放在解压成功之后，避免留下无用的空日志），并按代数裁剪旧回滚数据。
-    outcome.journal.save(&journal_path)?;
+    // C-11：全部成功 → 原子写正式日志（写临时文件 + rename），随后删除写前日志；
+    // 任何时刻只存在其中一份，`--rollback` 的"优先 JSON、回退 JSONL"据此成立。
+    // C-39：`created_at`（RFC3339 UTC）与 `target_kver` 在日志构造时已填真实值。
+    outcome.journal.save_atomic(&journal_path)?;
+    let _ = fs::remove_file(&wal_path);
+    // 按代数裁剪旧回滚数据（含残留的写前日志）。
     for note in prune_state(&journal_dir, req.keep_rollback) {
         outcome_push_note(&mut outcome, note);
     }
@@ -1020,6 +1374,8 @@ fn copy_entries(
     let root = target_root(req);
     let id = run_id();
     let rollback_dir = state_dir(&root).join(format!("rollback-{}", id));
+    // C-11：与 `extract` 同名的写前日志（同一 run id）。
+    let wal_path = journal_wal_path(journal_path);
     let mut copied = 0usize;
 
     let mut arch = open_archive(&req.archive)?;
@@ -1041,11 +1397,12 @@ fn copy_entries(
             continue;
         }
         let dest = root.join(&inner);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // C-02/C-12：回退拷贝与主提取路径共用同一套禁闭校验与暂存清理。
+        let parent = safe_parent(&root, &inner)?;
+        fs::create_dir_all(&parent)?;
         let staged = staged_path(&dest, &id);
         remove_any(&staged)?;
+        let _staging = StagingGuard::new(staged.clone());
         let mut out = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1056,18 +1413,29 @@ fn copy_entries(
         out.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
         drop(out);
 
-        let rollback = move_aside(&dest, &rollback_dir, &rel)?;
-        fs::rename(&staged, &dest)?;
-        journal.entries.push(JournalEntry {
-            path: rel,
-            prior_existed: rollback.is_some(),
-            rollback_path: rollback,
+        // C-11：回退拷贝同样写前日志（追加到本 run 的 `.jsonl.tmp`）。
+        let prior_existed = fs::symlink_metadata(&dest).is_ok();
+        let journal_entry = JournalEntry {
+            path: rel.clone(),
+            prior_existed,
+            rollback_path: prior_existed.then(|| {
+                rollback_dir
+                    .join(rollback_file_name(&rel))
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             kind: "module-fallback".to_string(),
-        });
+        };
+        append_journal_wal(&wal_path, &journal_entry)?;
+        let _rollback = move_aside(&dest, &rollback_dir, &rel)?;
+        fs::rename(&staged, &dest)?;
+        journal.entries.push(journal_entry);
         copied += 1;
     }
     if copied > 0 {
-        journal.save(journal_path)?;
+        // C-11：正式日志原子重写，随后清掉写前日志（两份并存时 `--rollback` 优先 JSON）。
+        journal.save_atomic(journal_path)?;
+        let _ = fs::remove_file(&wal_path);
     }
     Ok(copied)
 }
@@ -1125,6 +1493,10 @@ fn rollback_entries(root: &Path, journal: &RestoreJournal, notes: &mut Vec<Strin
 
 /// Run a rollback for the given journal (or the newest one when `journal` is `None`).
 /// 按指定事务日志回滚；`journal` 为 `None` 时使用最新的日志（`--rollback last`）。
+///
+/// C-11：日志文件可以是正式 `restore-<id>.json`，也可以是崩溃/失败后残留的
+/// `restore-<id>.jsonl.tmp`（逐行 JSON，行序即条目序；回滚按逆序执行，
+/// 即**最后写入的条目最先撤销**）。见 [`RestoreJournal::load`]。
 pub fn run_rollback(
     root: &Path,
     journal: Option<&Path>,
@@ -1178,7 +1550,7 @@ pub fn run_rollback(
 }
 
 /// Keep only the newest `keep` restore journals (and their rollback payloads).
-/// 只保留最新的 `keep` 份事务日志与其回滚区，超出部分按时间清理。
+/// 只保留最新的 `keep` 份事务日志与其回滚区，超出部分按时间清理（含残留的写前日志）。
 fn prune_state(dir: &Path, keep: usize) -> Vec<String> {
     let mut notes = Vec::new();
     let mut ids: Vec<u64> = Vec::new();
@@ -1187,18 +1559,17 @@ fn prune_state(dir: &Path, keep: usize) -> Vec<String> {
     };
     for entry in iter.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(id) = name
-            .strip_prefix("restore-")
-            .and_then(|n| n.strip_suffix(".json"))
-            .and_then(|n| n.parse::<u64>().ok())
-        {
+        if let Some((id, _)) = journal_file_id(&name) {
             ids.push(id);
         }
     }
     ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.dedup();
     for id in ids.into_iter().skip(keep.max(1)) {
         let journal = dir.join(format!("restore-{}.json", id));
+        let wal = dir.join(format!("restore-{}{}", id, WAL_SUFFIX));
         let rollback = dir.join(format!("rollback-{}", id));
+        let _ = fs::remove_file(&wal);
         if remove_any(&journal).is_ok() && remove_any(&rollback).is_ok() {
             notes.push(format!("已清理过期回滚数据：{id}"));
         }
@@ -1206,30 +1577,55 @@ fn prune_state(dir: &Path, keep: usize) -> Vec<String> {
     notes
 }
 
+/// C-11: classify a state-directory file name as a journal, returning
+/// `(run id, is_committed_json)`. `rollback-*` dirs and unrelated files yield `None`.
+/// C-11：识别状态目录里的日志文件名，返回 `(run id, 是否正式 JSON)`；
+/// `rollback-*` 目录与其它杂项返回 `None`（历史上曾因对它们 `?` 提前返回而漏判）。
+fn journal_file_id(name: &str) -> Option<(u64, bool)> {
+    let stem = name.strip_prefix("restore-")?;
+    if let Some(id) = stem
+        .strip_suffix(".json")
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        return Some((id, true));
+    }
+    if let Some(id) = stem
+        .strip_suffix(WAL_SUFFIX)
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        return Some((id, false));
+    }
+    None
+}
+
 /// Locate the newest restore journal under a root.
 /// 找到目标根下最新的还原日志。
+///
+/// C-11：同时识别正式 `restore-<id>.json` 与崩溃残留的 `restore-<id>.jsonl.tmp`；
+/// 同一 id 下**优先正式 JSON**，只有写前日志时回退返回它（供 `--rollback` 解析）。
 pub fn latest_journal(root: &Path) -> Option<PathBuf> {
     let dir = state_dir(root);
-    let mut best: Option<(u64, PathBuf)> = None;
+    // (run id, 是否正式 JSON, 路径)：正式 JSON 在同 id 下优先于写前日志。
+    let mut best: Option<(u64, bool, PathBuf)> = None;
     for entry in fs::read_dir(&dir).ok()?.flatten() {
         let path = entry.path();
-        // 注意：状态目录里同时存在 `rollback-*`（目录）与 `restore-*.json`（文件），
+        // 注意：状态目录里同时存在 `rollback-*`（目录）与两类日志文件，
         // 必须**跳过**不匹配的条目，不能对它们使用 `?` 提前返回。
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        let Some(id) = name
-            .strip_prefix("restore-")
-            .and_then(|n| n.strip_suffix(".json"))
-            .and_then(|n| n.parse::<u64>().ok())
-        else {
+        let Some((id, is_json)) = journal_file_id(&name) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(b, _)| id > *b) {
-            best = Some((id, path));
+        let better = match &best {
+            None => true,
+            Some((best_id, best_json, _)) => id > *best_id || (id == *best_id && is_json && !*best_json),
+        };
+        if better {
+            best = Some((id, is_json, path));
         }
     }
-    best.map(|(_, p)| p)
+    best.map(|(_, _, p)| p)
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,17 +1699,111 @@ fn run_command_with_input(cmd: &SystemCmd, input: Option<&str>) -> AppResult<Str
 // 还原主流程 / Restore entry point
 // ---------------------------------------------------------------------------
 
-/// Run a full restore.
-/// 执行还原（v0.2.0 顺序，DESIGN.md §5.5 + ROADMAP §3 P0）：
+/// C-31: decide the target kernel and whether the user asked for it explicitly.
+/// C-31：决定目标内核及其"是否显式指定"（纯函数，便于单测）：
+/// - `req_kver` 显式指定 → 用它，`kver_explicit = true`；
+/// - 否则 `root == None`（联网/本机还原）→ `host_kver`（`distro::kernel_release()`，当前内核）；
+/// - 否则 `root == Some`（`--root` 离线还原）→ `manifest_kver`。
 ///
-/// 1. `inspect` 取 manifest；目标 kver = `req.kver` 或 `manifest.kernel_release`，
+/// `kver_explicit == false` 时的内核不一致只降级为 `report.notes`，
+/// 不再要求 `allow_kernel_mismatch`（见 [`run_restore`] 步骤 2）。
+fn resolve_target_kver(
+    req_kver: Option<&str>,
+    root: Option<&Path>,
+    manifest_kver: &str,
+    host_kver: &str,
+) -> (String, bool) {
+    if let Some(kver) = req_kver {
+        return (kver.to_string(), true);
+    }
+    match root {
+        None => (host_kver.to_string(), false),
+        Some(_) => (manifest_kver.to_string(), false),
+    }
+}
+
+/// C-18/C-31: pure decision of the immutability gate (no command execution,
+/// unit-testable); the caller performs any command only in the real-run path.
+/// C-18/C-31：不可变系统闸门的**纯决策**——不执行任何命令，便于单测；
+/// 调用方只在实盘路径上按此决策执行（dry-run 永远到不了闸门，见 `run_restore` 步骤 4/5）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImmutableGate {
+    /// 可放行（可变系统）。
+    Pass,
+    /// 拒绝直写并给出替代路径（消息可直接作为 `AppError::Validation` 的内容）。
+    Refuse(String),
+    /// 需要先执行 `rpm-ostree usroverlay`（仅在实盘路径中执行）。
+    Usroverlay,
+}
+
+fn plan_immutable_gate(imm: distro::Immutability, policy: ImmutablePolicy) -> ImmutableGate {
+    match imm {
+        distro::Immutability::Mutable => ImmutableGate::Pass,
+        distro::Immutability::Ostree => match policy {
+            ImmutablePolicy::Refuse => ImmutableGate::Refuse(
+                "目标为 OSTree 不可变系统（/usr 只读），拒绝直接写入 /usr/lib/modules。\
+                 受支持的做法：① `rpm-ostree install <对应 kmod 包>`；\
+                 ② `rpm-ostree override replace <本地 rpm>`；\
+                 ③ 临时排障可加 --on-immutable usroverlay（重启即失效）。"
+                    .to_string(),
+            ),
+            ImmutablePolicy::Usroverlay => ImmutableGate::Usroverlay,
+        },
+        distro::Immutability::Nix => ImmutableGate::Refuse(
+            "目标为 NixOS：模块由声明式配置（nixos-rebuild）管理，本工具不支持直接还原。\
+             请把驱动加入 configuration.nix 后重建系统。"
+                .to_string(),
+        ),
+        distro::Immutability::ReadOnlyUsr => ImmutableGate::Refuse(
+            "目标系统的 /usr 以只读方式挂载，无法写入模块目录。\
+             请先解除只读（或使用 --root 做离线还原）。"
+                .to_string(),
+        ),
+    }
+}
+
+/// C-18: read-only hint shown by **dry-run** instead of running the gate.
+/// C-18：dry-run 用的**只读提示**——说明实盘还原将需要什么，但不执行任何命令
+/// （`rpm-ostree usroverlay` 之类只在 `run_restore` 步骤 5 的实盘路径里运行）。
+fn immutable_dry_run_hint(imm: distro::Immutability) -> String {
+    match imm {
+        distro::Immutability::Mutable => {
+            format!("目标系统可变性：{}——实盘还原可直接写入", imm.label_zh())
+        }
+        distro::Immutability::Ostree => {
+            "实盘还原将需要 --on-immutable usroverlay（或改用 rpm-ostree 安装 kmod 包）；\
+             本 dry-run 只读不执行任何命令"
+                .to_string()
+        }
+        distro::Immutability::Nix => {
+            "实盘还原将被拒绝：NixOS 需通过 configuration.nix 声明驱动；\
+             本 dry-run 只读不执行任何命令"
+                .to_string()
+        }
+        distro::Immutability::ReadOnlyUsr => {
+            "实盘还原将被拒绝：/usr 只读挂载，需先解除只读或改用 --root；\
+             本 dry-run 只读不执行任何命令"
+                .to_string()
+        }
+    }
+}
+
+/// Run a full restore.
+/// 执行还原（v0.2.1 顺序，DESIGN.md §5.5 + ROADMAP §3 P0 + ITERATION §2.1 C-18/C-31/C-32）：
+///
+/// 1. `inspect` 取 manifest；目标 kver 由 [`resolve_target_kver`] 决定（显式 `--kver` → 用它；
+///    否则联网/本机默认**当前内核**、`--root` 离线默认 `manifest.kernel_release`），
 ///    必须通过 `model::is_safe_kernel_version`。
-/// 2. 校验架构、内核版本与 **vermagic（模块 ABI 指纹）**；不一致且未确认 → `Validation`。
+/// 2. 一致性校验（C-31/C-32 已拆分）：架构不符仅 `allow_arch_mismatch` 可放行；
+///    内核/vermagic 不符在**显式**指定 kver 时才要求 `allow_kernel_mismatch`，
+///    auto 目标降级为 `report.notes` 提示。
 /// 3. 权限：写 `/`（非 dry_run）且非 root → `AppError::Privilege`（由 `main` 决定 pkexec 重入）；
 ///    指定 `--root <dir>` 的离线还原按目标目录自身权限判定（救援场景常以普通用户预演）。
-/// 4. **不可变系统闸门（P0-3）**：OSTree/Nix/只读 `/usr` 默认拒绝直写，给出替代路径。
-/// 5. dry-run：统计文件/链接/字节 + **策略预览**（重建/重装/弱更新/拷贝），不落盘。
-/// 6. 事务化解压（P0-1 符号链接、P0-5 来源包、P0-6 回滚日志）。
+/// 4. dry-run：统计文件/链接/字节 + **策略预览**（重建/重装/弱更新/拷贝），不落盘；
+///    仅**只读**探测 [`distro::immutability`] 并提示实盘将需要什么——不执行任何命令（C-18）。
+/// 5. **不可变系统闸门（P0-3）**：C-18 后移到 dry-run 分支**之后**，只有实盘还原才可能
+///    执行 `rpm-ostree usroverlay`；OSTree/Nix/只读 `/usr` 默认拒绝直写，给出替代路径。
+/// 6. 事务化解压（P0-1 符号链接、P0-5 来源包、P0-6 回滚日志 + C-11 写前日志）。
 /// 7. 策略执行（P0-4）：DKMS/akmods 重建 → 包管理器重装 → `weak-modules --add-modules`。
 /// 8. `depmod` → `restorecon`（RHEL）→ **Secure Boot 签名（P0-2）** → initramfs 更新。
 /// 9. 汇总报告，并给出事务日志路径（供 `--rollback`）。
@@ -1326,10 +1816,14 @@ pub fn run_restore(req: RestoreRequest) -> AppResult<RestoreReport> {
     // ---- 步骤 1：解析 manifest、确定目标内核并做安全校验 ----
     let info = inspect(&req.archive)?;
     let manifest = info.manifest;
-    let target_kver = req
-        .kver
-        .clone()
-        .unwrap_or_else(|| manifest.kernel_release.clone());
+    // C-31：目标内核语义——显式 `--kver` 优先；否则联网/本机默认当前内核，
+    // `--root` 离线默认 manifest 记录的内核。
+    let (target_kver, kver_explicit) = resolve_target_kver(
+        req.kver.as_deref(),
+        req.root.as_deref(),
+        &manifest.kernel_release,
+        &distro::kernel_release(),
+    );
 
     if !manifest.format_supported() {
         return Err(AppError::Format(format!(
@@ -1356,31 +1850,42 @@ pub fn run_restore(req: RestoreRequest) -> AppResult<RestoreReport> {
     let root = target_root(&req);
     let offline = root != Path::new(TARGET_ROOT);
 
-    // ---- 步骤 2：架构 / 内核 / vermagic 一致性 ----
+    // ---- 步骤 2：架构（C-32 独立）/ 内核与 vermagic（C-31 分级）一致性 ----
     let cur_arch = distro::arch();
-    let mut mismatches: Vec<String> = Vec::new();
+    // C-32：架构不符**只**看 `allow_arch_mismatch`，与 `allow_kernel_mismatch` 无关。
     if manifest.arch.as_str() != cur_arch {
-        mismatches.push(format!(
-            "架构 备份 {} / 当前 {}",
-            manifest.arch, cur_arch
-        ));
-    }
-    if manifest.kernel_release != target_kver {
-        mismatches.push(format!(
-            "内核 备份 {} / 目标 {}",
-            manifest.kernel_release, target_kver
-        ));
-    }
-    if !mismatches.is_empty() {
-        if req.allow_kernel_mismatch {
+        if req.allow_arch_mismatch {
             report.notes.push(format!(
-                "已由用户确认的不一致：{}；跨内核还原可能导致模块 ABI 不兼容",
-                mismatches.join("；")
+                "已由用户确认的架构不一致：备份 {} / 当前 {}；架构不符的模块无法加载",
+                manifest.arch, cur_arch
             ));
         } else {
             return Err(AppError::Validation(format!(
-                "备份内核/架构与当前不符，需用户确认：{}（确认后重试并设置 allow_kernel_mismatch）",
-                mismatches.join("；")
+                "备份架构与当前不符，需用户确认：备份 {} / 当前 {}\
+                 （确认后重试并设置 --allow-arch-mismatch / allow_arch_mismatch；\
+                 --allow-kernel-mismatch 不覆盖架构检查）",
+                manifest.arch, cur_arch
+            )));
+        }
+    }
+    // C-31：内核不符——auto 目标（未显式指定 --kver）降级为提示；
+    // 显式目标才需要 `--allow-kernel-mismatch` 确认。
+    if manifest.kernel_release != target_kver {
+        if !kver_explicit {
+            report.notes.push(format!(
+                "跨内核还原：将按当前内核重建（DKMS）…（未显式指定 --kver：备份 {} / 目标 {}）",
+                manifest.kernel_release, target_kver
+            ));
+        } else if req.allow_kernel_mismatch {
+            report.notes.push(format!(
+                "已由用户确认的内核不一致：备份 {} / 目标 {}；跨内核还原可能导致模块 ABI 不兼容",
+                manifest.kernel_release, target_kver
+            ));
+        } else {
+            return Err(AppError::Validation(format!(
+                "备份内核与目标不符，需用户确认：备份 {} / 目标 {}\
+                 （确认后重试并设置 --allow-kernel-mismatch；架构不符请改用 --allow-arch-mismatch）",
+                manifest.kernel_release, target_kver
             )));
         }
     }
@@ -1395,7 +1900,13 @@ pub fn run_restore(req: RestoreRequest) -> AppResult<RestoreReport> {
                 "模块 ABI 指纹（vermagic）不一致：备份 [{}] / 目标 [{}]",
                 backup_vm, current_vm
             );
-            if req.allow_kernel_mismatch {
+            if !kver_explicit {
+                // C-31：auto 目标同样降级为提示（用户未点名内核，无需二次确认）。
+                report.notes.push(format!(
+                    "{}；自动目标内核（未显式指定 --kver）：建议 --strategy rebuild（DKMS 重建）",
+                    msg
+                ));
+            } else if req.allow_kernel_mismatch {
                 report
                     .notes
                     .push(format!("{}；直接拷贝的 .ko 可能无法加载，建议使用 --strategy rebuild", msg));
@@ -1415,71 +1926,36 @@ pub fn run_restore(req: RestoreRequest) -> AppResult<RestoreReport> {
         ));
     }
 
-    // ---- 步骤 4：不可变系统闸门（P0-3）----
+    // C-18：此处只做**只读**的可变性探测（读标志文件与 /proc/mounts，不执行任何命令）。
+    // 含命令执行的不可变闸门已后移到 dry-run 分支之后（见"步骤 5"）。
     let immutability = distro::immutability();
-    if !offline {
-        match immutability {
-            distro::Immutability::Mutable => {}
-            distro::Immutability::Ostree => match req.on_immutable {
-                ImmutablePolicy::Refuse => {
-                    return Err(AppError::Validation(
-                        "目标为 OSTree 不可变系统（/usr 只读），拒绝直接写入 /usr/lib/modules。\
-                         受支持的做法：① `rpm-ostree install <对应 kmod 包>`；\
-                         ② `rpm-ostree override replace <本地 rpm>`；\
-                         ③ 临时排障可加 --on-immutable usroverlay（重启即失效）。"
-                            .to_string(),
-                    ));
-                }
-                ImmutablePolicy::Usroverlay => {
-                    let cmd = SystemCmd {
-                        program: "rpm-ostree".to_string(),
-                        args: vec!["usroverlay".to_string()],
-                    };
-                    if !distro::has_cmd("rpm-ostree") {
-                        return Err(AppError::Privilege(
-                            "未找到 rpm-ostree，无法建立临时可写覆盖层".to_string(),
-                        ));
-                    }
-                    run_command(&cmd)?;
-                    report.notes.push(
-                        "已在 OSTree 系统上启用临时可写覆盖层（usroverlay）：**重启后失效**，仅用于排障"
-                            .to_string(),
-                    );
-                }
-            },
-            distro::Immutability::Nix => {
-                return Err(AppError::Validation(
-                    "目标为 NixOS：模块由声明式配置（nixos-rebuild）管理，本工具不支持直接还原。\
-                     请把驱动加入 configuration.nix 后重建系统。"
-                        .to_string(),
-                ));
-            }
-            distro::Immutability::ReadOnlyUsr => {
-                return Err(AppError::Validation(
-                    "目标系统的 /usr 以只读方式挂载，无法写入模块目录。\
-                     请先解除只读（或使用 --root 做离线还原）。"
-                        .to_string(),
-                ));
-            }
-        }
+
+    // manifest 条目 → 类型表（dry-run 的固件判定用）。
+    // C-10：路径非法直接硬错误，不再 `filter_map` 静默丢弃。
+    let mut kinds: HashMap<String, EntryKind> = HashMap::new();
+    for e in &manifest.entries {
+        let p = safe_rel_path(&e.path).ok_or_else(|| {
+            AppError::Format(format!(
+                "manifest 含非法路径条目（绝对路径或越界 ..），拒绝还原：{}",
+                e.path
+            ))
+        })?;
+        kinds.insert(p.to_string_lossy().into_owned(), e.kind);
     }
-    report.notes.push(format!(
-        "目标系统可变性：{}（写入根：{}）",
-        immutability.label_zh(),
-        root.display()
-    ));
 
-    // manifest 条目 → 类型表（dry-run 的固件判定用）
-    let kinds: HashMap<String, EntryKind> = manifest
-        .entries
-        .iter()
-        .filter_map(|e| {
-            safe_rel_path(&e.path).map(|p| (p.to_string_lossy().into_owned(), e.kind))
-        })
-        .collect();
-
-    // ---- 步骤 5：dry-run 只统计与预览 ----
+    // ---- 步骤 4：dry-run 只统计与预览（C-18：本分支内绝不执行任何变更命令）----
     if req.dry_run {
+        report.notes.push(format!(
+            "目标系统可变性：{}（写入根：{}）",
+            immutability.label_zh(),
+            root.display()
+        ));
+        if !offline && immutability != distro::Immutability::Mutable {
+            // 只提示"实盘还原将需要什么"，不执行 `rpm-ostree usroverlay` 等任何命令。
+            report
+                .notes
+                .push(immutable_dry_run_hint(immutability));
+        }
         let mut files = 0usize;
         let mut links = 0usize;
         let mut bytes = 0u64;
@@ -1555,8 +2031,39 @@ pub fn run_restore(req: RestoreRequest) -> AppResult<RestoreReport> {
         return Ok(report);
     }
 
+    // ---- 步骤 5：不可变系统闸门（P0-3；C-18：位于 dry-run 分支**之后**，仅实盘执行）----
+    // 纯决策（`plan_immutable_gate`，可单测）与命令执行分离：只有 `Usroverlay`
+    // 分支会真正运行 `rpm-ostree usroverlay`，而 dry-run 在上一分支已经 return。
+    if !offline {
+        match plan_immutable_gate(immutability, req.on_immutable) {
+            ImmutableGate::Pass => {}
+            ImmutableGate::Refuse(msg) => return Err(AppError::Validation(msg)),
+            ImmutableGate::Usroverlay => {
+                let cmd = SystemCmd {
+                    program: "rpm-ostree".to_string(),
+                    args: vec!["usroverlay".to_string()],
+                };
+                if !distro::has_cmd("rpm-ostree") {
+                    return Err(AppError::Privilege(
+                        "未找到 rpm-ostree，无法建立临时可写覆盖层".to_string(),
+                    ));
+                }
+                run_command(&cmd)?;
+                report.notes.push(
+                    "已在 OSTree 系统上启用临时可写覆盖层（usroverlay）：**重启后失效**，仅用于排障"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    report.notes.push(format!(
+        "目标系统可变性：{}（写入根：{}）",
+        immutability.label_zh(),
+        root.display()
+    ));
+
     // ---- 步骤 6：事务化解压（含符号链接与策略分流）----
-    let outcome = extract(&req, &manifest)?;
+    let outcome = extract(&req, &manifest, &target_kver)?;
     report.written = outcome.written;
     report.links_written = outcome.links_written;
     report.skipped = outcome.skipped;
@@ -2453,5 +2960,805 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =======================================================================
+    // v0.2.1 热修包新增测试：
+    // C-01 etc 链接禁闭 / C-02 写入禁闭 / C-10 manifest 权威 /
+    // C-11 写前日志(WAL) / C-12 暂存清扫 / C-18 不可变闸门顺序 /
+    // C-31 内核确认分级 / C-32 架构确认独立 / C-39 RFC3339 时间戳
+    // =======================================================================
+
+    /// 生成一份最小可用的 `manifest.json`（arch / kernel_release / 条目均可参数化）。
+    /// Build a minimal `manifest.json` with explicit arch, kernel release and entries.
+    ///
+    /// `entries` 为 `(归档相对路径, EntryKind 小写标签)`；其余 v2 字段取安全默认
+    /// （`content_stored=true`、无 `kernel_vermagic`、无 DKMS/来源包）。
+    /// Entries are `(archive-relative path, lowercase EntryKind tag)`; other v2
+    /// fields take safe defaults (content stored, no vermagic, no DKMS/provenance).
+    fn manifest_json(arch: &str, kver: &str, entries: &[(&str, &str)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(path, kind)| {
+                format!(
+                    r#"{{"path":"{}","size":5,"sha256":"abc","kind":"{}"}}"#,
+                    path, kind
+                )
+            })
+            .collect();
+        let items = items.join(",");
+        format!(
+            r#"{{
+  "format_version": 2,
+  "tool_version": "0.2.1",
+  "created_at": "2026-10-01T00:00:00Z",
+  "kernel_release": "{kver}",
+  "arch": "{arch}",
+  "distro": {{"id":"linuxmint","version_id":"22.3","pretty_name":"Linux Mint 22.3","family":"debian"}},
+  "mode": "standard",
+  "entries": [{items}],
+  "warnings": []
+}}"#
+        )
+    }
+
+    /// 递归断言目标根下没有任何 `.ldb-staging-*` 暂存残留（C-12）。
+    /// Recursively assert that no `.ldb-staging-*` leftovers remain under the root.
+    fn assert_no_staging_leftovers(root: &Path) {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if e.file_name().to_string_lossy().starts_with(STAGE_PREFIX) {
+                    out.push(p.clone());
+                }
+                if p.is_dir() {
+                    walk(&p, out);
+                }
+            }
+        }
+        let mut left = Vec::new();
+        walk(root, &mut left);
+        assert!(left.is_empty(), "残留暂存文件：{left:?}");
+    }
+
+    /// C-01（还原侧）：`etc/` 下符号链接目标词法解析后必须落在 `/etc` 树或白名单前缀内。
+    /// C-01 (restore side): `etc/` link targets must resolve lexically into the
+    /// `/etc` tree or the whitelist prefixes (`/etc/`,`/lib/`,`/usr/lib/`,
+    /// `/usr/share/`,`/run/`); anything else is a Format error whose message
+    /// carries the normalized path. 与 `backup.rs::validate_link_target_etc_containment_c01`
+    /// 互为镜像（v0.3.0 W7/C-47 合并后二选一）。
+    #[test]
+    fn etc_link_target_containment_c01() {
+        // ---- 拒绝：根、越出归档根的相对目标、白名单之外的路径 ----
+        assert!(validate_link_target("etc/x", "/").is_err(), "`/` 必须被拒");
+        assert!(
+            validate_link_target("etc/x", "../../../../..").is_err(),
+            "越出归档根的相对目标必须被拒"
+        );
+        assert!(
+            validate_link_target("etc/x", "/home/user/pwn").is_err(),
+            "白名单之外的绝对目标必须被拒"
+        );
+        assert!(
+            validate_link_target("etc/x", "../../home/user/pwn").is_err(),
+            "解析到 /home 的相对目标必须被拒"
+        );
+        assert!(validate_link_target("etc/x", "../../../root/.bashrc").is_err());
+        assert!(validate_link_target("etc/x", "/librarian").is_err(), "/librarian 不是 /lib/");
+        assert!(validate_link_target("etc/x", "").is_err(), "空目标必须被拒");
+
+        // ---- 放行：etc 树内（Verbatim 重建）----
+        assert!(matches!(
+            validate_link_target("etc/modules-load.d/modules.conf", "../modules"),
+            Ok(LinkPlan::Verbatim)
+        ));
+        assert!(matches!(
+            validate_link_target("etc/x", "modules"),
+            Ok(LinkPlan::Verbatim)
+        ));
+        // ---- 放行：白名单前缀（真实样例 usr-merge / usr-merge 前）----
+        assert!(matches!(
+            validate_link_target(
+                "etc/modprobe.d/blacklist-oss.conf",
+                "/lib/linux-sound-base/noOSS.modprobe.conf"
+            ),
+            Ok(LinkPlan::Verbatim)
+        ));
+        assert!(validate_link_target("etc/x", "/usr/lib/foo").is_ok());
+        assert!(validate_link_target("etc/x", "/usr/share/foo").is_ok());
+        assert!(validate_link_target("etc/x", "/run/foo").is_ok());
+
+        // ---- 错误消息带归一化结果（中文侧）----
+        match validate_link_target("etc/x", "/home/user/pwn") {
+            Err(AppError::Format(m)) => assert!(m.contains("归一化"), "消息={m}"),
+            Err(other) => panic!("expected AppError::Format, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    /// C-02：写入前的父路径禁闭检查——拒绝任何符号链接组件（仅顶层 usr-merge 别名例外）。
+    /// C-02: `safe_parent` rejects every symlinked path component before any
+    /// write (the top-level usr-merge aliases `lib`/`bin`/`sbin`/`lib64` are the
+    /// only exception), rejects `..`/absolute components, and treats missing
+    /// components as safe while returning the full parent path.
+    #[test]
+    fn safe_parent_rejects_symlinks_and_allows_top_level_usrmerge_alias_c02() {
+        let root = temp_case("safe-parent");
+
+        // (a) 顶层非别名符号链接 → 拒绝（`root/opt -> root/var`）
+        fs::create_dir_all(root.join("var")).unwrap();
+        std::os::unix::fs::symlink(root.join("var"), root.join("opt")).unwrap();
+        let err = safe_parent(&root, Path::new("opt/evil.conf")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("符号链接组件"), "顶层链接组件必须被拒：{msg}");
+        assert!(matches!(err, AppError::Format(_)), "应为 Format 错误");
+
+        // (b) 顶层 usr-merge 别名（`root/lib -> usr/lib`）放行；其下缺失组件视为安全
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        assert_eq!(
+            safe_parent(&root, Path::new("lib/modules/6.8/x.ko")).unwrap(),
+            root.join("lib/modules/6.8"),
+            "别名之下的缺失组件应返回完整父路径"
+        );
+
+        // (c) 别名之下的更深层符号链接仍然拒绝（例外只限第 0 层）
+        fs::create_dir_all(root.join("usr/lib/modules")).unwrap();
+        std::os::unix::fs::symlink(root.join("var"), root.join("usr/lib/modules/evil")).unwrap();
+        let err = safe_parent(&root, Path::new("lib/modules/evil/x.ko")).unwrap_err();
+        assert!(
+            err.to_string().contains("符号链接组件"),
+            "更深层链接组件必须被拒：{err}"
+        );
+
+        // (d) 组件不存在 → 其后必然不存在，视为安全并返回完整父路径
+        assert_eq!(
+            safe_parent(&root, Path::new("a/b/c.ko")).unwrap(),
+            root.join("a/b")
+        );
+
+        // (e) `..` 与绝对路径组件（RootDir / ParentDir）一律拒绝
+        fs::create_dir_all(root.join("a")).unwrap();
+        let err = safe_parent(&root, Path::new("a/../../x.ko")).unwrap_err();
+        assert!(err.to_string().contains("非法组件"), "`..` 组件必须被拒：{err}");
+        let err = safe_parent(&root, Path::new("/etc/x")).unwrap_err();
+        assert!(err.to_string().contains("非法组件"), "绝对路径必须被拒：{err}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// C-10：tar 中 manifest 未登记的普通文件是硬错误，且已写入条目自动回滚。
+    /// C-10: a regular-file entry missing from the manifest is a hard Format
+    /// error; entries written before the failure are rolled back automatically
+    /// and no unregistered file ever lands on disk.
+    #[test]
+    fn manifest_extra_write_entry_is_hard_error_c10() {
+        let dir = temp_case("c10-extra");
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let manifest = manifest_json(
+            distro::arch(),
+            "6.8.0-45-generic",
+            &[("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko", "module")],
+        );
+        let archive = build_archive(
+            &dir,
+            "c10-extra.tar.gz",
+            &[
+                (
+                    "data/lib/modules/6.8.0-45-generic/updates/dkms/foo.ko",
+                    b"hello".as_slice(),
+                ),
+                // manifest 未登记 → 必须被硬错误拒绝
+                ("data/etc/pwn.conf", b"evil".as_slice()),
+            ],
+            Some(&manifest),
+        );
+        let info = inspect(&archive).unwrap();
+        let req = RestoreRequest {
+            archive,
+            root: Some(root.clone()),
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+        let err = extract(&req, &info.manifest, &info.manifest.kernel_release).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest") && msg.contains("pwn.conf"),
+            "消息应指明未登记条目：{msg}"
+        );
+        assert!(msg.contains("已自动回滚 1 条"), "应报告自动回滚：{msg}");
+
+        // 未登记文件绝不落盘；先前写入的条目也被回滚；无暂存残留
+        assert!(!root.join("etc/pwn.conf").exists(), "未登记文件不得写入");
+        assert!(
+            !root.join("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko").exists(),
+            "先行写入的条目必须被回滚"
+        );
+        assert_no_staging_leftovers(&root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-10：manifest 登记了非法路径（`..`）→ 解析类型表时直接硬错误，不静默过滤。
+    /// C-10: a manifest entry whose path escapes the archive root is a hard
+    /// error while building the lookup table — never silently dropped.
+    #[test]
+    fn manifest_illegal_path_is_hard_error_c10() {
+        let dir = temp_case("c10-illegal");
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let manifest = manifest_json(
+            distro::arch(),
+            "6.8.0-45-generic",
+            &[("../evil.ko", "module")],
+        );
+        let archive = build_archive(&dir, "c10-illegal.tar.gz", &[], Some(&manifest));
+        let info = inspect(&archive).unwrap();
+        let req = RestoreRequest {
+            archive,
+            root: Some(root.clone()),
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+        let err = extract(&req, &info.manifest, &info.manifest.kernel_release).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("非法路径") && msg.contains("../evil.ko"),
+            "消息应指明非法条目：{msg}"
+        );
+        assert!(!root.join("evil.ko").exists(), "非法路径不得落盘");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-11/C-12：解压中途失败 → 写前日志保留（唯一回滚凭据）、暂存零残留、
+    /// 凭 `.jsonl.tmp` 即可完成回滚。
+    /// C-11/C-12: when extraction fails midway, the write-ahead log is kept as
+    /// the only rollback credential, no `.ldb-staging-*` files remain, and
+    /// `run_rollback` can consume the WAL to undo the partial run.
+    #[test]
+    fn failed_extract_keeps_write_ahead_log_and_no_staging_c11_c12() {
+        let dir = temp_case("c11-wal-fail");
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        // 故障注入：`root/etc` 是普通文件 → 第 1 个条目（lib/…）写入成功，
+        // 第 2 个条目（etc/…）在逐段禁闭检查时撞上 ENOTDIR 而失败。
+        fs::write(root.join("etc"), b"not-a-directory").unwrap();
+        let manifest = manifest_json(
+            distro::arch(),
+            "6.8.0-45-generic",
+            &[
+                ("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko", "module"),
+                ("etc/modprobe.d/nvidia.conf", "config"),
+            ],
+        );
+        let archive = build_archive(
+            &dir,
+            "c11-wal-fail.tar.gz",
+            &[
+                (
+                    "data/lib/modules/6.8.0-45-generic/updates/dkms/foo.ko",
+                    b"hello".as_slice(),
+                ),
+                ("data/etc/modprobe.d/nvidia.conf", b"1234567".as_slice()),
+            ],
+            Some(&manifest),
+        );
+        let info = inspect(&archive).unwrap();
+        let req = RestoreRequest {
+            archive,
+            root: Some(root.clone()),
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+        let err = extract(&req, &info.manifest, &info.manifest.kernel_release).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("已自动回滚 1 条"), "应自动回滚首个条目：{msg}");
+
+        // 失败后：正式 JSON 不存在，但写前日志存在、有内容且逐行可解析
+        let wal = latest_journal(&root).expect("失败后应能从写前日志回退定位");
+        assert!(
+            wal.to_string_lossy().ends_with(WAL_SUFFIX),
+            "定位到的是 {wal:?}"
+        );
+        let text = fs::read_to_string(&wal).unwrap();
+        let records: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(records.len(), 1, "WAL 应记录唯一已提交条目：{text}");
+        assert!(
+            serde_json::from_str::<JournalEntry>(records[0]).is_ok(),
+            "WAL 每行必须是合法的 JournalEntry JSON"
+        );
+        // 第 1 个条目已被失败处理器回滚，磁盘上不留内容，也没有暂存残留
+        assert!(!root.join("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko").exists());
+        assert!(!root.join("etc/modprobe.d/nvidia.conf").exists());
+        assert_no_staging_leftovers(&root);
+
+        // 凭 WAL 回滚：删除当初新建的路径，并消费掉日志
+        let report =
+            run_rollback(&root, Some(wal.as_path()), Arc::new(|_v: f32, _m: String| {})).unwrap();
+        assert_eq!(report.removed, 1, "回滚应删除 1 个当初新建的文件");
+        assert!(!wal.exists(), "回滚后写前日志被消费");
+        assert!(latest_journal(&root).is_none(), "状态目录不再有日志");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-11：崩溃模拟——WAL 在任何变更**之前** append+fsync，正式 JSON 从未写出时
+    /// 凭 `.jsonl.tmp` 仍可回滚（先写日志、后动文件的顺序契约）。
+    /// C-11: crash simulation — the WAL line is fsynced *before* the file is
+    /// touched and the committed JSON never appears; `run_rollback` still undoes
+    /// the change from the `.jsonl.tmp` alone (write-ahead ordering contract).
+    #[test]
+    fn write_ahead_log_rolls_back_after_crash_c11() {
+        let root = temp_case("c11-wal-crash");
+        let dest = root.join("etc/pwned.conf");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"old").unwrap();
+
+        let rel = "etc/pwned.conf";
+        let rollback_dir = state_dir(&root).join("rollback-999");
+        let journal_path = state_dir(&root).join("restore-999.json");
+        let wal = journal_wal_path(&journal_path);
+        let record = JournalEntry {
+            path: rel.to_string(),
+            prior_existed: true,
+            rollback_path: Some(
+                rollback_dir
+                    .join(rollback_file_name(rel))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            kind: "config".to_string(),
+        };
+
+        // 契约顺序：先 append + fsync WAL，再 move_aside / 写入新内容
+        append_journal_wal(&wal, &record).unwrap();
+        move_aside(&dest, &rollback_dir, rel)
+            .unwrap()
+            .expect("原文件应被移入回滚区");
+        fs::write(&dest, b"new").unwrap();
+        // 崩溃点：正式 JSON 从未写出
+        assert!(!journal_path.exists(), "模拟崩溃：无正式日志");
+
+        let report =
+            run_rollback(&root, Some(wal.as_path()), Arc::new(|_v: f32, _m: String| {})).unwrap();
+        assert_eq!(report.restored, 1, "应恢复 1 个原文件");
+        assert_eq!(fs::read(&dest).unwrap(), b"old", "凭 WAL 应恢复原文件");
+        assert!(!wal.exists(), "回滚消费掉写前日志");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// C-11：`latest_journal` 同时识别正式 JSON 与写前日志——更新的 id 胜出，
+    /// 同一 id 下优先 JSON，只有 WAL 时回退返回它（`--rollback` 据此可用）。
+    /// C-11: `latest_journal` recognises both the committed JSON and the WAL:
+    /// newest run id wins, JSON beats WAL for the same id, WAL is the fallback,
+    /// and `rollback-*` directories / junk files are never mistaken for journals.
+    #[test]
+    fn latest_journal_prefers_json_and_falls_back_to_wal_c11() {
+        let root = temp_case("c11-latest");
+        let dir = state_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let json = r#"{"created_at":"","target_kver":"","root":"","entries":[]}"#;
+        let wal_line = r#"{"path":"a.ko","prior_existed":false,"kind":"module"}"#;
+        fs::write(dir.join("restore-100.json"), json).unwrap();
+        fs::write(
+            dir.join(format!("restore-100{}", WAL_SUFFIX)),
+            format!("{wal_line}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("restore-200{}", WAL_SUFFIX)),
+            format!("{wal_line}\n"),
+        )
+        .unwrap();
+        // 干扰项：rollback 目录与无关文件不得被当作日志
+        fs::create_dir_all(dir.join("rollback-300")).unwrap();
+        fs::write(dir.join("junk.txt"), b"x").unwrap();
+
+        // 更新的 id（200，仅 WAL）胜出
+        let newest = latest_journal(&root).unwrap();
+        assert!(
+            newest.ends_with(format!("restore-200{}", WAL_SUFFIX)),
+            "取到的是 {newest:?}"
+        );
+
+        // 同一 id 下正式 JSON 优先于 WAL
+        fs::remove_file(dir.join(format!("restore-200{}", WAL_SUFFIX))).unwrap();
+        let prefer = latest_journal(&root).unwrap();
+        assert!(prefer.ends_with("restore-100.json"), "取到的是 {prefer:?}");
+
+        // 只剩 WAL → 回退返回它
+        fs::remove_file(dir.join("restore-100.json")).unwrap();
+        let fallback = latest_journal(&root).unwrap();
+        assert!(
+            fallback.to_string_lossy().ends_with(WAL_SUFFIX),
+            "取到的是 {fallback:?}"
+        );
+
+        // 清空后返回 None
+        fs::remove_file(dir.join(format!("restore-100{}", WAL_SUFFIX))).unwrap();
+        assert!(latest_journal(&root).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// C-11/C-12/C-39：成功的离线还原——开跑前清扫陈旧暂存，结束后原子提交带
+    /// RFC3339 UTC 时间与真实目标内核的正式日志、删除写前日志、零暂存残留。
+    /// C-11/C-12/C-39: a successful offline restore sweeps stale staged files up
+    /// front, then commits a journal stamped with a real RFC3339 UTC timestamp
+    /// and the real target kernel, removes the WAL, and leaves no leftovers.
+    #[test]
+    fn successful_restore_commits_rfc3339_journal_and_sweeps_staging_c11_c12_c39() {
+        let dir = temp_case("c11-c12-ok");
+        let root = dir.join("root");
+        let kver = "6.8.0-45-generic";
+        let manifest = manifest_json(
+            distro::arch(),
+            kver,
+            &[
+                ("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko", "module"),
+                ("etc/modprobe.d/nvidia.conf", "config"),
+            ],
+        );
+        let archive = build_archive(
+            &dir,
+            "ok.tar.gz",
+            &[
+                (
+                    "data/lib/modules/6.8.0-45-generic/updates/dkms/foo.ko",
+                    b"hello".as_slice(),
+                ),
+                ("data/etc/modprobe.d/nvidia.conf", b"1234567".as_slice()),
+            ],
+            Some(&manifest),
+        );
+        // 预置陈旧暂存文件（C-12：开跑前必须被清扫并记入 notes）
+        let stale_dir = root.join("lib/modules/6.8.0-45-generic/updates/dkms");
+        fs::create_dir_all(&stale_dir).unwrap();
+        let stale = stale_dir.join(format!("{}OLD-x.ko", STAGE_PREFIX));
+        fs::write(&stale, b"stale").unwrap();
+
+        let req = RestoreRequest {
+            archive,
+            root: Some(root.clone()),
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+        let report = run_restore(req).unwrap();
+
+        // 写入结果与暂存清扫
+        assert_eq!(report.written, 2, "两个条目都应写入：{:?}", report.notes);
+        assert_eq!(report.links_written, 0);
+        assert!(!stale.exists(), "陈旧暂存文件必须被清扫");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("已清理 1 个陈旧暂存文件")),
+            "notes={:?}",
+            report.notes
+        );
+        assert_no_staging_leftovers(&root);
+        assert!(!report.depmod_done, "离线（--root）不得执行 depmod");
+        assert!(
+            report.notes.iter().any(|n| n.contains("跳过 depmod")),
+            "notes={:?}",
+            report.notes
+        );
+        assert_eq!(
+            fs::read(root.join("lib/modules/6.8.0-45-generic/updates/dkms/foo.ko")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(root.join("etc/modprobe.d/nvidia.conf")).unwrap(),
+            b"1234567"
+        );
+
+        // 正式日志：RFC3339 UTC + 真实目标内核 + 两个条目
+        let journal_path = report.rollback_journal.clone().expect("应记录事务日志");
+        assert!(journal_path.exists());
+        let journal = RestoreJournal::load(&journal_path).unwrap();
+        let created = &journal.created_at;
+        assert_eq!(created.len(), 20, "RFC3339 应为 20 字符：{created}");
+        let pat = "0000-00-00T00:00:00Z";
+        assert!(
+            created.chars().zip(pat.chars()).all(|(a, b)| match b {
+                '0' => a.is_ascii_digit(),
+                c => a == c,
+            }),
+            "不是 RFC3339 UTC：{created}"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            created.as_str() >= secs_to_rfc3339(now.saturating_sub(120)).as_str()
+                && created.as_str() <= secs_to_rfc3339(now + 120).as_str(),
+            "created_at 应接近当前时刻：{created}"
+        );
+        assert_eq!(journal.target_kver, kver, "目标内核必须写入日志");
+        assert_eq!(journal.entries.len(), 2, "两个条目都要入账");
+
+        // 成功收尾：写前日志与 .new 临时文件都不存在
+        let state = state_dir(&root);
+        assert!(!journal_wal_path(&journal_path).exists(), "成功后必须删除 WAL");
+        let leftovers: Vec<String> = fs::read_dir(&state)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".new") || n.ends_with(WAL_SUFFIX) || n.starts_with(STAGE_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "状态目录残留临时文件：{leftovers:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-31：目标内核解析的三条默认规则（纯函数）。
+    /// C-31: the three defaulting rules of target-kernel resolution (pure fn).
+    #[test]
+    fn resolve_target_kver_defaults_c31() {
+        let host = "6.8.0-99-host";
+        let manifest_kver = "6.8.0-45-generic";
+        // 显式 `--kver` 优先，并标记为"显式"（触发一致性确认）
+        assert_eq!(
+            resolve_target_kver(Some("1.2.3-foreign"), None, manifest_kver, host),
+            ("1.2.3-foreign".to_string(), true)
+        );
+        // 未指定 + 本机/联网（root=None）→ 当前内核，非显式
+        assert_eq!(
+            resolve_target_kver(None, None, manifest_kver, host),
+            (host.to_string(), false)
+        );
+        // 未指定 + `--root` 离线 → manifest 记录的内核，非显式
+        assert_eq!(
+            resolve_target_kver(None, Some(Path::new("/mnt")), manifest_kver, host),
+            (manifest_kver.to_string(), false)
+        );
+    }
+
+    /// C-32：架构确认与内核确认互相独立——`allow_kernel_mismatch=true` 绝不能
+    /// 放行未确认的架构不符。
+    /// C-32: arch confirmation is independent of kernel confirmation — a set
+    /// `allow_kernel_mismatch` must never release an unconfirmed arch mismatch;
+    /// only `allow_arch_mismatch` does.
+    #[test]
+    fn arch_mismatch_is_independent_of_kernel_confirmation_c32() {
+        let dir = temp_case("c32-arch");
+        let host_arch = distro::arch();
+        let other_arch = if host_arch == "x86_64" { "aarch64" } else { "x86_64" };
+        let manifest = manifest_json(
+            other_arch,
+            "6.8.0-45-generic",
+            &[("etc/modprobe.d/x.conf", "config")],
+        );
+        let archive = build_archive(
+            &dir,
+            "c32.tar.gz",
+            &[("data/etc/modprobe.d/x.conf", b"abc".as_slice())],
+            Some(&manifest),
+        );
+        let mk = |allow_arch: bool, allow_kernel: bool| RestoreRequest {
+            archive: archive.clone(),
+            kver: None,
+            dry_run: true, // 只校验一致性，不落盘
+            allow_arch_mismatch: allow_arch,
+            allow_kernel_mismatch: allow_kernel, // 即便为 true 也不得覆盖架构检查
+            root: Some(dir.join("root")),
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+
+        // 已确认内核不一致，但未确认架构 → 仍必须失败，且提示自己的开关
+        let err = run_restore(mk(false, true)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("架构") && msg.contains("allow-arch-mismatch"),
+            "架构错误必须提示自己的开关：{msg}"
+        );
+        assert!(
+            !msg.contains("备份内核与目标不符"),
+            "不应先撞内核检查：{msg}"
+        );
+
+        // 两个开关都确认 → 放行并记录确认说明
+        let report = run_restore(mk(true, true)).unwrap();
+        assert!(report.dry_run);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("已由用户确认的架构不一致")),
+            "notes={:?}",
+            report.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-31：显式 `--kver` 与备份内核不符 → 必须 `--allow-kernel-mismatch` 确认；
+    /// 未显式指定时的跨内核目标只降级为提示（不阻塞）。
+    /// C-31: an explicit `--kver` differing from the backup kernel requires
+    /// `--allow-kernel-mismatch`; an implicit (auto) target only degrades to a
+    /// note and keeps going.
+    #[test]
+    fn explicit_kver_mismatch_requires_kernel_confirmation_c31() {
+        let dir = temp_case("c31-kver");
+        let manifest = manifest_json(
+            distro::arch(),
+            "0.0.0-notest",
+            &[("etc/modprobe.d/x.conf", "config")],
+        );
+        let archive = build_archive(
+            &dir,
+            "c31.tar.gz",
+            &[("data/etc/modprobe.d/x.conf", b"abc".as_slice())],
+            Some(&manifest),
+        );
+        let mk = |kver: Option<&str>, allow: bool, root: Option<PathBuf>| RestoreRequest {
+            archive: archive.clone(),
+            kver: kver.map(str::to_string),
+            dry_run: true,
+            allow_kernel_mismatch: allow,
+            root,
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+
+        // 显式目标与备份不符 + 未确认 → 硬错误，提示自己的开关
+        let err = run_restore(mk(Some("1.2.3-foreign"), false, None)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("备份内核与目标不符") && msg.contains("allow-kernel-mismatch"),
+            "消息：{msg}"
+        );
+
+        // 确认后放行（dry-run 记录确认说明）
+        let report = run_restore(mk(Some("1.2.3-foreign"), true, None)).unwrap();
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("已由用户确认的内核不一致")),
+            "notes={:?}",
+            report.notes
+        );
+
+        // auto（未显式 --kver）：与当前内核不一致只降级为"跨内核还原"提示
+        let report = run_restore(mk(None, false, None)).unwrap();
+        assert!(
+            report.notes.iter().any(|n| n.contains("跨内核还原")),
+            "auto 目标应降级为提示：{:?}",
+            report.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-18：不可变系统闸门的**纯决策**与 dry-run 只读提示（全程不执行任何命令）。
+    /// C-18: pure decisions of the immutability gate plus the read-only dry-run
+    /// hint — no command is ever executed by these functions.
+    #[test]
+    fn plan_immutable_gate_decisions_c18() {
+        // 可变系统：一律放行
+        assert_eq!(
+            plan_immutable_gate(distro::Immutability::Mutable, ImmutablePolicy::Refuse),
+            ImmutableGate::Pass
+        );
+        assert_eq!(
+            plan_immutable_gate(distro::Immutability::Mutable, ImmutablePolicy::Usroverlay),
+            ImmutableGate::Pass
+        );
+        // OSTree + 默认策略 → 拒绝并给出受支持的替代路径
+        match plan_immutable_gate(distro::Immutability::Ostree, ImmutablePolicy::Refuse) {
+            ImmutableGate::Refuse(msg) => {
+                assert!(msg.contains("rpm-ostree"), "消息：{msg}");
+                assert!(msg.contains("usroverlay"), "消息：{msg}");
+            }
+            other => panic!("期望 Refuse，得到 {other:?}"),
+        }
+        // OSTree + usroverlay → 需先执行命令（只在实盘路径执行，见 dry-run 测试）
+        assert_eq!(
+            plan_immutable_gate(distro::Immutability::Ostree, ImmutablePolicy::Usroverlay),
+            ImmutableGate::Usroverlay
+        );
+        // NixOS / 只读 /usr：无论策略一律拒绝
+        assert!(matches!(
+            plan_immutable_gate(distro::Immutability::Nix, ImmutablePolicy::Refuse),
+            ImmutableGate::Refuse(_)
+        ));
+        assert!(matches!(
+            plan_immutable_gate(distro::Immutability::Nix, ImmutablePolicy::Usroverlay),
+            ImmutableGate::Refuse(_)
+        ));
+        assert!(matches!(
+            plan_immutable_gate(distro::Immutability::ReadOnlyUsr, ImmutablePolicy::Usroverlay),
+            ImmutableGate::Refuse(_)
+        ));
+        // dry-run 提示是纯文本：说明实盘将需要什么，且明确"不执行任何命令"
+        assert!(immutable_dry_run_hint(distro::Immutability::Ostree).contains("不执行任何命令"));
+        assert!(immutable_dry_run_hint(distro::Immutability::Mutable).contains("可直接写入"));
+        assert!(immutable_dry_run_hint(distro::Immutability::Nix).contains("configuration.nix"));
+    }
+
+    /// C-18：dry-run 必须在不可变闸门**之前**返回——即使策略为 usroverlay 也绝不
+    /// 执行 `rpm-ostree usroverlay` 等任何命令，只给只读提示。
+    ///
+    /// 本机可变性探测读真实系统（不可注入），故除行为断言外再加一道**源码顺序
+    /// 守卫**：run_restore 的步骤 4（dry-run 分支）必须先于步骤 5（闸门）出现。
+    /// 手工复核（OSTree 机器）：`strace -f -e trace=execve ./target/debug/... restore
+    /// --dry-run --on-immutable usroverlay …` 应看不到任何 execve("rpm-ostree")。
+    /// C-18: dry-run must return *before* the immutability gate — no command runs.
+    #[test]
+    fn dry_run_returns_before_immutable_gate_c18() {
+        let dir = temp_case("c18-dry");
+        let manifest = manifest_json(
+            distro::arch(),
+            "6.8.0-45-generic",
+            &[("etc/modprobe.d/x.conf", "config")],
+        );
+        let archive = build_archive(
+            &dir,
+            "c18.tar.gz",
+            &[("data/etc/modprobe.d/x.conf", b"abc".as_slice())],
+            Some(&manifest),
+        );
+        let req = RestoreRequest {
+            archive,
+            dry_run: true,
+            // root=None → 不离线；若闸门先于 dry-run 执行，OSTree 机器上会运行命令
+            root: None,
+            on_immutable: ImmutablePolicy::Usroverlay,
+            progress: Arc::new(|_v: f32, _m: String| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+            ..RestoreRequest::default()
+        };
+        let report = run_restore(req).unwrap();
+        assert!(report.dry_run);
+        assert!(report.rollback_journal.is_none(), "dry-run 不产生事务日志");
+        // 可变性说明来自 dry-run 分支（步骤 4）
+        assert!(
+            report.notes.iter().any(|n| n
+                .starts_with("目标系统可变性：")
+                && n.contains(distro::immutability().label_zh())),
+            "notes={:?}",
+            report.notes
+        );
+        // 闸门真正执行才会出现的说明（usroverlay"重启后失效"）绝不能出现
+        assert!(
+            !report.notes.iter().any(|n| n.contains("重启后失效")),
+            "dry-run 不得执行不可变闸门：{:?}",
+            report.notes
+        );
+
+        // 源码顺序守卫：步骤 4（dry-run）必须出现在步骤 5（闸门）之前
+        let src = include_str!("restore.rs");
+        let dry = src
+            .find("---- 步骤 4：dry-run")
+            .expect("run_restore 应有 dry-run 步骤注释");
+        let gate = src
+            .find("plan_immutable_gate(immutability, req.on_immutable)")
+            .expect("run_restore 应有不可变闸门调用");
+        assert!(dry < gate, "dry-run 必须先于不可变闸门返回（C-18）");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C-39：手写 RFC3339 UTC 格式化（不引入 chrono/time 依赖）的已知值。
+    /// C-39: known-value checks for the hand-rolled RFC3339 UTC formatter.
+    #[test]
+    fn secs_to_rfc3339_known_epoch_values_c39() {
+        assert_eq!(secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(secs_to_rfc3339(1), "1970-01-01T00:00:01Z");
+        assert_eq!(secs_to_rfc3339(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(secs_to_rfc3339(946_684_800), "2000-01-01T00:00:00Z");
+        // 闰年：2020-02 有 29 天 → 3 月 1 日
+        assert_eq!(secs_to_rfc3339(1_583_020_800), "2020-03-01T00:00:00Z");
+        assert_eq!(secs_to_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        // 百年规则：2100 不是闰年（epoch 4102444800 = 2100-01-01）
+        assert_eq!(secs_to_rfc3339(4_102_444_800), "2100-01-01T00:00:00Z");
     }
 }

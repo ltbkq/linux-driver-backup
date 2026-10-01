@@ -1032,6 +1032,50 @@ fn validate_rel_path(rel: &str) -> AppResult<()> {
 /// Managed prefixes in the `rel_path` namespace; a symlink target must stay within one.
 const MANAGED_LINK_PREFIXES: [&str; 2] = ["lib/modules/", "usr/lib/modules/"];
 
+/// C-01：`etc/` 下符号链接目标归一化后的**绝对路径白名单**（必须落在其中之一）。
+/// C-01: whitelist of absolute prefixes an `etc/` symlink target may resolve into.
+///
+/// 覆盖实测合法样例（`/lib/linux-sound-base/…`）、usr-merge 的 `/usr/lib/…` 以及
+/// `/etc/…`、`/usr/share/…`、`/run/…` 别名；`/`、`/home/…` 等一律拒绝。
+/// 与 `restore.rs::validate_link_target` 的同名常量保持一致——v0.3.0 由 W7/C-47
+/// 合并为共享函数，v0.2.1 按 ITERATION §4-W0-A 先各自实现并互相指认。
+const ALLOWED_ETC_LINK_PREFIXES: [&str; 5] =
+    ["/etc/", "/lib/", "/usr/lib/", "/usr/share/", "/run/"];
+
+/// C-01: lexically resolve a symlink target to an absolute path rooted at the
+/// archive root: relative targets are joined onto the link's own directory first;
+/// `..` is rejected when it would climb above the root for relative targets and
+/// pinned at `/` for absolute ones. `None` means "escapes the archive root".
+/// C-01：把符号链接目标**词法**解析为以归档根为基准的绝对路径（不访问文件系统）：
+/// 相对目标先拼到链接所在目录；相对目标的 `..` 越出根即返回 `None`，
+/// 绝对目标的 `/..` 则停在根。例：`("etc/a/b.conf", "../x")` → `Some("/etc/x")`。
+fn resolve_link_abs(link_rel: &str, target: &str) -> Option<String> {
+    let absolute = target.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    if !absolute {
+        if let Some(i) = link_rel.rfind('/') {
+            for seg in link_rel[..i].split('/') {
+                if !seg.is_empty() && seg != "." {
+                    stack.push(seg);
+                }
+            }
+        }
+    }
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() && !absolute {
+                    // 相对目标越出归档根（如 `etc/x -> ../../../../..`）→ 拒绝。
+                    return None;
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(format!("/{}", stack.join("/")))
+}
+
 /// 校验符号链接目标：拒绝绝对路径与越界目标，归一化后须仍落在受管前缀内。
 /// Validate a symlink target: reject absolute or escaping targets; after lexical
 /// normalization it must still reside under a managed prefix.
@@ -1040,15 +1084,34 @@ const MANAGED_LINK_PREFIXES: [&str; 2] = ["lib/modules/", "usr/lib/modules/"];
 /// 正依赖它），但以 `link_rel` 所在目录为起点做**纯词法归一化**（不触碰文件系统）：
 /// 一旦越过归档根即判为 [`AppError::Format`]。同时拒绝空目标、含 NUL、以 `/` 开头的目标。
 fn validate_link_target(link_rel: &str, target: &str) -> AppResult<()> {
-    // `/etc` 下存在大量**绝对目标**的系统配置别名（如
-    // /etc/modprobe.d/blacklist-oss.conf -> /lib/linux-sound-base/noOSS.modprobe.conf）。
-    // 链接自身仍写在受管的 /etc 路径下，重建它不会带来额外写权限，
-    // 因此这里只做基本合法性检查，按原样保存。
+    // ---- C-01/C-02 符号链接禁闭（与 restore.rs::validate_link_target 同步实施）----
+    // `/etc` 下存在**绝对目标**的系统配置别名（如 /etc/modprobe.d/blacklist-oss.conf
+    // -> /lib/linux-sound-base/noOSS.modprobe.conf），这类目标继续放行；但旧实现对
+    // `..` 越根与任意绝对路径（`/`、`/home/user/pwn`）也原样放行，恶意归档可借此
+    // 用 `data/etc/x -> /` + `data/etc/x/...` 条目以 root 任意写文件，故改为：
+    // 目标必须词法解析后仍落在 `etc/` 树内，或（绝对目标）位于允许前缀白名单。
     if link_rel.starts_with("etc/") {
         if target.trim().is_empty() {
             return Err(AppError::Format(format!(
                 "符号链接目标为空：{}",
                 link_rel
+            )));
+        }
+        let resolved = resolve_link_abs(link_rel, target).ok_or_else(|| {
+            AppError::Format(format!(
+                "符号链接目标越出归档根 / link target escapes archive root: {link_rel} -> {target}"
+            ))
+        })?;
+        // (a) 仍在 `etc/` 树内（如 etc/modules-load.d/modules.conf -> ../modules）。
+        let in_etc_tree = resolved == "/etc" || resolved.starts_with("/etc/");
+        // (b) 绝对目标位于允许前缀白名单（含 usr-merge 的 /usr/lib/…）。
+        let in_whitelist = ALLOWED_ETC_LINK_PREFIXES
+            .iter()
+            .any(|p| resolved.as_str() == p.trim_end_matches('/') || resolved.starts_with(p));
+        if !(in_etc_tree || in_whitelist) {
+            return Err(AppError::Format(format!(
+                "符号链接目标越出允许前缀 / etc link target outside allowed prefixes: \
+                 {link_rel} -> {target} (normalized: {resolved})"
             )));
         }
         return Ok(());
@@ -1535,7 +1598,7 @@ mod tests {
             "../../6.8.0-40/extra/foo.ko"
         )
         .is_ok());
-        // `/etc` 下的配置别名：相对目标与**绝对目标**都允许原样保存
+        // `/etc` 下的配置别名：解析后落在 `etc/` 树内 / 允许前缀白名单 → 放行
         // （真实案例：/etc/modprobe.d/blacklist-oss.conf -> /lib/linux-sound-base/…）
         assert!(
             validate_link_target("etc/modprobe.d/alias.conf", "../modprobe.d/other.conf").is_ok()
@@ -1559,11 +1622,11 @@ mod tests {
         assert!(
             validate_link_target("lib/modules/6.8.0/weak-updates/foo.ko", "/etc/shadow").is_err()
         );
-        // `/etc` 下的链接按原样重建（符号链接目标只是字符串，重建它不会产生写权限），
-        // 因此其目标即使是越根的相对路径也**不**在此处拒绝 —— 链接自身的路径由
-        // `safe_rel_path` / `data_payload` 严格校验，这才是防越界写入的关键。
+        // C-01：`/etc` 下的链接也不再"原样放行"——越出归档根的相对目标必须拒绝，
+        // 否则恶意归档可用 `data/etc/x -> ../../../../..` + 后续条目做禁闭逃逸
+        // （链接自身路径合法并不足够，解析后的目标同样要受约束）。
         assert!(
-            validate_link_target("etc/modprobe.d/x.conf", "../../../../etc/shadow").is_ok()
+            validate_link_target("etc/modprobe.d/x.conf", "../../../../etc/shadow").is_err()
         );
         // 归一化后落在受管前缀之外
         assert!(validate_link_target(
@@ -1577,6 +1640,49 @@ mod tests {
         // 越界一律是 AppError::Format
         match validate_link_target("lib/modules/x/a.ko", "/etc/shadow") {
             Err(AppError::Format(_)) => {}
+            other => panic!("expected AppError::Format, got {other:?}"),
+        }
+    }
+
+    /// C-01（v0.2.1）：`etc/` 链接目标的禁闭校验——与 restore.rs 同一规则。
+    /// C-01 (v0.2.1): containment check for `etc/` symlink targets (same rule as restore.rs).
+    #[test]
+    fn validate_link_target_etc_containment_c01() {
+        // ---- 拒绝：解析结果既不在 etc 树内、也不在允许前缀白名单 ----
+        assert!(validate_link_target("etc/x", "/").is_err(), "`/` 必须被拒");
+        assert!(
+            validate_link_target("etc/x", "../../../../..").is_err(),
+            "越出归档根的相对目标必须被拒"
+        );
+        assert!(
+            validate_link_target("etc/x", "/home/user/pwn").is_err(),
+            "白名单之外的绝对目标必须被拒"
+        );
+        // 相对目标归一化后同样要落在白名单内（/../.. → /home/user/pwn）
+        assert!(
+            validate_link_target("etc/modprobe.d/x.conf", "../../home/user/pwn").is_err(),
+            "解析到 /home 的相对目标必须被拒"
+        );
+
+        // ---- 放行：白名单前缀与 etc 树内 ----
+        // v0.2.0 实测样例（usr-merge 之前）
+        assert!(validate_link_target(
+            "etc/modprobe.d/blacklist-oss.conf",
+            "/lib/linux-sound-base/noOSS.modprobe.conf"
+        )
+        .is_ok());
+        // usr-merge 形态
+        assert!(validate_link_target("etc/x", "/usr/lib/foo").is_ok());
+        // etc 树内的相对目标（modules-load.d → ../modules）
+        assert!(validate_link_target(
+            "etc/modules-load.d/modules.conf",
+            "../modules"
+        )
+        .is_ok());
+
+        // 错误类型为 Format，且错误信息带归一化结果
+        match validate_link_target("etc/x", "/home/user/pwn") {
+            Err(AppError::Format(m)) => assert!(m.contains("normalized"), "消息={m}"),
             other => panic!("expected AppError::Format, got {other:?}"),
         }
     }
