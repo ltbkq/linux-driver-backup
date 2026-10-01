@@ -473,9 +473,10 @@ pub fn inspect(archive: &std::path::Path) -> AppResult<ArchiveInfo>;
 
 pub struct RestoreRequest {
     pub archive: std::path::PathBuf,
-    pub kver: Option<String>,            // None → 用 manifest.kernel_release
+    pub kver: Option<String>,            // None → 联网用当前内核、离线用 manifest（v0.2.1 C-31）
     pub dry_run: bool,
     pub allow_kernel_mismatch: bool,
+    pub allow_arch_mismatch: bool,       // +v0.2.1 C-32：与内核检查解耦
     pub with_firmware: bool,
     pub progress: ProgressFn,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -519,6 +520,7 @@ linux-driver-backup                          # 无参数 → 启动 GUI
 linux-driver-backup --scan [--mode m] [--json]           # 扫描并打印（JSON 便于测试）
 linux-driver-backup --backup --out <f> [--mode m] [--kver k]
 linux-driver-backup --restore --archive <f> [--dry-run] [--yes] [--with-firmware]
+                     [--allow-kernel-mismatch] [--allow-arch-mismatch]
 linux-driver-backup --helper-restore --archive <f> …     # 仅由 pkexec 调用
 ```
 
@@ -613,6 +615,52 @@ pub fn latest_journal(root: &Path) -> Option<PathBuf>;
 > 还原顺序（v0.2.0）：**inspect → 内核/架构/vermagic 校验 → 权限 → 不可变系统闸门 →
 > 事务化解压（符号链接 / 来源包 / 回滚日志）→ 重建(DKMS/akmods) → 重装包 → weak-modules →
 > depmod → restorecon → Secure Boot 签名 → initramfs → 汇总**。
+
+---
+
+### 5.9 v0.2.1 增补契约 / v0.2.1 contract addendum
+
+> 安全与正确性热修 14 项（docs/ITERATION-v0.3.0.md §2.1）；归档格式不变，v1/v2 归档均可读。
+
+**退出码（C-33，进程契约）**：`0` = 成功或用户主动取消；`1` = 运行失败（含 `--scan --json` 输出失败）；`2` = 用法/参数错误。集成测试 `tests/exit_codes.rs`。
+
+**`main.rs`（CLI 增补）**
+
+```
+--restore / --helper-restore … [--allow-arch-mismatch]   # 架构不符需独立确认（C-32）
+# C-31：GUI 不再向 helper 传归档内核（默认即当前内核，重建优先）
+# C-34：--helper-restore 的 --on-immutable 与 --restore 同样严格取值
+```
+
+**`restore.rs`**
+
+```rust
+pub struct RestoreRequest { /* 既字段 */ pub allow_arch_mismatch: bool }
+// C-31 默认目标内核：kver=None 且联网 → 当前内核（distro::kernel_release），
+//       离线（root=Some）→ manifest.kernel_release；auto 目标的跨内核差异
+//       降级为 report.notes（DKMS 重建路径），仅显式 --kver 不符才要求
+//       allow_kernel_mismatch；架构不符只认 allow_arch_mismatch（C-32 解耦）。
+```
+
+- **WAL 事务日志（C-11/C-39）**：每条目先 `append + fsync` 到 `restore-<id>.jsonl.tmp` 再变更；全部成功提交正式 JSON（RFC3339 `created_at`、真实 `target_kver`）并删除 JSONL；失败保留 JSONL，`--rollback` 优先读 JSON、回退读 JSONL。
+- **manifest 权威化（C-10）**：非法 manifest 路径、未登记的写入/链接条目 → 硬错误。
+- **写入路径逐段校验（C-02）**：`safe_parent` 对每个路径组件 `symlink_metadata`，拒绝穿链接写入（顶层 usr-merge 别名 `/lib`、`/bin`、`/sbin`、`/lib64` 除外）。
+- **dry-run 只读（C-18）**：不可变系统闸门（含 `rpm-ostree usroverlay` 执行）移到 dry-run 返回之后；预演永不执行变更命令，仅输出提示。
+
+**`backup.rs`**：`validate_link_target` 与 restore 同规则——`etc/` 链接目标归一化后须落在 `etc/` 树内或白名单前缀（`/etc`、`/lib`、`/usr/lib`、`/usr/share`、`/run`）（C-01，v0.2.1 先各自实现、v0.3.0 合并公共函数）。
+
+**`scan.rs`**：归属查询读取 stdout 不看退出码（C-22，`dpkg-query -S` 批内部分失败不再丢弃整批）；查询前 usr-merge 归一化 `/lib|/bin|/sbin|/lib64 → /usr/…`，命中映射回原路径键（C-23）。
+
+**`privilege.rs`**
+
+```rust
+pub const UNSAFE_ELEVATION_ENV: &str = "LDB_ALLOW_UNSAFE_ELEVATION";
+pub fn check_elevatable(exe: &std::path::Path, allow_unsafe: bool) -> crate::model::AppResult<std::path::PathBuf>;
+// self_exe() 提权前要求 canonicalize 后 uid==0 且 mode&022==0，否则拒绝提权（C-03，
+// dev 构建/AppImage 指引安装到 /usr）；LDB_ALLOW_UNSAFE_ELEVATION=1 仅供开发绕过（stderr 警告）。
+```
+
+**GUI（`ui/app_window.slint` 扩展，非冻结新增）**：属性 `confirm-visible` / `confirm-detail` / `restore-ack` 与回调 `confirm-restore` / `dismiss-confirm` —— 真实还原前的二次确认框（C-35，列出归档、内核/架构差异与写入警告）。
 
 ---
 

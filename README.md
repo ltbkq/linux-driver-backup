@@ -39,6 +39,25 @@
 - **非破坏性还原 / Non-destructive restore**：还原前可先 `--dry-run` 预演（只打印计划、不写盘）；目标位置已存在同名文件时先备份为 `*.ldbak` 再覆盖；写入完成后强制执行 `depmod -a <kver>`（RHEL 系并补 `restorecon`），最后按发行版自适应更新 initramfs——没有 `depmod` 就不会有 `modules.dep`/`modules.alias`，还原等于无效。*Dry-run preview, `.ldbak` safety copies, mandatory `depmod`, then distro-adaptive initramfs update.*
 - **多线程流水作业 / Pipelined workers**：扫描 → 哈希 → 压缩三段式流水线（`std::thread` + 有界通道背压），进度实时回传、可随时取消，全程不阻塞 UI。*A three-stage pipeline keeps the UI responsive.*
 
+## v0.2.1 修复 / What's fixed in v0.2.1
+
+> 对应 [docs/ITERATION-v0.3.0.md](docs/ITERATION-v0.3.0.md) §2.1 的 **14 项安全与正确性热修**；无新功能、归档格式不变。
+> The 14 security & correctness hotfixes of §2.1: no new features, archive format unchanged.
+
+| 修复 / Fix | 说明 / Details |
+|---|---|
+| **符号链接禁闭** / symlink jail | `etc/` 链接目标归一化校验（拒绝指向 `/`、`..` 逃逸、白名单前缀外的绝对目标）；提取时逐路径组件 `symlink_metadata` 检查，杜绝穿链接任意写。/ Link targets are normalized and contained; each path component is checked before writing. |
+| **写前日志（WAL）** / write-ahead log | 每条目先 `fsync` 落日志再变更；崩溃/断电后 `--rollback` 可从 JSONL 日志恢复。/ Every entry is journaled and fsynced before mutation; `--rollback` recovers from the JSONL log after a crash. |
+| **manifest 权威化** / manifest is authoritative | 非法路径与归档内未登记条目一律硬错误，不再静默丢弃。/ Illegal manifest paths and unregistered archive entries are hard errors instead of silent drops. |
+| **归属查询修复** / provenance queries | 读取 stdout 不看退出码（`dpkg-query -S` 批内部分失败不再丢弃整批）；usr-merge 归一化让 `/lib/…` 也查得到来源包。/ stdout is read regardless of exit code, with usr-merge path normalization. |
+| **提权前校验** / elevation trust check | pkexec 前要求自身二进制 `uid==0` 且组/其他不可写，dev 构建与 AppImage 不再以 root 执行用户可写文件。/ The binary handed to pkexec must be root-owned and not group/world-writable. |
+| **架构检查解耦** / independent arch check | 架构不符需独立的 `--allow-arch-mismatch`（或交互/确认框确认），`--allow-kernel-mismatch` 不再顺带放行。/ Arch mismatch now requires its own consent. |
+| **默认目标内核** / default target kernel | 还原默认以**当前内核**为目标（联网），跨内核差异降级为提示并按 DKMS 重建；删除 GUI 死逻辑传参。/ Online restores default to the running kernel with rebuild-first; dead code removed. |
+| **退出码契约** / exit codes | `0` 成功或用户主动取消、`1` 运行失败（含 JSON 输出失败）、`2` 用法错误；`tests/exit_codes.rs` 集成测试守护。 |
+| **GUI 二次确认** / GUI confirmation | 真实还原前弹出确认框，列出归档、内核/架构差异与"将写入系统目录"警告，取消零副作用。/ A confirmation dialog lists the archive, kernel/arch delta and the root-write warning before any change. |
+| **dry-run 严格只读** / strictly read-only dry-run | 不可变系统闸门移到预演返回之后，预演永不执行 `rpm-ostree` 等变更命令。/ The immutable gate runs after dry-run returns; previews never execute mutating commands. |
+| **staging 清理** / staging cleanup | 失败路径（含 `?` 提前返回）清理 `.ldb-staging-*`，并提供启动时清扫。/ Staging leftovers are removed on every exit path. |
+
 ## v0.2.0 新增能力 / What's new in v0.2.0
 
 > 对应 [docs/ROADMAP-v2.md](docs/ROADMAP-v2.md) 的 **P0（正确性与安全）** 计划，归档格式升级为 **v2**（v1 归档仍可读）。
@@ -233,8 +252,10 @@ target/release/linux-driver-backup
 | *(无参数 / no args)* | 启动 GUI / launch the GUI |
 | `--scan [--mode <m>] [--json]` | 扫描并打印结果；`--json` 输出机器可读 JSON（便于测试），`<m>` 为 `minimal`/`standard`/`full` |
 | `--backup --out <f> [--mode <m>] [--kver <k>]` | 备份到指定归档文件 `<f>`；模式默认 `standard`，内核版本默认取当前运行内核 |
-| `--restore --archive <f> [--dry-run] [--yes] [--with-firmware]` | 从归档 `<f>` 还原；`--dry-run` 只预演不写盘，`--yes` 跳过交互确认，`--with-firmware` 允许还原固件 |
+| `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch] [--allow-arch-mismatch] [--root <dir>] [--strategy …]` | 从归档 `<f>` 还原；`--dry-run` 只预演不写盘，`--yes` 跳过交互确认，`--with-firmware` 允许还原固件；备份内核与当前不符用 `--allow-kernel-mismatch`（或交互确认），**架构不符**需独立的 `--allow-arch-mismatch`（或交互确认） |
 | `--helper-restore --archive <f> …` | **仅供内部使用**：由 `pkexec <自身> --helper-restore …` 以 root 重入时解析的内部标志，用户不应手动调用 |
+
+退出码 / Exit codes：`0` 成功或用户主动取消；`1` 运行失败；`2` 用法/参数错误（JSON 输出失败也返回 1）。*0 = success or user cancellation; 1 = runtime failure; 2 = usage error.*
 
 可复制的三个示例 / Three copy-pasteable examples：
 
