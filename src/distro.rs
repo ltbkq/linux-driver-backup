@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -352,7 +353,11 @@ where
 {
     let dracut = || SystemCmd {
         program: "dracut".to_string(),
-        args: vec!["--force".to_string(), "--kver".to_string(), kver.to_string()],
+        args: vec![
+            "--force".to_string(),
+            "--kver".to_string(),
+            kver.to_string(),
+        ],
     };
     let cmd = match family {
         Family::Debian => SystemCmd {
@@ -455,13 +460,17 @@ where
     }
     let linux_candidates = [format!("boot/vmlinuz-{kver}"), "boot/vmlinuz".to_string()];
     let initrd_candidates = [
-        format!("boot/initrd.img-{kver}"),       // Debian / Ubuntu
-        format!("boot/initramfs-{kver}.img"),    // RHEL / Fedora
-        format!("boot/initramfs-{kver}"),        // Gentoo
-        format!("boot/initramfs.img-{kver}"),    // 部分旧 RHEL
+        format!("boot/initrd.img-{kver}"),    // Debian / Ubuntu
+        format!("boot/initramfs-{kver}.img"), // RHEL / Fedora
+        format!("boot/initramfs-{kver}"),     // Gentoo
+        format!("boot/initramfs.img-{kver}"), // 部分旧 RHEL
     ];
     let mut args: Vec<String> = vec!["build".to_string()];
-    if let Some(linux) = linux_candidates.iter().map(|p| root.join(p)).find(|p| p.is_file()) {
+    if let Some(linux) = linux_candidates
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| p.is_file())
+    {
         args.push("--linux".to_string());
         args.push(linux.display().to_string());
     }
@@ -641,9 +650,13 @@ fn usr_is_read_only() -> bool {
     for line in content.lines() {
         let mut fields = line.split_whitespace();
         let _dev = fields.next();
-        let Some(mount_point) = fields.next() else { continue };
+        let Some(mount_point) = fields.next() else {
+            continue;
+        };
         let _fstype = fields.next();
-        let Some(options) = fields.next() else { continue };
+        let Some(options) = fields.next() else {
+            continue;
+        };
         let mount_point = mount_point.replace("\\040", " ");
         let is_usr = mount_point == "/usr" || mount_point == "/";
         if !is_usr {
@@ -709,9 +722,16 @@ fn secure_boot_enabled_at(root: &Path) -> bool {
     read_efivar_secure_boot(root).unwrap_or(false)
 }
 
-/// Host Secure Boot probe (unchanged pre-W4 behaviour).
-/// 宿主 Secure Boot 探测（W4 前的既有行为，保持不变）。
+/// Host Secure Boot probe.
+/// 宿主 Secure Boot 探测。
+///
+/// C-30 ①：**优先直读 efivars**（`/sys/firmware/efi/efivars/SecureBoot-*`，无需 root，
+/// 见 ITERATION §3.1-6），efivars 不可读时才回退 `mokutil --sb-state`；无 EFI 变量目录
+/// 直接判定为关闭。这样 `mokutil` 缺失不再与"Secure Boot 关闭"不可区分。
 fn secure_boot_enabled() -> bool {
+    if let Some(enabled) = read_efivar_secure_boot(Path::new("/")) {
+        return enabled;
+    }
     if !Path::new("/sys/firmware/efi").exists() {
         return false;
     }
@@ -754,8 +774,7 @@ fn module_sig_enforced_at(root: &Path) -> bool {
     if root == Path::new("/") {
         return module_sig_enforced();
     }
-    if let Ok(value) = fs::read_to_string(root.join("sys/module/module/parameters/sig_enforce"))
-    {
+    if let Ok(value) = fs::read_to_string(root.join("sys/module/module/parameters/sig_enforce")) {
         if value.trim() == "Y" || value.trim() == "1" {
             return true;
         }
@@ -768,20 +787,50 @@ fn module_sig_enforced_at(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Host signature-enforcement probe (unchanged pre-W4 behaviour).
-/// 宿主签名强制探测（W4 前的既有行为，保持不变）。
+/// Host signature-enforcement probe.
+/// 宿主签名强制探测。
+///
+/// 顺序：sysfs 参数 → `/proc/cmdline` 的 `module.sig_enforce` → C-30 ② 解析内核配置
+/// （`/proc/config.gz` 优先，回退 `/boot/config-<kver>`）中的 `CONFIG_MODULE_SIG_FORCE=y`。
 fn module_sig_enforced() -> bool {
     if let Ok(value) = fs::read_to_string("/sys/module/module/parameters/sig_enforce") {
         if value.trim() == "Y" || value.trim() == "1" {
             return true;
         }
     }
-    fs::read_to_string("/proc/cmdline")
+    if fs::read_to_string("/proc/cmdline")
         .map(|c| {
             c.split_whitespace()
                 .any(|a| a == "module.sig_enforce=1" || a == "module.sig_enforce")
         })
         .unwrap_or(false)
+    {
+        return true;
+    }
+    kernel_config_text().is_some_and(|text| config_module_sig_force(&text))
+}
+
+/// C-30 ②：判定内核配置文本是否强制模块签名（`CONFIG_MODULE_SIG_FORCE=y`）。
+/// Whether a kernel config text enforces module signing (`CONFIG_MODULE_SIG_FORCE=y`).
+///
+/// 只认未注释的赋值行；`# CONFIG_MODULE_SIG_FORCE is not set` 视为**未强制**。
+pub fn config_module_sig_force(config_text: &str) -> bool {
+    config_text
+        .lines()
+        .any(|line| line.trim() == "CONFIG_MODULE_SIG_FORCE=y")
+}
+
+/// 读取当前内核配置文本：`/proc/config.gz`（通常可读）优先，回退 `/boot/config-<kver>`。
+/// Read the running kernel config text: `/proc/config.gz` first, then `/boot/config-<kver>`.
+fn kernel_config_text() -> Option<String> {
+    if let Ok(file) = fs::File::open("/proc/config.gz") {
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut text = String::new();
+        if decoder.read_to_string(&mut text).is_ok() {
+            return Some(text);
+        }
+    }
+    fs::read_to_string(format!("/boot/config-{}", kernel_release())).ok()
 }
 
 /// 一对 MOK 密钥（私钥 + DER 证书），用于给还原的模块签名。
@@ -823,8 +872,9 @@ pub fn mok_keys() -> Vec<MokKeyPair> {
     found
 }
 
-/// 返回可用的模块签名命令（优先 `kmodsign`，其次内核头里的 `sign-file`）。
-/// Return an available module signing command (`kmodsign` first, then `sign-file`).
+/// 返回可用的模块签名命令（内核树的 `sign-file` → PATH 的 `sign-file` → `kmodsign`）。
+/// Return an available module signing command (kernel-tree `sign-file`, then PATH
+/// `sign-file`, then `kmodsign`).
 ///
 /// 返回值中的 `args_prefix` 形如 `["sha256"]`（`sign-file` 需要算法参数，
 /// `kmodsign` 则不需要，调用方按需拼接 私钥/证书/模块路径）。
@@ -834,7 +884,10 @@ pub fn sign_tool(kernel_release: &str) -> Option<(String, Vec<String>)> {
     //   sign-file sha256 <key> <x509> <module>        （内核源码树 scripts/sign-file）
     //   kmodsign  sha256 <key> <x509> <module>        （Debian/Ubuntu 的 sbsigntool 版）
     // 因此统一返回前缀 ["sha256"]，调用方再拼 私钥/证书/模块路径。
-    // 优先 sign-file（各发行版行为一致），其次 kmodsign。
+    //
+    // C-30 ③：文档曾称"优先 kmodsign"而实现优先 `sign-file`，此处以**实现为准**定稿：
+    // 优先目标内核自带的 `sign-file`（与内核 ABI 匹配最可靠），再回退 PATH 中的
+    // `sign-file`，最后才是 Debian/Ubuntu 的 `kmodsign` 包装。两者参数完全一致。
     let candidates = [
         format!("/usr/src/linux-headers-{kernel_release}/scripts/sign-file"),
         format!("/lib/modules/{kernel_release}/build/scripts/sign-file"),
@@ -1085,7 +1138,11 @@ mod tests {
     fn mok_keys_are_valid_pairs_when_present() {
         for pair in mok_keys() {
             assert!(pair.private.is_file(), "私钥必须存在：{:?}", pair.private);
-            assert!(pair.certificate.is_file(), "证书必须存在：{:?}", pair.certificate);
+            assert!(
+                pair.certificate.is_file(),
+                "证书必须存在：{:?}",
+                pair.certificate
+            );
         }
     }
 
@@ -1159,7 +1216,10 @@ HOME_URL=\"https://www.ubuntu.com/\"
     fn unknown_when_neither_id_nor_id_like_match() {
         let d = parse_os_release("ID=plan9\nID_LIKE=\"weirdos\"\nPRETTY_NAME=\"Plan 9\"\n");
         assert_eq!(d.family, Family::Unknown);
-        assert_eq!(d.pretty_name, "Plan 9", "未知发行版仍保留 pretty_name 供展示");
+        assert_eq!(
+            d.pretty_name, "Plan 9",
+            "未知发行版仍保留 pretty_name 供展示"
+        );
         // 完全没有 ID 字段也是 Unknown
         assert_eq!(parse_os_release("").family, Family::Unknown);
     }
@@ -1167,7 +1227,13 @@ HOME_URL=\"https://www.ubuntu.com/\"
     #[test]
     fn mapping_table_matches_design_4_1() {
         for id in [
-            "ubuntu", "debian", "linuxmint", "pop", "elementary", "kali", "raspbian",
+            "ubuntu",
+            "debian",
+            "linuxmint",
+            "pop",
+            "elementary",
+            "kali",
+            "raspbian",
         ] {
             assert_eq!(Family::from_token(id), Some(Family::Debian), "{id}");
         }
@@ -1178,12 +1244,18 @@ HOME_URL=\"https://www.ubuntu.com/\"
             assert_eq!(Family::from_token(id), Some(Family::Arch), "{id}");
         }
         assert_eq!(Family::from_token("suse"), None);
-        assert_eq!(Family::from_token("UBUNTU"), Some(Family::Debian), "大小写不敏感");
+        assert_eq!(
+            Family::from_token("UBUNTU"),
+            Some(Family::Debian),
+            "大小写不敏感"
+        );
     }
 
     #[test]
     fn family_label_and_display_are_human_readable() {
-        let mut d = parse_os_release("ID=linuxmint\nVERSION_ID=\"22.3\"\nPRETTY_NAME=\"Linux Mint 22.3\"\n");
+        let mut d = parse_os_release(
+            "ID=linuxmint\nVERSION_ID=\"22.3\"\nPRETTY_NAME=\"Linux Mint 22.3\"\n",
+        );
         assert_eq!(d.family_label(), "Debian 系");
         // pretty_name 已含版本号 → 不再重复拼接
         assert_eq!(format!("{d}"), "Linux Mint 22.3 (Debian 系)");
@@ -1256,6 +1328,20 @@ HOME_URL=\"https://www.ubuntu.com/\"
         assert!(!arch().is_empty());
     }
 
+    /// C-30 ②：内核配置文本解析 —— 只认未注释的 `CONFIG_MODULE_SIG_FORCE=y`。
+    #[test]
+    fn config_module_sig_force_parses_only_active_setting() {
+        assert!(config_module_sig_force("CONFIG_MODULE_SIG_FORCE=y\n"));
+        assert!(config_module_sig_force("  CONFIG_MODULE_SIG_FORCE=y  \n"));
+        assert!(!config_module_sig_force(
+            "# CONFIG_MODULE_SIG_FORCE is not set\n"
+        ));
+        assert!(!config_module_sig_force(
+            "CONFIG_MODULE_SIG_FORCE=y is documented\n"
+        ));
+        assert!(!config_module_sig_force("CONFIG_MODULE_SIG=n\n"));
+    }
+
     /// C-43 ②：`has_cmd` 进程级缓存可清空且结果稳定（测试改动 PATH 前后须可重置）。
     #[test]
     fn has_cmd_cache_is_resettable() {
@@ -1263,7 +1349,10 @@ HOME_URL=\"https://www.ubuntu.com/\"
         let first = has_cmd("sh");
         reset_has_cmd_cache();
         assert_eq!(first, has_cmd("sh"), "缓存清空不改变 PATH 查询结果");
-        assert!(!has_cmd("ldb-no-such-binary-xyzzy"), "不存在的命令应为 false");
+        assert!(
+            !has_cmd("ldb-no-such-binary-xyzzy"),
+            "不存在的命令应为 false"
+        );
     }
 
     // ---- W4/C-20：目标根感知探测 API ----
@@ -1323,16 +1412,21 @@ HOME_URL=\"https://www.ubuntu.com/\"
         let efivars = base.join("sys/firmware/efi/efivars");
         fs::create_dir_all(&efivars).unwrap();
         // 属性 4 字节 + 值 1 字节（1 = 开启）
-        fs::write(efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"), [
-            0u8, 0, 0, 0, 1,
-        ])
+        fs::write(
+            efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            [0u8, 0, 0, 0, 1],
+        )
         .unwrap();
         assert!(secure_boot_state_at(&base).enabled, "efivars 值为 1 → 开启");
-        fs::write(efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"), [
-            0u8, 0, 0, 0, 0,
-        ])
+        fs::write(
+            efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            [0u8, 0, 0, 0, 0],
+        )
         .unwrap();
-        assert!(!secure_boot_state_at(&base).enabled, "efivars 值为 0 → 关闭");
+        assert!(
+            !secure_boot_state_at(&base).enabled,
+            "efivars 值为 0 → 关闭"
+        );
         // root="/" 与既有薄包装一致
         let a = secure_boot_state_at(Path::new("/"));
         let b = secure_boot_state();

@@ -23,7 +23,10 @@ fn bin() -> Command {
 /// 退出码 2：未知参数 / Unknown flag → usage error.
 #[test]
 fn unknown_flag_exits_two() {
-    let out = bin().arg("--definitely-not-a-flag").output().expect("spawn");
+    let out = bin()
+        .arg("--definitely-not-a-flag")
+        .output()
+        .expect("spawn");
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -37,13 +40,29 @@ fn unknown_flag_exits_two() {
 #[test]
 fn missing_or_invalid_value_exits_two() {
     let out = bin().args(["--restore"]).output().expect("spawn");
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let out = bin()
-        .args(["--helper-restore", "--archive", "a", "--on-immutable", "bogus"])
+        .args([
+            "--helper-restore",
+            "--archive",
+            "a",
+            "--on-immutable",
+            "bogus",
+        ])
         .output()
         .expect("spawn");
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// 退出码 0：`--version` 成功；`--scan --json` 输出可解析 JSON。
@@ -54,7 +73,12 @@ fn success_paths_exit_zero() {
     assert_eq!(out.status.code(), Some(0));
 
     let out = bin().args(["--scan", "--json"]).output().expect("spawn");
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
     assert!(parsed.get("entries").is_some());
@@ -71,10 +95,21 @@ fn declined_restore_prompt_exits_zero() {
     let archive = dir.join("a.tar.gz");
 
     let backup = bin()
-        .args(["--backup", "--out", archive.to_str().expect("utf8"), "--mode", "minimal"])
+        .args([
+            "--backup",
+            "--out",
+            archive.to_str().expect("utf8"),
+            "--mode",
+            "minimal",
+        ])
         .output()
         .expect("spawn");
-    assert_eq!(backup.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&backup.stderr));
+    assert_eq!(
+        backup.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
 
     let mut child = bin()
         .args(["--restore", "--archive", archive.to_str().expect("utf8")])
@@ -110,10 +145,20 @@ fn declined_restore_prompt_exits_zero() {
 fn failed_restore_exits_one() {
     // a) 归档不存在 → “读取归档失败” → 1
     let out = bin()
-        .args(["--restore", "--archive", "/nonexistent/ldb-nope.tar.gz", "--yes"])
+        .args([
+            "--restore",
+            "--archive",
+            "/nonexistent/ldb-nope.tar.gz",
+            "--yes",
+        ])
         .output()
         .expect("spawn");
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // b) 非 root 下 `--yes` 真实还原 → “需要 root” → 1（root 环境无法构造该失败，跳过）
     //    Non-root real restore hits the "requires root" gate → 1 (skipped when euid==0).
@@ -123,16 +168,32 @@ fn failed_restore_exits_one() {
         std::fs::create_dir_all(&dir).expect("tempdir");
         let archive = dir.join("a.tar.gz");
         let backup = bin()
-            .args(["--backup", "--out", archive.to_str().expect("utf8"), "--mode", "minimal"])
+            .args([
+                "--backup",
+                "--out",
+                archive.to_str().expect("utf8"),
+                "--mode",
+                "minimal",
+            ])
             .output()
             .expect("spawn");
         assert_eq!(backup.status.code(), Some(0));
 
         let out = bin()
-            .args(["--restore", "--archive", archive.to_str().expect("utf8"), "--yes"])
+            .args([
+                "--restore",
+                "--archive",
+                archive.to_str().expect("utf8"),
+                "--yes",
+            ])
             .output()
             .expect("spawn");
-        assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,10 +6,9 @@
 // [Frozen contract] Property/callback names below are frozen by DESIGN.md §4.6;
 //                  src/main.rs binds via the generated set_*/get_*/on_* API.
 //
-// 【控件来源】全部取自 "std-widgets.slint"。该套件不含文件对话框（DESIGN.md 核查：
-//             "无文件选择能力"），因此备份输出路径与还原归档路径由 LineEdit 手输。
-// [Widgets] Everything comes from std-widgets.slint, which ships no file dialog,
-//           so both paths are typed into LineEdit controls.
+// 【控件来源】基础控件取自 "std-widgets.slint"；文件选择由 Rust 侧 rfd 原生对话框提供
+//             （W6），LineEdit 仍可手输。 [Widgets] Base widgets come from std-widgets.slint;
+//           native file dialogs are provided by rfd on the Rust side (W6).
 //
 // 【线程约定】本文件只声明 UI；耗时工作（扫描/备份/还原）在 src/main.rs 里以
 //             std::thread 工作线程执行，经 slint::invoke_from_event_loop 回写属性。
@@ -28,6 +27,7 @@ export struct ModuleItem {
     kind: string,   // 分类 module | dkms | config | firmware / entry kind
     owner: string,  // W6：来源包，如 "dpkg:nvidia-dkms"（可空）
     vermagic: string, // W6：模块 ABI 指纹（可空）
+    depends: string, // W6/P1-5：空格分隔的依赖模块名（用于勾选依赖闭包，可空）
 }
 
 export component AppWindow inherits Window {

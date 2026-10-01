@@ -2404,7 +2404,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "linux-driver-backup"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "rfd",

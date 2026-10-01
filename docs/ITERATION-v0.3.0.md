@@ -201,6 +201,20 @@
 | 9 | GUI 文件对话框构建依赖就绪 | `pkg-config gtk+-3.0` → 3.24.41 存在 | ✅ rfd GTK 后端可构建（CI 需补 `libgtk-3-dev`） |
 | 10 | C-01/C-03/C-11/C-18/C-31/C-33/C-35 等结论 | 逐条复核源码（§1 标 ✅ 项） | ✅ 结论成立，纳入设计 |
 
+### 3.1.1 v0.3.0 实施结果 / Implementation result (v0.3.0)
+
+57 项审查发现全部落地（v0.2.1 热修 14 项 + W1–W9）：
+
+| 门禁 / Gate | 结果（本机 rustc 1.98.1） |
+|---|---|
+| `cargo test --no-fail-fast` | **197 passed / 0 failed**（186 单元 + 7 `exit_codes` + 4 `w7_cli`） |
+| `cargo clippy --all-targets -- -D warnings` | 零告警 |
+| `cargo fmt --check` | 通过（仓库已全量重排） |
+| 打包脚本 | `bash -n` + `shellcheck -x` 零告警；`.deb`/`tar`/PKGBUILD 渲染实测通过 |
+| 版本 | `Cargo.toml` = `0.3.0`；归档格式仍为 v2 |
+
+> 待容器/真机复核项见 §3.2（P-1…P-7）；其中 P-3/P-7 依赖桌面 VM / Arch / openSUSE 环境。
+
 ### 3.2 待容器/真机验证 / Pending (containers & QEMU)
 
 | # | 项 | 场景 | 归属 |

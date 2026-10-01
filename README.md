@@ -37,7 +37,23 @@
 - **GUI + CLI 双模 / Dual front-ends**：桌面环境用 Slint 图形界面；无显示环境、自动化脚本与 CI 冒烟测试用同一二进制的命令行参数完成扫描、备份与还原。*One binary, both a Slint GUI and a scriptable CLI.*
 - **单文件分发 / Single-file delivery**：`cargo build --release` 产出一个可执行文件，无需 Python / Qt / C++ 运行时；Slint 采用 `default-features = false` 裁剪特性并使用软件渲染，避免 OpenGL/EGL 依赖。*One stripped binary, no runtime toolchain required.*
 - **非破坏性还原 / Non-destructive restore**：还原前可先 `--dry-run` 预演（只打印计划、不写盘）；目标位置已存在同名文件时先备份为 `*.ldbak` 再覆盖；写入完成后强制执行 `depmod -a <kver>`（RHEL 系并补 `restorecon`），最后按发行版自适应更新 initramfs——没有 `depmod` 就不会有 `modules.dep`/`modules.alias`，还原等于无效。*Dry-run preview, `.ldbak` safety copies, mandatory `depmod`, then distro-adaptive initramfs update.*
-- **多线程流水作业 / Pipelined workers**：扫描 → 哈希 → 压缩三段式流水线（`std::thread` + 有界通道背压），进度实时回传、可随时取消，全程不阻塞 UI。*A three-stage pipeline keeps the UI responsive.*
+- **多线程流水作业 / Pipelined workers**：扫描 → 打包两段式流水线（哈希并入打包，单遍读，C-38），`std::thread` + 有界通道背压，进度实时回传、可随时取消，全程不阻塞 UI。*A two-stage pipeline keeps the UI responsive.*
+
+## v0.3.0 新增 / What's new in v0.3.0
+
+> 对应 [docs/ITERATION-v0.3.0.md](docs/ITERATION-v0.3.0.md) 的 W1–W9：还原事务完备化、扫描/元数据修复、离线还原收尾、
+> 固件按需收集、GUI 强化、CLI/配置、打包与 CI 加固。**归档格式仍为 v2**（仅语义收紧，字段只增不删）。
+> The W1–W9 work of the iteration document: transactional restore, scan/metadata fixes, offline restore,
+> on-demand firmware, GUI enhancements, CLI/config, packaging & CI. **Archive format stays v2.**
+
+- **还原事务完备化（W1）**：目录创建入 WAL、系统阶段失败默认自动回滚（`--no-auto-rollback-on-post` 可保留事务）、外部命令（`dkms install`/`akmods`/重装/`weak-modules`）逆序补偿、回滚文件名 URL 转义单射化、`run_id` 秒内唯一 + 孤儿清理 + 状态排他锁、`RestorePlan` 让 dry-run 与实跑统计同源、`inspect` 进程内缓存。
+- **离线还原（W4）**：`--root <目录>` 下发行版/vermagic/Secure Boot/不可变状态全部改为读取**目标根**；`--chroot-exec` 增加提前 root 预检。
+- **扫描修复（W3）**：`rpm -qf`/`modinfo` 批量化（消除数万次进程）、`kernel/` 子树链接不再误判、配置目录扩至 11 条、`/usr/lib/firmware` 回退、`dkms.conf` 的 `PACKAGE_NAME` 识别、告警去重封顶。
+- **备份单遍哈希（C-38）**：哈希与打包合并为一次读取，`manifest.sha256` 恒等于归档内实际字节；输出改为**同目录临时文件 + 成功后才原子替换**，失败不再毁掉旧备份（C-37）。
+- **固件按需收集（W5）**：新增 `--firmware all|needed|none`，按模块 `modinfo.firmware` 标签精选固件并写入 manifest。
+- **GUI 强化（W6）**：原生文件对话框（rfd）、勾选还原（含 `modinfo.depends` 依赖闭包）、策略与 `--strict-links`/`--no-sign`/`--on-immutable` 开关、扫描告警常驻面板、一键诊断包与回滚入口、行内显示 path/owner/vermagic。
+- **CLI 与配置（W7）**：新增 `--verify [ARCHIVE] [--json]`（逐条 SHA-256 体检）、`--require-verify`、`--diagnose [OUT]`（脱敏诊断包）、`--keep-rollback <n>`、`--config <f>`；零依赖配置文件 `/etc/linux-driver-backup.toml` 与 `~/.config/linux-driver-backup/config.toml`（6 键，CLI 旗标优先）。
+- **打包与 CI（W8/W9）**：版本/架构解析统一到 `packaging/lib/common.sh`；PKGBUILD 渲染 + `.SRCINFO`；RPM `--rpm-target fedora|suse|both`；polkit policy 随包安装；CI 新增 `fmt`/`clippy`/`shellcheck`/`desktop-file-validate`/`cargo audit`/MSRV/安装冒烟与 aarch64 qemu，action 全部 pin 到 commit SHA。
 
 ## v0.2.1 修复 / What's fixed in v0.2.1
 

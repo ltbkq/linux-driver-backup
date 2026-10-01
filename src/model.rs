@@ -573,7 +573,9 @@ mod tests {
             tool_version: "0.2.0".to_string(),
             created_at: "2026-09-27T12:00:00Z".to_string(),
             kernel_release: "6.8.0-45-generic".to_string(),
-            kernel_vermagic: Some("6.8.0-45-generic SMP preempt mod_unload modversions".to_string()),
+            kernel_vermagic: Some(
+                "6.8.0-45-generic SMP preempt mod_unload modversions".to_string(),
+            ),
             arch: "x86_64".to_string(),
             distro: ManifestDistro {
                 id: "linuxmint".to_string(),
@@ -887,11 +889,7 @@ mod tests {
     fn command_entry_roundtrip_w1() {
         let entry = CommandEntry {
             program: "dkms".to_string(),
-            args: vec![
-                "install".to_string(),
-                "-m".to_string(),
-                "foo".to_string(),
-            ],
+            args: vec!["install".to_string(), "-m".to_string(), "foo".to_string()],
             undone_by: Some(vec![
                 "dkms".to_string(),
                 "remove".to_string(),

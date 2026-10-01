@@ -69,11 +69,7 @@ fn verify_healthy_archive_passes() {
     assert!(String::from_utf8_lossy(&text.stdout).contains("通过 / OK"));
 
     let json = bin_at(&dir)
-        .args([
-            "--verify",
-            archive.to_str().expect("utf8"),
-            "--json",
-        ])
+        .args(["--verify", archive.to_str().expect("utf8"), "--json"])
         .output()
         .expect("spawn verify json");
     assert_eq!(json.status.code(), Some(0));
@@ -140,8 +136,7 @@ fn diagnose_writes_a_bundle() {
         if name == "report.json" {
             let mut buf = String::new();
             entry.read_to_string(&mut buf).expect("read report");
-            let parsed: serde_json::Value =
-                serde_json::from_str(&buf).expect("report.json valid");
+            let parsed: serde_json::Value = serde_json::from_str(&buf).expect("report.json valid");
             assert!(parsed.get("kernel_release").is_some());
         }
         names.push(name);
@@ -183,7 +178,9 @@ fn config_out_dir_supplies_backup_default() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        produced.iter().any(|n| n.starts_with("driver-backup-") && n.ends_with(".tar.gz")),
+        produced
+            .iter()
+            .any(|n| n.starts_with("driver-backup-") && n.ends_with(".tar.gz")),
         "out_dir 内未生成归档: {produced:?}"
     );
 

@@ -117,20 +117,14 @@ fn merge_discovered(cfg: &mut Config, path: &Path) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(err) => {
-            eprintln!(
-                "警告 / warning: 无法读取配置 {}: {err}",
-                path.display()
-            );
+            eprintln!("警告 / warning: 无法读取配置 {}: {err}", path.display());
             return;
         }
     };
     match parse_kv(&text) {
         Ok(kv) => {
             if let Err(err) = apply(cfg, &kv) {
-                eprintln!(
-                    "警告 / warning: 配置 {} 无效: {err}",
-                    path.display()
-                );
+                eprintln!("警告 / warning: 配置 {} 无效: {err}", path.display());
             }
         }
         Err(err) => {
@@ -158,9 +152,9 @@ pub(crate) fn parse_kv(text: &str) -> Result<Vec<(String, String)>, String> {
                 no + 1
             ));
         }
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            format!("第 {} 行：缺少 `=` / missing `=`", no + 1)
-        })?;
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("第 {} 行：缺少 `=` / missing `=`", no + 1))?;
         let key = key.trim();
         if key.is_empty() || key.contains(char::is_whitespace) {
             return Err(format!("第 {} 行：键名非法 / invalid key", no + 1));
@@ -327,26 +321,10 @@ mod tests {
         assert!(parse_kv("mode = \" minimal \"\n").is_err() || true); // 空格串是合法字符串，由 apply 校验取值
 
         let mut cfg = Config::default();
-        assert!(apply(
-            &mut cfg,
-            &[("mode".into(), "huge".into())]
-        )
-        .is_err());
-        assert!(apply(
-            &mut cfg,
-            &[("firmware".into(), "yes".into())]
-        )
-        .is_err());
-        assert!(apply(
-            &mut cfg,
-            &[("typo_key".into(), "1".into())]
-        )
-        .is_err());
-        assert!(apply(
-            &mut cfg,
-            &[("keep_rollback".into(), "-3".into())]
-        )
-        .is_err());
+        assert!(apply(&mut cfg, &[("mode".into(), "huge".into())]).is_err());
+        assert!(apply(&mut cfg, &[("firmware".into(), "yes".into())]).is_err());
+        assert!(apply(&mut cfg, &[("typo_key".into(), "1".into())]).is_err());
+        assert!(apply(&mut cfg, &[("keep_rollback".into(), "-3".into())]).is_err());
     }
 
     /// 键值正确落地 + 未设键保持 `None`（向后兼容语义）。

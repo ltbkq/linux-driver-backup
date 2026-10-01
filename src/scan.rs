@@ -221,10 +221,7 @@ pub fn scan(opt: &ScanOptions<'_>) -> AppResult<ScanReport> {
             Some(fw) => walk_files(Path::new(fw), EntryKind::Firmware, opt, &mut report)?,
             None => push_warning(
                 &mut report,
-                format!(
-                    "固件目录不存在或不可读: {}",
-                    FIRMWARE_DIRS.join("、")
-                ),
+                format!("固件目录不存在或不可读: {}", FIRMWARE_DIRS.join("、")),
             ),
         }
     }
@@ -368,7 +365,10 @@ fn handle_symlink(abs: &Path, report: &mut ScanReport) {
     }
     // 目录符号链接：walkdir 默认不跟随，这里也明确跳过并记 warning。
     if abs.is_dir() {
-        push_warning(report, format!("跳过目录符号链接（不跟随）: {}", abs.display()));
+        push_warning(
+            report,
+            format!("跳过目录符号链接（不跟随）: {}", abs.display()),
+        );
         return;
     }
     let target = match fs::read_link(abs) {
@@ -591,7 +591,10 @@ fn collect_module_metadata(opt: &ScanOptions<'_>, report: &mut ScanReport) -> Ap
         return Ok(());
     }
     if !has_cmd("modinfo") {
-        push_warning(report, "未找到 modinfo 命令，跳过模块元数据收集".to_string());
+        push_warning(
+            report,
+            "未找到 modinfo 命令，跳过模块元数据收集".to_string(),
+        );
         return Ok(());
     }
     collect_module_metadata_with(opt.cancel, report, run_modinfo_batch)
@@ -1366,7 +1369,10 @@ mod tests {
             "usr/lib/modules/6.8.0/extra/bar.ko"
         );
         // 本来就相对的路径原样保留
-        assert_eq!(rel_path_of(Path::new("etc/depmod.d/x.conf")), "etc/depmod.d/x.conf");
+        assert_eq!(
+            rel_path_of(Path::new("etc/depmod.d/x.conf")),
+            "etc/depmod.d/x.conf"
+        );
         for p in [
             "/a/b.ko",
             "/etc/modprobe.d/z.conf",
@@ -1426,12 +1432,10 @@ mod tests {
 
         assert_eq!(report.skipped_in_tree, 2, "kernel/ 下两个 .ko 计为 in-tree");
         assert_eq!(report.entries.len(), 6, "kernel/ 之外的 .ko* 全部收录");
-        assert!(
-            report
-                .entries
-                .iter()
-                .all(|e| e.kind == EntryKind::Module && e.size == 2)
-        );
+        assert!(report
+            .entries
+            .iter()
+            .all(|e| e.kind == EntryKind::Module && e.size == 2));
         assert!(
             !report
                 .entries
@@ -1442,14 +1446,15 @@ mod tests {
         // (b)(c) rel_path 去前导 /，且与 abs_path 一致
         for e in &report.entries {
             assert!(!e.rel_path.starts_with('/'));
-            assert_eq!(e.rel_path, e.abs_path.to_string_lossy().trim_start_matches('/'));
+            assert_eq!(
+                e.rel_path,
+                e.abs_path.to_string_lossy().trim_start_matches('/')
+            );
         }
-        assert!(
-            report
-                .entries
-                .iter()
-                .any(|e| e.rel_path.ends_with("updates/dkms/nv.ko"))
-        );
+        assert!(report
+            .entries
+            .iter()
+            .any(|e| e.rel_path.ends_with("updates/dkms/nv.ko")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1466,7 +1471,11 @@ mod tests {
         let mut report = ScanReport::default();
         scan_module_root(&base.join("no-such-kver"), &opt, &mut report).expect("non-fatal");
         assert!(report.entries.is_empty());
-        assert_eq!(report.warnings.len(), 1, "目录不存在 → warning 而非整体失败");
+        assert_eq!(
+            report.warnings.len(),
+            1,
+            "目录不存在 → warning 而非整体失败"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1509,7 +1518,10 @@ mod tests {
         assert_eq!(report.entries.len(), 2);
         assert!(report.entries.iter().all(|e| e.kind == EntryKind::Config));
         assert!(report.entries.iter().all(|e| !e.rel_path.starts_with('/')));
-        assert!(report.entries.iter().any(|e| e.rel_path.ends_with("sub/bar.conf")));
+        assert!(report
+            .entries
+            .iter()
+            .any(|e| e.rel_path.ends_with("sub/bar.conf")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1543,7 +1555,11 @@ mod tests {
         let mut report = ScanReport::default();
         scan_dkms_in(&dkms_root, &usr_src, &opt, &mut report).expect("scan dkms");
 
-        assert_eq!(report.entries.len(), 6, "3 个 dkms 树文件 + 3 个匹配的 usr/src 文件");
+        assert_eq!(
+            report.entries.len(),
+            6,
+            "3 个 dkms 树文件 + 3 个匹配的 usr/src 文件"
+        );
         assert!(report.entries.iter().all(|e| e.kind == EntryKind::Dkms));
         assert!(report.entries.iter().all(|e| !e.rel_path.starts_with('/')));
         assert!(
@@ -1556,10 +1572,9 @@ mod tests {
         assert!(report.entries.iter().any(|e| e
             .rel_path
             .ends_with("var/lib/dkms/nvidia/550.129.03/modules/nvidia.ko")));
-        assert!(report
-            .entries
-            .iter()
-            .any(|e| e.rel_path.ends_with("usr/src/virtualbox-guest-dkms/dkms.conf")));
+        assert!(report.entries.iter().any(|e| e
+            .rel_path
+            .ends_with("usr/src/virtualbox-guest-dkms/dkms.conf")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1621,7 +1636,11 @@ mod tests {
         assert_eq!(links.len(), 1, "b.ko 必须按符号链接语义收录");
         let link = links[0];
         assert!(link.rel_path.ends_with("weak-updates/b.ko"));
-        assert_eq!(link.link_target.as_deref(), Some("a.ko"), "readlink 原样保存");
+        assert_eq!(
+            link.link_target.as_deref(),
+            Some("a.ko"),
+            "readlink 原样保存"
+        );
         assert_eq!(link.size, 0, "符号链接大小记为 0");
         assert!(link.content_stored);
         assert!(link.owner.is_none() && link.modinfo.is_none());
@@ -1759,10 +1778,8 @@ firmware: nvidia/2.bin
             "filename:       {path}\nvermagic:       6.8.0-45-generic SMP\n\
              firmware:       fw/a.bin\ndepends:        dep1, dep2\nsig_id:         PKCS#7\n"
         );
-        collect_module_metadata_with(None, &mut report, |_paths: &[PathBuf]| {
-            Ok(canned.clone())
-        })
-        .expect("collect");
+        collect_module_metadata_with(None, &mut report, |_paths: &[PathBuf]| Ok(canned.clone()))
+            .expect("collect");
 
         let info = report.entries[0].modinfo.as_ref().expect("metadata filled");
         assert_eq!(info.vermagic.as_deref(), Some("6.8.0-45-generic SMP"));
@@ -1826,10 +1843,21 @@ depends:        a
         }
         // 只返回第一个模块的块，其余两个缺失。
         collect_module_metadata_with(None, &mut report, |paths: &[PathBuf]| {
-            Ok(format!("filename:       {}\nvermagic: 6.8.0 SMP\n", paths[0].display()))
+            Ok(format!(
+                "filename:       {}\nvermagic: 6.8.0 SMP\n",
+                paths[0].display()
+            ))
         })
         .expect("collect");
-        assert_eq!(report.entries[0].modinfo.as_ref().unwrap().vermagic.as_deref(), Some("6.8.0 SMP"));
+        assert_eq!(
+            report.entries[0]
+                .modinfo
+                .as_ref()
+                .unwrap()
+                .vermagic
+                .as_deref(),
+            Some("6.8.0 SMP")
+        );
         assert!(report.entries[1].modinfo.is_none() && report.entries[2].modinfo.is_none());
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("未返回 2 个模块"));
@@ -1887,7 +1915,10 @@ diversion by foo from: /usr/lib/old
         assert_eq!(parsed.len(), 2, "diversion 行被忽略");
         assert_eq!(parsed[0].0, "linux-image-6.8.0-45-generic");
         assert_eq!(parsed[1].0, "nvidia-dkms-550");
-        assert_eq!(parsed[1].1, "/lib/modules/6.8.0-45-generic/updates/dkms/nvidia.ko");
+        assert_eq!(
+            parsed[1].1,
+            "/lib/modules/6.8.0-45-generic/updates/dkms/nvidia.ko"
+        );
     }
 
     /// P0-5：空输入与无路径行 → 空结果。
@@ -1977,7 +2008,10 @@ diversion by foo from: /usr/lib/old
         assert_eq!(owners[&paths[0]].package, "kmod-a");
         assert_eq!(owners[&paths[0]].version, "1.0-1");
         assert_eq!(owners[&paths[1]].package, "kmod-b");
-        assert!(owners.keys().all(|k| paths.contains(k)), "key 必须是原始路径");
+        assert!(
+            owners.keys().all(|k| paths.contains(k)),
+            "key 必须是原始路径"
+        );
     }
 
     /// C-24：`rpm -qf` 批量查询优先按"每个归属路径一行"关联，一次填入全部。
@@ -2033,10 +2067,7 @@ dash: /bin/sh, /usr/bin/sh
             parsed[0],
             ("coreutils".to_string(), "/usr/bin/env".to_string())
         );
-        assert_eq!(
-            parsed[2],
-            ("dash".to_string(), "/usr/bin/sh".to_string())
-        );
+        assert_eq!(parsed[2], ("dash".to_string(), "/usr/bin/sh".to_string()));
     }
 
     /// C-22：归属查询读 stdout 而不看退出码 —— exit≠0 仍返回输出，仅 spawn 失败返回 `None`。
@@ -2054,11 +2085,8 @@ dash: /bin/sh, /usr/bin/sh
         assert_eq!(out, "coreutils: /usr/bin/env\n");
 
         // 完全无输出（如 `-W` 查询的包不存在）→ 空串，解析自然得空、不影响其余包。
-        let empty = run_command_stdout(
-            "sh",
-            &[OsString::from("-c"), OsString::from("exit 1")],
-        )
-        .expect("非零退出但成功 spawn");
+        let empty = run_command_stdout("sh", &[OsString::from("-c"), OsString::from("exit 1")])
+            .expect("非零退出但成功 spawn");
         assert!(empty.is_empty());
 
         // spawn 失败（命令不存在）→ None。
@@ -2089,7 +2117,10 @@ dash: /bin/sh, /usr/bin/sh
             PathBuf::from("/usr/lib64/ld-linux-x86-64.so.2")
         );
         // 恰好只有根段时也不补尾斜杠
-        assert_eq!(usr_merge_normalize(Path::new("/lib")), PathBuf::from("/usr/lib"));
+        assert_eq!(
+            usr_merge_normalize(Path::new("/lib")),
+            PathBuf::from("/usr/lib")
+        );
     }
 
     /// C-23：只改写"根之后的第一个组件"，其余路径原样返回。
@@ -2203,8 +2234,7 @@ dash: /bin/sh, /usr/bin/sh
         fs::create_dir_all(base.join("nvidia")).unwrap(); // 只有 name，无 version
         fs::write(base.join("stray"), b"x").unwrap(); // 非目录忽略
 
-        let packages =
-            enumerate_dkms(&base, &mut ScanReport::default()).packages;
+        let packages = enumerate_dkms(&base, &mut ScanReport::default()).packages;
         let got: Vec<(String, String)> = packages
             .iter()
             .map(|p| (p.name.clone(), p.version.clone()))
@@ -2251,7 +2281,10 @@ dash: /bin/sh, /usr/bin/sh
 
         assert_eq!(report.entries.len(), 1, "只有 kernel/ 之外的 out.ko 收录");
         assert!(report.entries[0].rel_path.ends_with("updates/out.ko"));
-        assert_eq!(report.skipped_in_tree, 2, "kernel/ 下的 real.ko 与 link.ko 计为 in-tree");
+        assert_eq!(
+            report.skipped_in_tree, 2,
+            "kernel/ 下的 real.ko 与 link.ko 计为 in-tree"
+        );
         assert!(report.entries.iter().all(|e| e.kind == EntryKind::Module));
         let _ = fs::remove_dir_all(&base);
     }
@@ -2424,20 +2457,14 @@ dash: /bin/sh, /usr/bin/sh
     fn run_command_stdout_timeout_handles_exit_and_timeout() {
         let ok = run_command_stdout_timeout(
             "sh",
-            &[
-                OsString::from("-c"),
-                OsString::from("printf hi; exit 1"),
-            ],
+            &[OsString::from("-c"), OsString::from("printf hi; exit 1")],
             Duration::from_secs(5),
         );
         assert_eq!(ok.as_deref(), Some("hi"), "非零退出仍返回 stdout");
 
         let timed_out = run_command_stdout_timeout(
             "sh",
-            &[
-                OsString::from("-c"),
-                OsString::from("sleep 5; printf late"),
-            ],
+            &[OsString::from("-c"), OsString::from("sleep 5; printf late")],
             Duration::from_millis(150),
         );
         assert!(timed_out.is_none(), "超时必须返回 None 而非阻塞");

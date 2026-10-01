@@ -229,9 +229,8 @@ pub fn verify(archive: &Path) -> AppResult<VerifyReport> {
     let manifest_json = manifest_json.ok_or_else(|| {
         AppError::Format("归档缺少 manifest.json / archive has no manifest.json".to_string())
     })?;
-    let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|err| {
-        AppError::Format(format!("manifest.json 解析失败 / parse failed: {err}"))
-    })?;
+    let manifest: Manifest = serde_json::from_str(&manifest_json)
+        .map_err(|err| AppError::Format(format!("manifest.json 解析失败 / parse failed: {err}")))?;
     if !manifest.format_supported() {
         return Err(AppError::Format(format!(
             "归档格式版本 v{} 不受支持（当前支持 v{}–v{}）/ unsupported format version",
@@ -278,7 +277,8 @@ pub fn verify(archive: &Path) -> AppResult<VerifyReport> {
                     if me.kind != crate::model::EntryKind::Symlink {
                         issues.push(VerifyIssue {
                             path: me.path.clone(),
-                            problem: "类型不一致：manifest 非链接而归档为链接 / kind mismatch".to_string(),
+                            problem: "类型不一致：manifest 非链接而归档为链接 / kind mismatch"
+                                .to_string(),
                         });
                         continue;
                     }
@@ -498,7 +498,11 @@ mod tests {
             builder
                 .append_data(&mut header, format!("data/{rel}"), *bytes)
                 .expect("append data");
-            let sha = if tamper { "deadbeef".repeat(8) } else { hex_of(bytes) };
+            let sha = if tamper {
+                "deadbeef".repeat(8)
+            } else {
+                hex_of(bytes)
+            };
             entries_json.push(ManifestEntry {
                 path: (*rel).to_string(),
                 size: bytes.len() as u64,
@@ -715,10 +719,14 @@ mod tests {
                     .append_data(&mut header, path, &json[..])
                     .expect("append");
             } else if let Some(target) = link {
-                builder.append_link(&mut header, path, target).expect("append");
+                builder
+                    .append_link(&mut header, path, target)
+                    .expect("append");
             } else {
                 header.set_cksum();
-                builder.append_data(&mut header, path, &buf[..]).expect("append");
+                builder
+                    .append_data(&mut header, path, &buf[..])
+                    .expect("append");
             }
         }
         let enc = builder.into_inner().expect("tar finish");

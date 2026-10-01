@@ -99,6 +99,8 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
+# W6：原生文件对话框（归档/输出目录选择）。
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 
 [build-dependencies]
 slint-build = "1.18"
@@ -221,12 +223,11 @@ driver-backup-<kver>-<YYYYMMDD-HHMMSS>.tar.gz
 │  on_start_backup → as_weak().upgrade() → 启动 worker      │
 └───────────────┬──────────────────────────────────────────┘
                 │ std::thread::spawn
-┌───────────────▼─── 备份流水线（3 级，sync_channel 限流背压）──┐
+┌───────────────▼─── 备份流水线（2 级，sync_channel 限流背压）──┐
 │ Stage 1  Walker    ：walkdir 遍历 + 分类，产 ScanEntry       │
 │                      └─sync_channel(64)─┐                   │
-│ Stage 2  Hasher×N  ：读文件 + SHA-256（N= min(4, 可用核数)） │
-│                      └─sync_channel(64)─┐                   │
-│ Stage 3  Packer    ：单写者 GzEncoder<tar::Builder>，        │
+│ Stage 2  Packer    ：单写者 GzEncoder<tar::Builder>，        │
+│                      HashingReader 单遍读 + SHA-256（C-38），│
 │                      末尾追加 manifest.json                  │
 └───────┬─────────────────────────────────────────────────────┘
         │ mpsc::progress(f32, String)  +  Arc<AtomicBool> cancel
@@ -616,8 +617,6 @@ pub fn latest_journal(root: &Path) -> Option<PathBuf>;
 > 事务化解压（符号链接 / 来源包 / 回滚日志）→ 重建(DKMS/akmods) → 重装包 → weak-modules →
 > depmod → restorecon → Secure Boot 签名 → initramfs → 汇总**。
 
----
-
 ### 5.9 v0.2.1 增补契约 / v0.2.1 contract addendum
 
 > 安全与正确性热修 14 项（docs/ITERATION-v0.3.0.md §2.1）；归档格式不变，v1/v2 归档均可读。
@@ -661,6 +660,88 @@ pub fn check_elevatable(exe: &std::path::Path, allow_unsafe: bool) -> crate::mod
 ```
 
 **GUI（`ui/app_window.slint` 扩展，非冻结新增）**：属性 `confirm-visible` / `confirm-detail` / `restore-ack` 与回调 `confirm-restore` / `dismiss-confirm` —— 真实还原前的二次确认框（C-35，列出归档、内核/架构差异与写入警告）。
+
+
+---
+
+### 5.10 v0.3.0 增补契约 / v0.3.0 contract addendum
+
+> 兼容性与体验 + 审查强化（docs/ITERATION-v0.3.0.md §2.2，W1–W9）。**归档格式仍为 v2**：只加字段、不改语义（`sha256` 语义收紧为"归档内实际字节"）；退出码矩阵沿用 §5.9。
+
+**新增 CLI 旗标（`main.rs`）**
+
+```
+--verify [--archive] <f> [--json]     # 归档体检：逐条 SHA-256 + 内核/架构/vermagic（C-06）
+--require-verify                      # 还原前强制体检
+--firmware all|needed|none            # W5 固件按需收集（写入 manifest.firmware_policy）
+--diagnose [--out <f>]                # 脱敏诊断包 tar.gz（report.txt + report.json）
+--config <f>                          # 显式配置文件（内置 < /etc < ~/.config < --config < CLI）
+--keep-rollback <n>                   # 回滚保留代数
+--no-auto-rollback-on-post            # W1/C-14 逃生口：系统阶段失败不自动回滚
+--helper-rollback [last|<id>] [--root <dir>]   # 内部：GUI 回滚经 pkexec 重入
+```
+
+退出码：沿用 §5.9（`0` 成功/取消、`1` 失败、`2` 用法错误）；配置加载失败、缺 `--out` 且无 `out_dir` 均按用法错误（2）。
+
+**`model.rs`（新增类型）**
+
+```rust
+pub struct CommandEntry { pub program: String, pub args: Vec<String>, pub undone_by: Option<Vec<String>>, pub best_effort: bool, pub note: String }  // C-15
+pub struct PlannedEntry { pub path: String, pub kind: EntryKind, pub strategy: RestoreStrategy, pub content_stored: bool, pub size: u64, pub link_target: Option<String> }  // C-19
+pub struct RestorePlan { pub entries: Vec<PlannedEntry>, pub files: usize, pub links: usize, pub bytes: u64, pub firmware_skipped: usize, pub provided_skipped: usize, pub strategy_counts: Vec<(String, usize)>, pub notes: Vec<String> }
+pub struct Manifest { /* 既字段 */ pub firmware_policy: Option<String> }   // 规范串 all|needed|none
+```
+
+**`restore.rs`**
+
+```rust
+pub struct RestoreRequest {
+    /* 既字段 */
+    pub no_auto_rollback_on_post: bool,   // C-14（默认 false = 自动回滚）
+    pub keep_rollback: usize,
+    pub selected: Option<Vec<String>>,    // W6/P1-5：勾选还原的 manifest 相对路径（None = 全部）
+}
+// W1：目录创建入 WAL；外部命令经 CommandEntry 逆序补偿；run_id 秒内唯一 + 状态排他锁；
+//     plan_restore() 一次构造，dry-run 与 extract 同源（C-19/C-41/C-42/C-44）。
+// W4：run_restore 只 detect_at(root) 一次并传 family；immutability/Secure Boot/vermagic 走 *_at(root)。
+pub fn latest_journal(root: &Path) -> Option<PathBuf>;  // 既有冻结契约，行为按完整 run id 配对
+```
+
+**`distro.rs`（目标根感知，host 版为 `root="/"` 薄包装）**
+
+```rust
+pub fn detect_at(root: &Path) -> DistroInfo;
+pub fn module_roots_at(root: &Path) -> Vec<PathBuf>;
+pub fn reference_vermagic_at(root: &Path, kver: &str) -> Option<String>;
+pub fn immutability_at(root: &Path) -> Immutability;
+pub fn secure_boot_state_at(root: &Path) -> SecureBootState;
+pub fn config_module_sig_force(config_text: &str) -> bool;   // C-30 ②
+// C-30 ①：宿主 Secure Boot 优先直读 efivars，mokutil 仅回退；initramfs 命令矩阵扩展
+// （SUSE/Alpine/Void/Gentoo→探测；无法确定返回 None = 如实上报"跳过"）；has_cmd 进程级缓存（C-43）。
+```
+
+**`pathutil.rs`（W7/C-47，新模块）**：`restore.rs` 与 `backup.rs` 共用的路径校验唯一实现 ——
+`safe_rel_path` / `validate_rel_path` / `data_payload` / `normalize_join` / `LinkPlan` / `validate_link_target`
+（符号链接禁闭 C-01/C-02 同一规则，消除规则漂移）。
+
+**`privilege.rs`**
+
+```rust
+pub const ROLLBACK_FLAG: &str = "--helper-rollback";   // W6：GUI 回滚经 pkexec 重入
+pub fn run_helper_via_pkexec_with(flag: &str, args: &[String], progress: ProgressFn, cancel: Arc<AtomicBool>) -> AppResult<String>;
+// C-04：helper 侧监听 stdin EOF 取消；主进程优雅关闭写端 → 宽限 → 进程组 TERM。
+```
+
+**`main.rs`（C-45 收敛）**：`RestoreOptions` 为 `--restore` 与 `--helper-restore` 共用的唯一结构体，
+经 `RestoreOptions::to_request(progress, cancel) -> restore::RestoreRequest` 转换（取代 helper 的 12 个位置参数）。
+
+**GUI（`ui/app_window.slint` 扩展，非冻结新增）**：`ModuleItem` 增 `selected`/`owner`/`vermagic`/`depends` 列；
+属性 `strategy-index`/`strict-links`/`no-sign`/`on-immutable`/`warnings-text`；回调 `pick-archive`/`pick-out-path`/`diagnose`/`rollback`（W6）。
+
+**配置文件（W7/P1-8）**：TOML 子集，6 键 `mode`/`out_dir`/`keep_rollback`/`sign_key`/`firmware`/`strategy`；
+层级：内置 < `/etc/linux-driver-backup.toml` < `~/.config/linux-driver-backup/config.toml` < `--config` < CLI 旗标。
+
+---
 
 ---
 

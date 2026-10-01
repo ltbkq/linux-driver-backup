@@ -97,7 +97,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -115,6 +115,7 @@ use crate::model::{
     Manifest, ManifestDistro, ManifestEntry, ProgressFn, RestoreStrategy, ScanEntry, ScanReport,
     MANIFEST_FORMAT_VERSION,
 };
+use crate::pathutil::{validate_link_target, validate_rel_path};
 use crate::scan::{scan, ScanOptions};
 
 /// Walker 发给哈希阶段的任务：`(扫描序号, 条目)`。
@@ -1340,196 +1341,6 @@ impl Read for HashingReader<'_> {
     }
 }
 
-/// 校验归档内相对路径：拒绝 `..`、绝对路径、空路径与 NUL。
-/// Validate an in-archive relative path: reject `..`, absolute paths, empties and NULs.
-fn validate_rel_path(rel: &str) -> AppResult<()> {
-    if rel.is_empty() {
-        return Err(AppError::Format(
-            "归档内路径为空 / empty relative path".to_string(),
-        ));
-    }
-    if rel.starts_with('/') {
-        return Err(AppError::Format(format!(
-            "归档内路径不得以 / 开头 / absolute path not allowed: {rel}"
-        )));
-    }
-    if rel.contains('\0') {
-        return Err(AppError::Format(format!(
-            "归档内路径含 NUL 字节 / NUL byte in path: {rel}"
-        )));
-    }
-    // 冗余的字面 `..` 检查（DESIGN.md §4.5）：任何形态的父目录跳转都被拒绝。
-    // 注意：只拒绝"作为路径组件出现"的 `..`（等价于下面 components() 的 ParentDir），
-    // 文件名里内嵌两个点（如 `foo..bar`）不是越界路径，不应误伤。
-    for seg in rel.split('/') {
-        if seg == ".." {
-            return Err(AppError::Format(format!(
-                "归档内路径含 `..` 组件 / parent-directory component not allowed: {rel}"
-            )));
-        }
-    }
-    for c in Path::new(rel).components() {
-        match c {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => {
-                return Err(AppError::Format(format!(
-                    "归档内路径含非法组件 / unsafe path component: {rel}"
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 受管前缀（`rel_path` 命名空间）：符号链接目标归一化后必须落在其中之一。
-/// Managed prefixes in the `rel_path` namespace; a symlink target must stay within one.
-const MANAGED_LINK_PREFIXES: [&str; 2] = ["lib/modules/", "usr/lib/modules/"];
-
-/// C-01：`etc/` 下符号链接目标归一化后的**绝对路径白名单**（必须落在其中之一）。
-/// C-01: whitelist of absolute prefixes an `etc/` symlink target may resolve into.
-///
-/// 覆盖实测合法样例（`/lib/linux-sound-base/…`）、usr-merge 的 `/usr/lib/…` 以及
-/// `/etc/…`、`/usr/share/…`、`/run/…` 别名；`/`、`/home/…` 等一律拒绝。
-/// 与 `restore.rs::validate_link_target` 的同名常量保持一致——v0.3.0 由 W7/C-47
-/// 合并为共享函数，v0.2.1 按 ITERATION §4-W0-A 先各自实现并互相指认。
-const ALLOWED_ETC_LINK_PREFIXES: [&str; 5] =
-    ["/etc/", "/lib/", "/usr/lib/", "/usr/share/", "/run/"];
-
-/// C-01: lexically resolve a symlink target to an absolute path rooted at the
-/// archive root: relative targets are joined onto the link's own directory first;
-/// `..` is rejected when it would climb above the root for relative targets and
-/// pinned at `/` for absolute ones. `None` means "escapes the archive root".
-/// C-01：把符号链接目标**词法**解析为以归档根为基准的绝对路径（不访问文件系统）：
-/// 相对目标先拼到链接所在目录；相对目标的 `..` 越出根即返回 `None`，
-/// 绝对目标的 `/..` 则停在根。例：`("etc/a/b.conf", "../x")` → `Some("/etc/x")`。
-fn resolve_link_abs(link_rel: &str, target: &str) -> Option<String> {
-    let absolute = target.starts_with('/');
-    let mut stack: Vec<&str> = Vec::new();
-    if !absolute {
-        if let Some(i) = link_rel.rfind('/') {
-            for seg in link_rel[..i].split('/') {
-                if !seg.is_empty() && seg != "." {
-                    stack.push(seg);
-                }
-            }
-        }
-    }
-    for seg in target.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if stack.pop().is_none() && !absolute {
-                    // 相对目标越出归档根（如 `etc/x -> ../../../../..`）→ 拒绝。
-                    return None;
-                }
-            }
-            other => stack.push(other),
-        }
-    }
-    Some(format!("/{}", stack.join("/")))
-}
-
-/// 校验符号链接目标：拒绝绝对路径与越界目标，归一化后须仍落在受管前缀内。
-/// Validate a symlink target: reject absolute or escaping targets; after lexical
-/// normalization it must still reside under a managed prefix.
-///
-/// 允许 `..` 组件（RHEL/SUSE 的 `weak-updates/<m>.ko -> ../../<other-kver>/extra/<m>.ko`
-/// 正依赖它），但以 `link_rel` 所在目录为起点做**纯词法归一化**（不触碰文件系统）：
-/// 一旦越过归档根即判为 [`AppError::Format`]。同时拒绝空目标、含 NUL、以 `/` 开头的目标。
-fn validate_link_target(link_rel: &str, target: &str) -> AppResult<()> {
-    // ---- C-01/C-02 符号链接禁闭（与 restore.rs::validate_link_target 同步实施）----
-    // `/etc` 下存在**绝对目标**的系统配置别名（如 /etc/modprobe.d/blacklist-oss.conf
-    // -> /lib/linux-sound-base/noOSS.modprobe.conf），这类目标继续放行；但旧实现对
-    // `..` 越根与任意绝对路径（`/`、`/home/user/pwn`）也原样放行，恶意归档可借此
-    // 用 `data/etc/x -> /` + `data/etc/x/...` 条目以 root 任意写文件，故改为：
-    // 目标必须词法解析后仍落在 `etc/` 树内，或（绝对目标）位于允许前缀白名单。
-    if link_rel.starts_with("etc/") {
-        if target.trim().is_empty() {
-            return Err(AppError::Format(format!(
-                "符号链接目标为空：{}",
-                link_rel
-            )));
-        }
-        let resolved = resolve_link_abs(link_rel, target).ok_or_else(|| {
-            AppError::Format(format!(
-                "符号链接目标越出归档根 / link target escapes archive root: {link_rel} -> {target}"
-            ))
-        })?;
-        // (a) 仍在 `etc/` 树内（如 etc/modules-load.d/modules.conf -> ../modules）。
-        let in_etc_tree = resolved == "/etc" || resolved.starts_with("/etc/");
-        // (b) 绝对目标位于允许前缀白名单（含 usr-merge 的 /usr/lib/…）。
-        let in_whitelist = ALLOWED_ETC_LINK_PREFIXES
-            .iter()
-            .any(|p| resolved.as_str() == p.trim_end_matches('/') || resolved.starts_with(p));
-        if !(in_etc_tree || in_whitelist) {
-            return Err(AppError::Format(format!(
-                "符号链接目标越出允许前缀 / etc link target outside allowed prefixes: \
-                 {link_rel} -> {target} (normalized: {resolved})"
-            )));
-        }
-        return Ok(());
-    }
-    if target.is_empty() {
-        return Err(AppError::Format(format!(
-            "符号链接目标为空 / empty link target: {link_rel}"
-        )));
-    }
-    if target.contains('\0') {
-        return Err(AppError::Format(format!(
-            "符号链接目标含 NUL 字节 / NUL byte in link target: {link_rel}"
-        )));
-    }
-    if target.starts_with('/') {
-        return Err(AppError::Format(format!(
-            "符号链接目标不得为绝对路径 / absolute link target not allowed: {link_rel} -> {target}"
-        )));
-    }
-    let parent = match link_rel.rfind('/') {
-        Some(i) => &link_rel[..i],
-        None => "",
-    };
-    let combined = if parent.is_empty() {
-        target.to_string()
-    } else {
-        format!("{parent}/{target}")
-    };
-    let normalized = normalize_lexical(&combined).ok_or_else(|| {
-        AppError::Format(format!(
-            "符号链接目标越界 / link target escapes archive root: {link_rel} -> {target}"
-        ))
-    })?;
-    if MANAGED_LINK_PREFIXES
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-    {
-        Ok(())
-    } else {
-        Err(AppError::Format(format!(
-            "符号链接目标不在受管前缀内 / link target outside managed prefixes: {link_rel} -> {target}"
-        )))
-    }
-}
-
-/// 词法归一化相对路径（不访问文件系统）；因 `..` 越出根时返回 `None`。
-/// Lexically normalize a relative path (no filesystem access); `None` when `..` escapes the root.
-fn normalize_lexical(path: &str) -> Option<String> {
-    let mut stack: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                stack.pop()?;
-            }
-            other => stack.push(other),
-        }
-    }
-    if stack.is_empty() {
-        None
-    } else {
-        Some(stack.join("/"))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 进度与时间工具 / progress & time helpers
 // ---------------------------------------------------------------------------
@@ -1964,9 +1775,7 @@ mod tests {
         )
         .is_ok());
         // 模块目录下仍不允许绝对目标
-        assert!(
-            validate_link_target("lib/modules/6.8/a.ko", "/etc/shadow").is_err()
-        );
+        assert!(validate_link_target("lib/modules/6.8/a.ko", "/etc/shadow").is_err());
         // 同目录相对目标
         assert!(validate_link_target("lib/modules/6.8.0/extra/a.ko", "b.ko").is_ok());
     }
@@ -1980,9 +1789,7 @@ mod tests {
         // C-01：`/etc` 下的链接也不再"原样放行"——越出归档根的相对目标必须拒绝，
         // 否则恶意归档可用 `data/etc/x -> ../../../../..` + 后续条目做禁闭逃逸
         // （链接自身路径合法并不足够，解析后的目标同样要受约束）。
-        assert!(
-            validate_link_target("etc/modprobe.d/x.conf", "../../../../etc/shadow").is_err()
-        );
+        assert!(validate_link_target("etc/modprobe.d/x.conf", "../../../../etc/shadow").is_err());
         // 归一化后落在受管前缀之外
         assert!(validate_link_target(
             "lib/modules/6.8.0/weak-updates/foo.ko",
@@ -2029,11 +1836,7 @@ mod tests {
         // usr-merge 形态
         assert!(validate_link_target("etc/x", "/usr/lib/foo").is_ok());
         // etc 树内的相对目标（modules-load.d → ../modules）
-        assert!(validate_link_target(
-            "etc/modules-load.d/modules.conf",
-            "../modules"
-        )
-        .is_ok());
+        assert!(validate_link_target("etc/modules-load.d/modules.conf", "../modules").is_ok());
 
         // 错误类型为 Format，且错误信息带归一化结果
         match validate_link_target("etc/x", "/home/user/pwn") {

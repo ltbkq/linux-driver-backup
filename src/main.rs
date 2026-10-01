@@ -19,6 +19,7 @@ mod config;
 mod diagnose;
 mod distro;
 mod model;
+mod pathutil;
 mod privilege;
 mod restore;
 mod scan;
@@ -26,12 +27,13 @@ mod verify;
 
 slint::include_modules!();
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
 use crate::distro::DistroInfo;
 use crate::model::{
@@ -90,7 +92,10 @@ enum Cmd {
         config: Option<String>,
     },
     /// `--rollback [last|<id>] [--root <dir>]`
-    Rollback { journal: Option<String>, root: Option<String> },
+    Rollback {
+        journal: Option<String>,
+        root: Option<String>,
+    },
     /// `--helper-restore --archive <f> [--kver <k>] [--with-firmware] …`（内部）。
     Helper {
         archive: String,
@@ -106,6 +111,8 @@ enum Cmd {
         chroot_exec: bool,
         /// 回滚保留代数（GUI 经参数透传，root 下读不到用户配置）。
         keep_rollback: Option<usize>,
+        /// W6/P1-5：勾选还原的路径清单文件（每行一个 manifest 相对路径；`None` = 全部）。
+        selected_file: Option<String>,
     },
     /// `--helper-rollback [last|<id>] [--root <dir>]`（内部，pkexec 重入）。
     HelperRollback {
@@ -260,7 +267,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     "--kver" => kver = Some(take_value(args, &mut idx, "--kver", inline)?),
                     "--firmware" => {
                         firmware = Some(parse_firmware(&take_value(
-                            args, &mut idx, "--firmware", inline,
+                            args,
+                            &mut idx,
+                            "--firmware",
+                            inline,
                         )?)?)
                     }
                     "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
@@ -298,9 +308,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
-                    "--archive" => {
-                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
-                    }
+                    "--archive" => archive = Some(take_value(args, &mut idx, "--archive", inline)?),
                     "--dry-run" => {
                         dry_run = true;
                         idx += 1;
@@ -333,8 +341,8 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                             "refuse" => false,
                             other => {
                                 return Err(format!(
-                                    "`--on-immutable` 取值非法：`{other}`（可选 refuse | usroverlay）"
-                                ))
+                                "`--on-immutable` 取值非法：`{other}`（可选 refuse | usroverlay）"
+                            ))
                             }
                         };
                     }
@@ -360,7 +368,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     }
                     "--keep-rollback" => {
                         keep_rollback = Some(parse_usize(&take_value(
-                            args, &mut idx, "--keep-rollback", inline,
+                            args,
+                            &mut idx,
+                            "--keep-rollback",
+                            inline,
                         )?)?)
                     }
                     "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
@@ -413,6 +424,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut kver: Option<String> = None;
             let mut with_firmware = false;
             let mut keep_rollback: Option<usize> = None;
+            let mut selected_file: Option<String> = None;
             let mut allow_kernel_mismatch = false;
             let mut allow_arch_mismatch = false;
             let mut root: Option<String> = None;
@@ -424,9 +436,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
-                    "--archive" => {
-                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
-                    }
+                    "--archive" => archive = Some(take_value(args, &mut idx, "--archive", inline)?),
                     "--kver" => kver = Some(take_value(args, &mut idx, "--kver", inline)?),
                     "--with-firmware" => {
                         with_firmware = true;
@@ -473,15 +483,20 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     }
                     "--keep-rollback" => {
                         keep_rollback = Some(parse_usize(&take_value(
-                            args, &mut idx, "--keep-rollback", inline,
+                            args,
+                            &mut idx,
+                            "--keep-rollback",
+                            inline,
                         )?)?)
+                    }
+                    "--selected-file" => {
+                        selected_file = Some(take_value(args, &mut idx, "--selected-file", inline)?)
                     }
                     other => return Err(format!("`--helper-restore` 不支持参数 `{other}`")),
                 }
             }
-            let archive = archive.ok_or_else(|| {
-                "`--helper-restore` 必须提供 `--archive <归档路径>`".to_string()
-            })?;
+            let archive = archive
+                .ok_or_else(|| "`--helper-restore` 必须提供 `--archive <归档路径>`".to_string())?;
             Ok(Cmd::Helper {
                 archive,
                 kver,
@@ -495,6 +510,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 no_sign,
                 chroot_exec,
                 keep_rollback,
+                selected_file,
             })
         }
         "--helper-rollback" => {
@@ -522,9 +538,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
-                    "--archive" => {
-                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
-                    }
+                    "--archive" => archive = Some(take_value(args, &mut idx, "--archive", inline)?),
                     "--json" => {
                         if inline.is_some() {
                             return Err("`--json` 不接受取值".to_string());
@@ -540,8 +554,9 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     other => return Err(format!("`--verify` 不支持参数 `{other}`")),
                 }
             }
-            let archive = archive
-                .ok_or_else(|| "`--verify` 需要归档路径（`--archive <f>` 或位置参数）".to_string())?;
+            let archive = archive.ok_or_else(|| {
+                "`--verify` 需要归档路径（`--archive <f>` 或位置参数）".to_string()
+            })?;
             Ok(Cmd::Verify { archive, json })
         }
         "--diagnose" => {
@@ -651,6 +666,46 @@ fn warnings_panel_text(warnings: &[String]) -> String {
     out
 }
 
+/// W6/P1-5：由 GUI 勾选状态计算要还原的路径集合（展开 `modinfo.depends` 依赖闭包）。
+/// Returns the selected restore paths, dependency-closed; `None` means "restore all".
+///
+/// 全部条目都勾选时返回 `None`（等价整档还原，避免生成大列表）。勾选 nvidia 会自动
+/// 带上 nvidia-uvm 等在 `depends` 中被引用的模块。
+fn selected_paths(ui: &AppWindow) -> Option<Vec<String>> {
+    let model = ui.get_modules();
+    let items: Vec<ModuleItem> = model.iter().collect();
+    if items.is_empty() || items.iter().all(|item| item.selected) {
+        return None;
+    }
+    let mut by_stem: HashMap<String, String> = HashMap::new();
+    for item in &items {
+        let stem = item.name.trim_end_matches(".ko").to_string();
+        by_stem.insert(stem, item.path.to_string());
+    }
+    let mut chosen: HashSet<String> = HashSet::new();
+    for item in &items {
+        if !item.selected {
+            continue;
+        }
+        chosen.insert(item.path.to_string());
+        let mut stack: Vec<String> = item
+            .depends
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        while let Some(dep) = stack.pop() {
+            if let Some(path) = by_stem.get(&dep) {
+                if chosen.insert(path.clone()) {
+                    if let Some(next) = items.iter().find(|x| x.path.as_str() == path.as_str()) {
+                        stack.extend(next.depends.split_whitespace().map(str::to_string));
+                    }
+                }
+            }
+        }
+    }
+    Some(chosen.into_iter().collect())
+}
+
 /// 条目分类的中文短标签，用于 GUI 列表。
 /// Short Chinese label for an entry kind, used by the GUI list.
 fn kind_label(kind: EntryKind) -> &'static str {
@@ -666,7 +721,10 @@ fn kind_label(kind: EntryKind) -> &'static str {
 /// 打印到 stderr 的 CLI 进度回调（200ms 或 1% 节流）。
 /// CLI progress callback printing to stderr, throttled to 200ms or 1%.
 fn cli_progress() -> ProgressFn {
-    let last = Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), -1.0f32)));
+    let last = Arc::new(Mutex::new((
+        Instant::now() - Duration::from_secs(10),
+        -1.0f32,
+    )));
     Arc::new(move |value: f32, msg: String| {
         let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
         let (at, previous) = *guard;
@@ -683,7 +741,10 @@ fn cli_progress() -> ProgressFn {
 /// GUI 进度回调：节流后经事件循环回写 `progress` / `status-text`。
 /// GUI progress callback: throttled, posted to the event loop to update the UI.
 fn gui_progress(weak: slint::Weak<AppWindow>) -> ProgressFn {
-    let last = Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), -1.0f32)));
+    let last = Arc::new(Mutex::new((
+        Instant::now() - Duration::from_secs(10),
+        -1.0f32,
+    )));
     Arc::new(move |value: f32, msg: String| {
         let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
         let (at, previous) = *guard;
@@ -768,6 +829,11 @@ fn to_module_items(report: &ScanReport) -> (Vec<ModuleItem>, bool, usize) {
             .as_ref()
             .and_then(|m| m.vermagic.clone())
             .unwrap_or_default();
+        let depends = entry
+            .modinfo
+            .as_ref()
+            .map(|m| m.depends.join(" "))
+            .unwrap_or_default();
         rows.push(ModuleItem {
             selected: true, // W6/P1-5：默认预选；依赖闭包在 Rust 侧展开
             name: name.into(),
@@ -776,6 +842,7 @@ fn to_module_items(report: &ScanReport) -> (Vec<ModuleItem>, bool, usize) {
             kind: kind_label(entry.kind).into(),
             owner: owner.into(),
             vermagic: vermagic.into(),
+            depends: depends.into(),
         });
     }
     let truncated = total > rows.len();
@@ -853,7 +920,12 @@ fn run_cli_scan(mode: Option<BackupMode>, json: bool, config: Option<String>) ->
 
 /// 输出 `--scan --json` 的 JSON 结构。
 /// Emit the JSON document for `--scan --json`.
-fn print_scan_json(report: &ScanReport, info: &DistroInfo, kver: &str, mode: BackupMode) -> Result<(), String> {
+fn print_scan_json(
+    report: &ScanReport,
+    info: &DistroInfo,
+    kver: &str,
+    mode: BackupMode,
+) -> Result<(), String> {
     use serde_json::json;
     let entries: Vec<serde_json::Value> = report
         .entries
@@ -1043,10 +1115,15 @@ fn run_cli_backup(
     }
 }
 
-/// `--restore` 的 CLI 选项集合（由 `Cmd::Restore` 解构而来）。
-/// CLI options for `--restore`, destructured from `Cmd::Restore`.
-struct RestoreCli {
+/// 还原选项集合：`--restore` 与 `--helper-restore` 共用的**唯一结构体**（C-45）。
+/// Restore option set shared by `--restore` and `--helper-restore` (C-45).
+///
+/// 两种 CLI 入口与 GUI 都以本结构体表达还原意图，并经 [`RestoreOptions::to_request`]
+/// 转换为 `restore::RestoreRequest`，消除原先 12 个位置参数的 helper 调用。
+struct RestoreOptions {
     archive: String,
+    /// `--helper-restore` 的目标内核（`--restore` 不用，交由 restore 侧自动决策）。
+    kver: Option<String>,
     dry_run: bool,
     yes: bool,
     with_firmware: bool,
@@ -1062,6 +1139,40 @@ struct RestoreCli {
     no_auto_rollback_on_post: bool,
     keep_rollback: Option<usize>,
     config: Option<String>,
+    /// 已解析的勾选路径（GUI 本地路径直接填；helper 从 `selected_file` 读出）。
+    selected: Option<Vec<String>>,
+    /// 勾选清单文件路径（仅 helper 传输用；读入 `selected` 后清空）。
+    selected_file: Option<String>,
+}
+
+impl RestoreOptions {
+    /// 由选项生成 `restore::RestoreRequest`（CLI / helper 共用，C-45）。
+    /// Build a `RestoreRequest` from these options (shared by CLI and helper).
+    fn to_request(&self, progress: ProgressFn, cancel: Arc<AtomicBool>) -> restore::RestoreRequest {
+        restore::RestoreRequest {
+            archive: expand_tilde(&self.archive),
+            kver: self.kver.clone(),
+            dry_run: self.dry_run,
+            allow_kernel_mismatch: self.allow_kernel_mismatch,
+            allow_arch_mismatch: self.allow_arch_mismatch,
+            no_auto_rollback_on_post: self.no_auto_rollback_on_post,
+            with_firmware: self.with_firmware,
+            root: self.root.as_deref().map(expand_tilde),
+            strategy: self.strategy,
+            on_immutable: if self.on_immutable {
+                restore::ImmutablePolicy::Usroverlay
+            } else {
+                restore::ImmutablePolicy::Refuse
+            },
+            strict_links: self.strict_links,
+            no_sign: self.no_sign,
+            chroot_exec: self.chroot_exec,
+            keep_rollback: self.keep_rollback.unwrap_or(restore::DEFAULT_KEEP_ROLLBACK),
+            selected: self.selected.clone(),
+            progress,
+            cancel,
+        }
+    }
 }
 
 /// `--restore`：校验并还原归档。
@@ -1071,7 +1182,7 @@ struct RestoreCli {
 /// （GUI 才自动提权）；`--dry-run` 不需要 root，始终可执行。
 /// Without root, the CLI never auto-elevates (only the GUI does): it tells the user to
 /// re-run with sudo. `--dry-run` needs no root and always works.
-fn run_cli_restore(opts: RestoreCli) -> i32 {
+fn run_cli_restore(mut opts: RestoreOptions) -> i32 {
     let path = expand_tilde(&opts.archive);
 
     // W7：配置补全默认策略 / 回滚代数（CLI 旗标永远优先）。
@@ -1082,11 +1193,8 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             return 2;
         }
     };
-    let strategy = opts.strategy.or(cfg.strategy);
-    let keep_rollback = opts
-        .keep_rollback
-        .or(cfg.keep_rollback)
-        .unwrap_or(restore::DEFAULT_KEEP_ROLLBACK);
+    opts.strategy = opts.strategy.or(cfg.strategy);
+    opts.keep_rollback = opts.keep_rollback.or(cfg.keep_rollback);
 
     // 普通权限即可读归档：先 inspect 用于打印确认信息与提示内核不一致。
     let info = match restore::inspect(&path) {
@@ -1146,7 +1254,7 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             info.manifest.compression.as_deref().unwrap_or("unknown")
         );
         println!("  条目 / entries : {}", info.manifest.entries.len());
-        if let Some(st) = strategy {
+        if let Some(st) = opts.strategy {
             // C-48：英文 label 与中文 label_zh 并存，此处消费英文文案。
             println!("  策略 / strategy : {}（{}）", st.label(), st.label_zh());
         }
@@ -1192,28 +1300,9 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         return 1;
     }
 
-    let request = restore::RestoreRequest {
-        archive: path,
-        kver: None,
-        dry_run: opts.dry_run,
-        allow_kernel_mismatch: opts.allow_kernel_mismatch,
-        allow_arch_mismatch,
-        no_auto_rollback_on_post: opts.no_auto_rollback_on_post,
-        with_firmware: opts.with_firmware,
-        root: opts.root.as_deref().map(expand_tilde),
-        strategy,
-        on_immutable: if opts.on_immutable {
-            restore::ImmutablePolicy::Usroverlay
-        } else {
-            restore::ImmutablePolicy::Refuse
-        },
-        strict_links: opts.strict_links,
-        no_sign: opts.no_sign,
-        chroot_exec: opts.chroot_exec,
-        keep_rollback,
-        progress: cli_progress(),
-        cancel: Arc::new(AtomicBool::new(false)),
-    };
+    // 交互确认（或 --dry-run 放行）后把架构不一致决议写回选项，再统一构造请求。
+    opts.allow_arch_mismatch = allow_arch_mismatch;
+    let request = opts.to_request(cli_progress(), Arc::new(AtomicBool::new(false)));
 
     match restore::run_restore(request) {
         Ok(report) => {
@@ -1278,20 +1367,7 @@ fn run_cli_rollback(journal: Option<String>, root: Option<String>) -> i32 {
 /// `--helper-restore`：`pkexec` 以 root 重入的无 GUI 分支，按行协议回传。
 /// `--helper-restore`: the GUI-less, root-only re-entry driven by pkexec.
 #[allow(clippy::too_many_arguments)]
-fn run_helper(
-    archive: String,
-    kver: Option<String>,
-    with_firmware: bool,
-    allow_kernel_mismatch: bool,
-    allow_arch_mismatch: bool,
-    root: Option<String>,
-    strategy: Option<RestoreStrategy>,
-    on_immutable: bool,
-    strict_links: bool,
-    no_sign: bool,
-    chroot_exec: bool,
-    keep_rollback: Option<usize>,
-) -> i32 {
+fn run_helper(mut opts: RestoreOptions) -> i32 {
     let sink_progress = privilege::HelperSink::new();
     let sink_result = privilege::HelperSink::new();
 
@@ -1341,7 +1417,8 @@ fn run_helper(
                         }
                         break;
                     }
-                    Ok(_) => { /* 保留字节读取以便未来握手；当前父进程只保持管道打开 */ }
+                    Ok(_) => { /* 保留字节读取以便未来握手；当前父进程只保持管道打开 */
+                    }
                     Err(_) => break,
                 }
             }
@@ -1352,28 +1429,31 @@ fn run_helper(
         sink_progress.progress(value, &msg);
     });
 
-    let request = restore::RestoreRequest {
-        archive: expand_tilde(&archive),
-        kver,
-        dry_run: false,
-        allow_kernel_mismatch,
-        allow_arch_mismatch,
-        no_auto_rollback_on_post: false, // helper 不暴露该逃生口（仅 CLI `--no-auto-rollback-on-post`）
-        with_firmware,
-        root: root.as_deref().map(expand_tilde),
-        strategy,
-        on_immutable: if on_immutable {
-            restore::ImmutablePolicy::Usroverlay
-        } else {
-            restore::ImmutablePolicy::Refuse
-        },
-        strict_links,
-        no_sign,
-        chroot_exec,
-        keep_rollback: keep_rollback.unwrap_or(restore::DEFAULT_KEEP_ROLLBACK),
-        progress,
-        cancel: Arc::clone(&cancel), // C-04：与 EOF 监听共享
+    // W6/P1-5：勾选清单由 GUI 写入临时文件经参数传来（避免超长 argv）。
+    opts.selected = match opts.selected_file.take() {
+        Some(raw) => {
+            let path = expand_tilde(&raw);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(err) => {
+                    sink_result.result(
+                        false,
+                        &format!("无法读取 --selected-file / cannot read selection: {err}"),
+                    );
+                    return 1;
+                }
+            }
+        }
+        None => None,
     };
+
+    let request = opts.to_request(progress, Arc::clone(&cancel)); // C-04：与 EOF 监听共享 cancel
 
     restore_started.store(true, Ordering::SeqCst);
     match restore::run_restore(request) {
@@ -1481,7 +1561,11 @@ fn run_gui() -> AppResult<()> {
             kver,
             info,
             distro::arch(),
-            if distro::is_root() { "root" } else { "普通用户" },
+            if distro::is_root() {
+                "root"
+            } else {
+                "普通用户"
+            },
             info.id,
             info.version_id
         )
@@ -1630,7 +1714,12 @@ fn run_gui() -> AppResult<()> {
                         });
                     }
                     Err(AppError::Cancelled) => {
-                        finish_gui(&weak_thread, &running_thread, false, "备份已取消。".to_string());
+                        finish_gui(
+                            &weak_thread,
+                            &running_thread,
+                            false,
+                            "备份已取消。".to_string(),
+                        );
                     }
                     Err(err) => {
                         finish_gui(
@@ -1672,6 +1761,8 @@ fn run_gui() -> AppResult<()> {
             let strict_links = ui.get_strict_links();
             let no_sign = ui.get_no_sign();
             let on_immutable = ui.get_on_immutable();
+            // W6/P1-5：把勾选（含依赖闭包）固化；全部选中时为 None（整档还原）。
+            let gui_selected = selected_paths(&ui);
             let path = expand_tilde(&archive);
 
             // 真实还原（非 dry-run）且尚未确认 → 先只读 inspect，再弹确认框（C-35）。
@@ -1796,6 +1887,7 @@ fn run_gui() -> AppResult<()> {
                         no_sign: true, // 预演不写盘、不签名
                         chroot_exec: false,
                         keep_rollback: gui_keep_rollback,
+                        selected: gui_selected.clone(),
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
@@ -1852,6 +1944,7 @@ fn run_gui() -> AppResult<()> {
                         no_sign,
                         chroot_exec: false,
                         keep_rollback: gui_keep_rollback,
+                        selected: gui_selected.clone(),
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
@@ -1907,11 +2000,33 @@ fn run_gui() -> AppResult<()> {
                         args.push("--on-immutable".to_string());
                         args.push("usroverlay".to_string());
                     }
-                    privilege::run_helper_via_pkexec(
+                    // W6/P1-5：勾选清单写入临时文件，经 `--selected-file` 传给 root helper，
+                    // 运行结束后删除（避免超长 argv）。
+                    let selected_file = gui_selected.as_ref().map(|list| {
+                        let nonce = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let file =
+                            std::env::temp_dir().join(format!(
+                                "ldb-selected-{}-{nonce:x}.txt",
+                                std::process::id()
+                            ));
+                        std::fs::write(&file, list.join("\n")).map(|_| file)
+                    });
+                    if let Some(Ok(file)) = &selected_file {
+                        args.push("--selected-file".to_string());
+                        args.push(file.to_string_lossy().into_owned());
+                    }
+                    let result = privilege::run_helper_via_pkexec(
                         &args,
                         progress,
                         Arc::clone(&cancel_thread),
-                    )
+                    );
+                    if let Some(Ok(file)) = selected_file {
+                        let _ = std::fs::remove_file(file);
+                    }
+                    result
                 };
 
                 match outcome {
@@ -2000,9 +2115,9 @@ fn run_gui() -> AppResult<()> {
                     ui.set_busy(false);
                     ui.set_progress(1.0);
                     match outcome {
-                        Ok(path) => ui.set_status_text(
-                            format!("诊断包已生成：{}", path.display()).into(),
-                        ),
+                        Ok(path) => {
+                            ui.set_status_text(format!("诊断包已生成：{}", path.display()).into())
+                        }
                         Err(err) => {
                             ui.set_status_text(format!("诊断收集失败：{err}").into());
                         }
@@ -2049,9 +2164,12 @@ fn run_gui() -> AppResult<()> {
                 };
                 match outcome {
                     Ok(message) => finish_gui(&weak_thread, &running_thread, true, message),
-                    Err(AppError::Cancelled) => {
-                        finish_gui(&weak_thread, &running_thread, false, "回滚已取消。".to_string())
-                    }
+                    Err(AppError::Cancelled) => finish_gui(
+                        &weak_thread,
+                        &running_thread,
+                        false,
+                        "回滚已取消。".to_string(),
+                    ),
                     Err(err) => finish_gui(
                         &weak_thread,
                         &running_thread,
@@ -2097,9 +2215,8 @@ fn run_gui() -> AppResult<()> {
         });
     }
 
-    app.run().map_err(|err| {
-        AppError::Privilege(format!("图形界面事件循环异常退出：{err}"))
-    })
+    app.run()
+        .map_err(|err| AppError::Privilege(format!("图形界面事件循环异常退出：{err}")))
 }
 
 // ===========================================================================
@@ -2151,7 +2268,7 @@ fn main() {
             no_auto_rollback_on_post,
             keep_rollback,
             config,
-        } => run_cli_restore(RestoreCli {
+        } => run_cli_restore(RestoreOptions {
             archive,
             dry_run,
             yes,
@@ -2168,6 +2285,9 @@ fn main() {
             no_auto_rollback_on_post,
             keep_rollback,
             config,
+            kver: None,
+            selected: None,
+            selected_file: None,
         }),
         Cmd::Rollback { journal, root } => run_cli_rollback(journal, root),
         Cmd::Helper {
@@ -2183,9 +2303,12 @@ fn main() {
             no_sign,
             chroot_exec,
             keep_rollback,
-        } => run_helper(
+            selected_file,
+        } => run_helper(RestoreOptions {
             archive,
             kver,
+            dry_run: false,
+            yes: false,
             with_firmware,
             allow_kernel_mismatch,
             allow_arch_mismatch,
@@ -2195,8 +2318,13 @@ fn main() {
             strict_links,
             no_sign,
             chroot_exec,
+            require_verify: false,
+            no_auto_rollback_on_post: false,
             keep_rollback,
-        ),
+            config: None,
+            selected: None,
+            selected_file,
+        }),
         Cmd::Verify { archive, json } => run_cli_verify(archive, json),
         Cmd::Diagnose { out } => run_cli_diagnose(out),
         Cmd::HelperRollback { journal, root } => run_helper_rollback(journal, root),
@@ -2222,6 +2350,52 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn restore_options_to_request_maps_all_fields() {
+        // C-45：CLI / helper 共用同一结构体与同一转换；此处覆盖全部字段映射。
+        let opts = RestoreOptions {
+            archive: "~/a.tar.gz".to_string(),
+            kver: Some("6.8.0".to_string()),
+            dry_run: false,
+            yes: false,
+            with_firmware: true,
+            allow_kernel_mismatch: true,
+            allow_arch_mismatch: true,
+            root: Some("~/mnt".to_string()),
+            strategy: Some(RestoreStrategy::Rebuild),
+            on_immutable: true,
+            strict_links: true,
+            no_sign: true,
+            chroot_exec: true,
+            require_verify: false,
+            no_auto_rollback_on_post: true,
+            keep_rollback: Some(7),
+            config: None,
+            selected: Some(vec!["lib/modules/x/a.ko".to_string()]),
+            selected_file: None,
+        };
+        let req = opts.to_request(
+            Arc::new(|_v: f32, _m: String| {}),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(req.archive.ends_with("a.tar.gz"));
+        assert_eq!(req.kver.as_deref(), Some("6.8.0"));
+        assert!(req.with_firmware && req.allow_kernel_mismatch && req.allow_arch_mismatch);
+        assert!(req.root.is_some());
+        assert_eq!(req.strategy, Some(RestoreStrategy::Rebuild));
+        assert!(matches!(
+            req.on_immutable,
+            restore::ImmutablePolicy::Usroverlay
+        ));
+        assert!(req.strict_links && req.no_sign && req.chroot_exec);
+        assert!(req.no_auto_rollback_on_post);
+        assert_eq!(req.keep_rollback, 7);
+        assert_eq!(
+            req.selected.as_deref(),
+            Some(&["lib/modules/x/a.ko".to_string()][..])
+        );
     }
 
     #[test]
@@ -2407,10 +2581,22 @@ mod tests {
                 config: None
             }
         );
-        assert!(parse_args(&args(&["--restore", "--archive", "a", "--strategy", "magic"])).is_err());
-        assert!(
-            parse_args(&args(&["--restore", "--archive", "a", "--on-immutable", "maybe"])).is_err()
-        );
+        assert!(parse_args(&args(&[
+            "--restore",
+            "--archive",
+            "a",
+            "--strategy",
+            "magic"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&[
+            "--restore",
+            "--archive",
+            "a",
+            "--on-immutable",
+            "maybe"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -2447,7 +2633,14 @@ mod tests {
                 config: Some("/etc/ldb.toml".to_string())
             }
         );
-        assert!(parse_args(&args(&["--restore", "--archive", "a", "--keep-rollback", "-1"])).is_err());
+        assert!(parse_args(&args(&[
+            "--restore",
+            "--archive",
+            "a",
+            "--keep-rollback",
+            "-1"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -2547,7 +2740,8 @@ mod tests {
                 strict_links: false,
                 no_sign: false,
                 chroot_exec: false,
-                keep_rollback: None
+                keep_rollback: None,
+                selected_file: None
             }
         );
         assert!(parse_args(&args(&["--helper-restore"])).is_err());
@@ -2565,7 +2759,10 @@ mod tests {
     #[test]
     fn tilde_and_labels_helpers() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        assert_eq!(expand_tilde("~/a.tar.gz"), PathBuf::from(&home).join("a.tar.gz"));
+        assert_eq!(
+            expand_tilde("~/a.tar.gz"),
+            PathBuf::from(&home).join("a.tar.gz")
+        );
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
         assert_eq!(kind_label(EntryKind::Module), "模块");
         assert_eq!(kind_label(EntryKind::Firmware), "固件");
@@ -2603,7 +2800,8 @@ mod tests {
         .unwrap();
         match parsed {
             Cmd::Restore {
-                allow_arch_mismatch, ..
+                allow_arch_mismatch,
+                ..
             } => assert!(allow_arch_mismatch),
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2616,7 +2814,8 @@ mod tests {
         .unwrap();
         match helper {
             Cmd::Helper {
-                allow_arch_mismatch, ..
+                allow_arch_mismatch,
+                ..
             } => assert!(allow_arch_mismatch),
             other => panic!("unexpected command: {other:?}"),
         }

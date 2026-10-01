@@ -115,10 +115,7 @@ pub fn parse_line(line: &str) -> Option<HelperMsg> {
                 "FAIL" => false,
                 _ => return None,
             };
-            Some(HelperMsg::Result(
-                ok,
-                it.next().unwrap_or("").to_string(),
-            ))
+            Some(HelperMsg::Result(ok, it.next().unwrap_or("").to_string()))
         }
         _ => None,
     }
@@ -436,8 +433,8 @@ pub fn run_helper_via_pkexec_with(
         let deadline = Instant::now() + CANCEL_GRACE;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,      // 已退出
-                Ok(None) => {}             // 仍在运行
+                Ok(Some(_)) => break, // 已退出
+                Ok(None) => {}        // 仍在运行
                 Err(_) => break,
             }
             if Instant::now() >= deadline {
@@ -629,7 +626,10 @@ mod tests {
             match err {
                 AppError::Privilege(m) => {
                     assert!(m.contains("已拒绝提权"), "{m}");
-                    assert!(m.contains("refusing to elevate a user-writable binary"), "{m}");
+                    assert!(
+                        m.contains("refusing to elevate a user-writable binary"),
+                        "{m}"
+                    );
                     assert!(m.contains("/usr"), "{m}");
                     assert!(m.contains("AppImage"), "{m}");
                     assert!(m.contains("LDB_ALLOW_UNSAFE_ELEVATION=1"), "{m}");

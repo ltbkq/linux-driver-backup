@@ -40,12 +40,12 @@ pub fn run(out: Option<&str>) -> AppResult<PathBuf> {
 
     let text = report_text();
     let json = serde_json::to_string_pretty(&report_json()).map_err(|err| {
-        AppError::Format(format!("诊断 JSON 序列化失败 / diagnose JSON failed: {err}"))
+        AppError::Format(format!(
+            "诊断 JSON 序列化失败 / diagnose JSON failed: {err}"
+        ))
     })?;
 
-    let file = fs::File::create(&path).map_err(|err| {
-        AppError::Io(err)
-    })?;
+    let file = fs::File::create(&path).map_err(AppError::Io)?;
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
 
@@ -62,11 +62,7 @@ pub fn run(out: Option<&str>) -> AppResult<PathBuf> {
 
 /// 写入一个文本 tar 条目（mtime=0、mode 0644，输出可复现）。
 /// Append one text member with deterministic metadata.
-fn append_text<W: Write>(
-    builder: &mut tar::Builder<W>,
-    name: &str,
-    bytes: &[u8],
-) -> AppResult<()> {
+fn append_text<W: Write>(builder: &mut tar::Builder<W>, name: &str, bytes: &[u8]) -> AppResult<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(bytes.len() as u64);
     header.set_mode(0o644);
