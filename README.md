@@ -13,6 +13,26 @@
 
 ---
 
+## v0.3.0 亮点 / Highlights in v0.3.0
+
+> 对应 [docs/ITERATION-v0.3.0.md](docs/ITERATION-v0.3.0.md) 的 W1–W9，共落地 57 项代码审查发现。**归档格式仍为 v2**（只加字段、语义收紧）。
+> The W1–W9 work of the iteration document: 57 review findings implemented. **Archive format stays v2.**
+
+- **归档体检 / Verify**：`--verify [ARCHIVE] [--json]` 逐条 SHA-256 校验 + 内核/架构/vermagic 比对；`--require-verify` 可在还原前强制体检。
+- **一键诊断 / Diagnose**：`--diagnose [OUT]` 生成脱敏 `tar.gz`（`report.txt` + `report.json`），含内核/发行版/Secure Boot/不可变状态/工具链/最近还原日志。
+- **配置文件 / Config**：`/etc/linux-driver-backup.toml` 与 `~/.config/linux-driver-backup/config.toml`，6 键，层级 内置 < 系统 < 用户 < `--config` < CLI 旗标。
+- **固件按需收集 / Firmware policy**：`--firmware all|needed|none`，按模块 `modinfo.firmware` 标签精选。
+- **GUI 强化 / GUI**：原生文件对话框（rfd）、勾选还原（含 `modinfo.depends` 依赖闭包）、策略与 `--strict-links`/`--no-sign`/`--on-immutable` 开关、扫描告警常驻面板、诊断包与回滚入口。
+- **还原事务完备化 / Transactional restore**：目录创建入 WAL、系统阶段失败默认自动回滚（`--no-auto-rollback-on-post` 可保留事务）、外部命令逆序补偿、`RestorePlan` 让 dry-run 与实跑统计同源。
+- **离线还原 / Offline restore**：`--root <目录>` 下发行版/vermagic/Secure Boot/不可变状态全部改读**目标根**。
+- **扫描修复 / Scan fixes**：`rpm -qf`/`modinfo` 批量化、usr-merge 归一化、配置面扩至 11 条、`/usr/lib/firmware` 回退、`dkms.conf` 的 `PACKAGE_NAME` 识别。
+- **备份单遍哈希 / Single-pass hashing**：哈希与打包合并为一次读取，`manifest.sha256` 恒等于归档内实际字节；输出改为同目录临时文件 + 成功后才原子替换（失败不再毁掉旧备份）。
+- **打包与 CI 加固 / Packaging & CI**：版本/架构解析统一到 `packaging/lib/common.sh`；PKGBUILD 渲染 + `.SRCINFO`；RPM `--rpm-target fedora|suse|both`；polkit policy 随包安装；CI 新增 `fmt`/`clippy`/`shellcheck`/`desktop-file-validate`/`cargo audit`/MSRV/安装冒烟与 aarch64 qemu。
+
+**质量门 / Gates**：`cargo test --locked` → 197 通过 / 0 失败；`cargo clippy --all-targets -- -D warnings` 零告警；`cargo fmt --check` 通过。
+
+---
+
 ## 目录 / Table of Contents
 
 - [功能特性 / Features](#功能特性--features)
