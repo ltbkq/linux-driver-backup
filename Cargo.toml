@@ -34,6 +34,10 @@ walkdir = "2"
 # W6：原生文件对话框（归档 / 输出目录）。GTK 后端；默认启用，无 GTK sysroot 的
 # 交叉编译/精简构建可用 `--no-default-features` 关闭（见 gui-dialogs 特性）。
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
+# W10：zstd 多线程压缩（`zstdmt`）。
+zstd = "0.14"
+# W11：age 流式加密（纯 Rust，无 GPG 依赖）。
+age = "0.11"
 
 [features]
 # 默认包含原生文件对话框（GTK 后端，CI 需 libgtk-3-dev）。

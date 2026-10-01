@@ -47,6 +47,8 @@ pub struct Config {
     pub sign_key: Option<String>,
     /// 固件收集策略（`all` | `needed` | `none`，W5）。
     pub firmware: Option<String>,
+    /// 压缩算法（`zstd` | `gzip` | `none`，W10）。
+    pub compression: Option<String>,
     /// 还原默认策略（`auto` = 自动决策 = `None`）。
     pub strategy: Option<RestoreStrategy>,
 }
@@ -256,6 +258,14 @@ fn apply(cfg: &mut Config, kv: &[(String, String)]) -> AppResult<()> {
                 cfg.keep_rollback = Some(n);
             }
             "sign_key" => cfg.sign_key = Some(value.clone()),
+            "compression" => match value.as_str() {
+                v @ ("zstd" | "gzip" | "none") => cfg.compression = Some(v.to_string()),
+                other => {
+                    return Err(AppError::Validation(format!(
+                        "配置键 compression 取值非法：`{other}`（可选 zstd | gzip | none）"
+                    )))
+                }
+            },
             "firmware" => match value.as_str() {
                 v @ ("all" | "needed" | "none") => cfg.firmware = Some(v.to_string()),
                 other => {

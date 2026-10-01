@@ -373,6 +373,12 @@ pub struct BackupRequest {
     /// Firmware collection policy (W5): `"all"` | `"needed"` | `"none"`;
     /// `None` keeps today's mode-driven behaviour (zero change).
     pub firmware_policy: Option<String>,
+    /// 压缩算法（v0.4.0 W10）：`"zstd"` | `"gzip"` | `"none"`；`None` = 默认 `zstd`。
+    /// Compression (W10): `"zstd"` | `"gzip"` | `"none"`; `None` = default `zstd`.
+    pub compression: Option<String>,
+    /// 加密（v0.4.0 W11）：`Some((scheme, recipient))`，`scheme` 为 `"age"` | `"gpg"`；`None` = 不加密。
+    /// Encryption (W11): `Some((scheme, recipient))`; `None` = unencrypted.
+    pub encryption: Option<(String, String)>,
     /// 进度回调 `0.0..1.0`。
     pub progress: ProgressFn,
     /// 取消标志：置位后流水线尽快停止并删除半成品。
@@ -423,6 +429,8 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         distro,
         mode,
         firmware_policy,
+        compression,
+        encryption,
         progress,
         cancel,
     } = req;
@@ -499,6 +507,8 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
                     &distro,
                     mode,
                     firmware_policy,
+                    compression,
+                    encryption,
                     &partial_started,
                 );
                 match outcome {
@@ -916,6 +926,8 @@ fn packer_main(
     distro: &DistroInfo,
     mode: BackupMode,
     firmware_policy: Option<FirmwarePolicy>,
+    compression: Option<String>,
+    encryption: Option<(String, String)>,
     partial_started: &AtomicBool,
 ) -> AppResult<PackerOutcome> {
     // C-37：写入同目录 partial（不是 out_file 本体），成功后才 rename 替换。
@@ -1018,6 +1030,13 @@ fn packer_main(
     let manifest = Manifest {
         format_version: MANIFEST_FORMAT_VERSION,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        // W11：加密头（v3）；缺省 None = 不加密。
+        encryption: encryption
+            .as_ref()
+            .map(|(scheme, recipient)| crate::model::ManifestEncryption {
+                scheme: scheme.clone(),
+                recipient: recipient.clone(),
+            }),
         created_at: utc_timestamp(now, false),
         kernel_release: kver.to_string(),
         kernel_vermagic: crate::distro::reference_vermagic(kver),
@@ -1086,6 +1105,7 @@ fn build_manifest_entry(
 ) -> ManifestEntry {
     ManifestEntry {
         path: entry.rel_path.clone(),
+        block: None, // W11：v3 内容寻址块 id（由 W11 写入路径填充）
         size,
         sha256,
         kind: entry.kind,

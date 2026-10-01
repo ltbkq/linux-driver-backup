@@ -66,6 +66,8 @@ enum Cmd {
         kver: Option<String>,
         firmware: Option<String>,
         config: Option<String>,
+        compression: Option<String>,
+        encryption: Option<(String, String)>,
     },
     /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`
     ///   `[--root <dir>] [--strategy <s>] [--on-immutable <p>] [--strict-links] [--no-sign] [--chroot-exec]`
@@ -155,6 +157,37 @@ fn parse_strategy(value: &str) -> Result<Option<RestoreStrategy>, String> {
             "`--strategy` 取值非法：`{other}`（可选 auto | rebuild | reinstall | weak-modules | copy）"
         )),
     }
+}
+
+/// 把 `--compress` 取值映射为压缩算法（W10 / ITERATION §4-W10）。
+/// Map the `--compress` value onto the compression algorithm.
+fn parse_compression(value: &str) -> Result<String, String> {
+    match value {
+        v @ ("zstd" | "gzip" | "none") => Ok(v.to_string()),
+        other => Err(format!(
+            "`--compress` 取值非法：`{other}`（可选 zstd | gzip | none）"
+        )),
+    }
+}
+
+/// 解析 `--encrypt <scheme:recipient>`（W11 / ITERATION §4-W11）。
+/// Parse `--encrypt <scheme:recipient>` into a (scheme, recipient) pair.
+fn parse_encryption(value: &str) -> Result<(String, String), String> {
+    let (scheme, recipient) = value.split_once(':').ok_or_else(|| {
+        format!("`--encrypt` 取值非法：`{value}`（格式 <scheme:recipient>，如 age:age1ql3z...）")
+    })?;
+    match scheme {
+        "age" | "gpg" => {}
+        other => {
+            return Err(format!(
+                "`--encrypt` 方案非法：`{other}`（可选 age | gpg）"
+            ))
+        }
+    }
+    if recipient.is_empty() {
+        return Err("`--encrypt` 接收方为空".to_string());
+    }
+    Ok((scheme.to_string(), recipient.to_string()))
 }
 
 /// 把 `--firmware` 取值映射为三态策略（W5 / ITERATION §4-W5）。
@@ -257,6 +290,8 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut kver: Option<String> = None;
             let mut firmware: Option<String> = None;
             let mut config: Option<String> = None;
+            let mut compression: Option<String> = None;
+            let mut encryption: Option<(String, String)> = None;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -274,6 +309,16 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         )?)?)
                     }
                     "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
+                    "--compress" => {
+                        compression = Some(parse_compression(&take_value(
+                            args, &mut idx, "--compress", inline,
+                        )?)?)
+                    }
+                    "--encrypt" => {
+                        encryption = Some(parse_encryption(&take_value(
+                            args, &mut idx, "--encrypt", inline,
+                        )?)?)
+                    }
                     other => return Err(format!("`--backup` 不支持参数 `{other}`")),
                 }
             }
@@ -285,6 +330,8 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 kver,
                 firmware,
                 config,
+                compression,
+                encryption,
             })
         }
         "--restore" => {
@@ -1059,6 +1106,8 @@ fn run_cli_backup(
     kver: Option<String>,
     firmware: Option<String>,
     config: Option<String>,
+    compression: Option<String>,
+    encryption: Option<(String, String)>,
 ) -> i32 {
     // W7：配置补全模式 / 输出目录 / 固件策略（CLI 旗标永远优先）。
     let cfg = match config::Config::load(config.as_deref()) {
@@ -1070,6 +1119,8 @@ fn run_cli_backup(
     };
     let mode = mode.or(cfg.mode).unwrap_or(BackupMode::Standard);
     let firmware_policy = firmware.or(cfg.firmware);
+    // W10：压缩算法（默认 zstd）；W11：加密与签名。
+    let compression = compression.or(cfg.compression);
     let kver = kver.unwrap_or_else(distro::kernel_release);
     let out_path = match out {
         Some(raw) => expand_tilde(&raw),
@@ -1091,6 +1142,8 @@ fn run_cli_backup(
         mode,
         progress: cli_progress(),
         firmware_policy,
+        compression,
+        encryption,
         cancel: Arc::new(AtomicBool::new(false)),
     };
 
@@ -1607,8 +1660,9 @@ fn run_gui() -> AppResult<()> {
         ))
     })?;
 
-    // W7：GUI 读取配置补全固件策略 / 回滚代数（GUI 没有 CLI 旗标，配置即默认）。
+    // W7：GUI 读取配置补全固件策略 / 回滚代数 / 压缩算法（GUI 没有 CLI 旗标，配置即默认）。
     let gui_cfg = config::Config::load(None).unwrap_or_default();
+    let gui_compression = gui_cfg.compression.clone();
 
     // ---- 启动时的静态信息 ----
     let kver = distro::kernel_release();
@@ -1748,11 +1802,14 @@ fn run_gui() -> AppResult<()> {
             let cancel_thread = Arc::clone(&cancel);
             // 内层线程 move 捕获，先克隆避免把 FnMut 闭包捕获的变量移走。
             let gui_firmware = gui_firmware.clone();
+            let gui_compression = gui_compression.clone();
             std::thread::spawn(move || {
                 let request = backup::BackupRequest {
                     out_file: out_path,
                     kver,
                     distro: DistroInfo::detect(),
+                    compression: gui_compression.clone(),
+                    encryption: None, // GUI 暂不暴露加密（CLI 专属）
                     mode,
                     progress,
                     firmware_policy: gui_firmware.clone(),
@@ -2276,7 +2333,9 @@ fn main() {
             kver,
             firmware,
             config,
-        } => run_cli_backup(out, mode, kver, firmware, config),
+            compression,
+            encryption,
+        } => run_cli_backup(out, mode, kver, firmware, config, compression, encryption),
         Cmd::Restore {
             archive,
             dry_run,
