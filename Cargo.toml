@@ -31,6 +31,9 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
+# W6：原生文件对话框（归档 / 输出目录）。GTK 后端，本机 gtk+-3.0 3.24 可用；
+# CI 需 libgtk-3-dev（W9）。ITERATION §3.3 依赖评估已选定 rfd。
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 
 [build-dependencies]
 slint-build = "1.18"

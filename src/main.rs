@@ -26,7 +26,7 @@ mod verify;
 
 slint::include_modules!();
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -106,6 +106,11 @@ enum Cmd {
         chroot_exec: bool,
         /// 回滚保留代数（GUI 经参数透传，root 下读不到用户配置）。
         keep_rollback: Option<usize>,
+    },
+    /// `--helper-rollback [last|<id>] [--root <dir>]`（内部，pkexec 重入）。
+    HelperRollback {
+        journal: Option<String>,
+        root: Option<String>,
     },
     /// `--verify --archive <f> [--json]`（或位置参数 `--verify <f>`）。
     Verify { archive: String, json: bool },
@@ -492,6 +497,24 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 keep_rollback,
             })
         }
+        "--helper-rollback" => {
+            let mut idx = 1;
+            let mut journal: Option<String> = None;
+            let mut root: Option<String> = None;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--root" => root = Some(take_value(args, &mut idx, "--root", inline)?),
+                    // 位置参数：`last` 或日志 id。
+                    other if !other.starts_with('-') && inline.is_none() => {
+                        journal = Some(other.to_string());
+                        idx += 1;
+                    }
+                    other => return Err(format!("`--helper-rollback` 不支持参数 `{other}`")),
+                }
+            }
+            Ok(Cmd::HelperRollback { journal, root })
+        }
         "--verify" => {
             let mut idx = 1;
             let mut archive: Option<String> = None;
@@ -595,6 +618,37 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// 还原策略 → CLI 取值 token（`--strategy` / helper 透传统一用此表）。
+/// Map a restore strategy to its CLI token (shared by `--strategy` and helper passthrough).
+fn strategy_token(strategy: RestoreStrategy) -> &'static str {
+    match strategy {
+        RestoreStrategy::Rebuild => "rebuild",
+        RestoreStrategy::Reinstall => "reinstall",
+        RestoreStrategy::WeakModules => "weak-modules",
+        RestoreStrategy::Copy => "copy",
+        RestoreStrategy::Skip => "skip",
+    }
+}
+
+/// 把扫描告警整理成 GUI 常驻面板文案（空则返回空串，面板自动隐藏）。
+/// Render scan warnings for the persistent GUI panel (empty string hides it).
+fn warnings_panel_text(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("扫描告警 / warnings（{}）：", warnings.len());
+    for warning in warnings.iter().take(8) {
+        out.push_str(&format!("\n  ⚠ {warning}"));
+    }
+    if warnings.len() > 8 {
+        out.push_str(&format!(
+            "\n  … 其余 {} 条见 `--diagnose` 诊断包",
+            warnings.len() - 8
+        ));
+    }
+    out
 }
 
 /// 条目分类的中文短标签，用于 GUI 列表。
@@ -704,11 +758,24 @@ fn to_module_items(report: &ScanReport) -> (Vec<ModuleItem>, bool, usize) {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| entry.rel_path.clone());
+        let owner = entry
+            .owner
+            .as_ref()
+            .map(|p| format!("{}:{}", p.manager, p.package))
+            .unwrap_or_default();
+        let vermagic = entry
+            .modinfo
+            .as_ref()
+            .and_then(|m| m.vermagic.clone())
+            .unwrap_or_default();
         rows.push(ModuleItem {
+            selected: true, // W6/P1-5：默认预选；依赖闭包在 Rust 侧展开
             name: name.into(),
             path: entry.rel_path.clone().into(),
             size: human_size(entry.size).into(),
             kind: kind_label(entry.kind).into(),
+            owner: owner.into(),
+            vermagic: vermagic.into(),
         });
     }
     let truncated = total > rows.len();
@@ -1331,6 +1398,58 @@ fn run_helper(
     }
 }
 
+/// `--helper-rollback`：`pkexec` 以 root 重入的无 GUI 回滚分支（W6 回滚入口）。
+/// `--helper-rollback`: the GUI-less root re-entry used to roll back the last restore.
+fn run_helper_rollback(journal: Option<String>, root: Option<String>) -> i32 {
+    let sink_progress = privilege::HelperSink::new();
+    let sink_result = privilege::HelperSink::new();
+
+    // C-07：特权入口必须自证合法性（与 `--helper-restore` 同一标准）。
+    let euid = unsafe { geteuid() };
+    if euid != 0 {
+        sink_result.result(
+            false,
+            "helper 必须以 root 运行 / helper must run as root (euid != 0)",
+        );
+        return 1;
+    }
+    if let Ok(raw) = std::env::var("PKEXEC_UID") {
+        if raw.parse::<u32>().is_err() {
+            sink_result.result(false, "PKEXEC_UID 非法 / invalid PKEXEC_UID");
+            return 1;
+        }
+    }
+
+    let root_path = root
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let journal_path = journal.as_deref().map(expand_tilde);
+    let progress: ProgressFn = Arc::new(move |value: f32, msg: String| {
+        sink_progress.progress(value, &msg);
+    });
+
+    match restore::run_rollback(&root_path, journal_path.as_deref(), progress) {
+        Ok(report) => {
+            for note in &report.notes {
+                sink_result.note(note);
+            }
+            sink_result.result(
+                true,
+                &format!(
+                    "回滚完成：恢复 {} 个文件，删除 {} 个链接",
+                    report.restored, report.removed
+                ),
+            );
+            0
+        }
+        Err(err) => {
+            sink_result.result(false, &err.to_string());
+            exit_code(&err)
+        }
+    }
+}
+
 // helper 自证所需的 `geteuid(2)`（裸 extern，避免为单个符号引入 libc 依赖）。
 // `geteuid(2)` for helper self-attestation (bare extern; no libc dependency).
 extern "C" {
@@ -1408,6 +1527,7 @@ fn run_gui() -> AppResult<()> {
                     ui.set_busy(false);
                     match outcome {
                         Ok(report) => {
+                            ui.set_warnings_text(warnings_panel_text(&report.warnings).into());
                             let (rows, truncated, total) = to_module_items(&report);
                             let modules = report
                                 .entries
@@ -1447,6 +1567,7 @@ fn run_gui() -> AppResult<()> {
                         }
                         Err(err) => {
                             ui.set_progress(0.0);
+                            ui.set_warnings_text("".into());
                             ui.set_status_text(format!("扫描失败：{err}").into());
                         }
                     }
@@ -1540,6 +1661,17 @@ fn run_gui() -> AppResult<()> {
                 return;
             }
             let dry_run = ui.get_dry_run();
+            // W6：GUI 能力对齐 CLI —— 策略与安全开关。
+            let strategy = match ui.get_strategy_index() {
+                1 => Some(RestoreStrategy::Rebuild),
+                2 => Some(RestoreStrategy::Reinstall),
+                3 => Some(RestoreStrategy::WeakModules),
+                4 => Some(RestoreStrategy::Copy),
+                _ => None,
+            };
+            let strict_links = ui.get_strict_links();
+            let no_sign = ui.get_no_sign();
+            let on_immutable = ui.get_on_immutable();
             let path = expand_tilde(&archive);
 
             // 真实还原（非 dry-run）且尚未确认 → 先只读 inspect，再弹确认框（C-35）。
@@ -1654,10 +1786,14 @@ fn run_gui() -> AppResult<()> {
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
-                        strategy: None,
-                        on_immutable: restore::ImmutablePolicy::Refuse,
-                        strict_links: false,
-                        no_sign: true,
+                        strategy,
+                        on_immutable: if on_immutable {
+                            restore::ImmutablePolicy::Usroverlay
+                        } else {
+                            restore::ImmutablePolicy::Refuse
+                        },
+                        strict_links,
+                        no_sign: true, // 预演不写盘、不签名
                         chroot_exec: false,
                         keep_rollback: gui_keep_rollback,
                         progress,
@@ -1706,10 +1842,14 @@ fn run_gui() -> AppResult<()> {
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
-                        strategy: None,
-                        on_immutable: restore::ImmutablePolicy::Refuse,
-                        strict_links: false,
-                        no_sign: false,
+                        strategy,
+                        on_immutable: if on_immutable {
+                            restore::ImmutablePolicy::Usroverlay
+                        } else {
+                            restore::ImmutablePolicy::Refuse
+                        },
+                        strict_links,
+                        no_sign,
                         chroot_exec: false,
                         keep_rollback: gui_keep_rollback,
                         progress,
@@ -1743,7 +1883,7 @@ fn run_gui() -> AppResult<()> {
                     // 新默认语义"以当前内核为目标"执行重建；旧分支传的正是默认值，是死逻辑。
                     // C-31: no `--kver` here — the helper defaults to the current kernel
                     // (rebuild-first); the old branch passed the default value, i.e. dead logic.
-                    let args = vec![
+                    let mut args = vec![
                         "--archive".to_string(),
                         path.to_string_lossy().to_string(),
                         "--with-firmware".to_string(),
@@ -1752,6 +1892,21 @@ fn run_gui() -> AppResult<()> {
                         "--keep-rollback".to_string(),
                         gui_keep_rollback.to_string(),
                     ];
+                    // W6：把 GUI 的策略与安全开关透传给提权 helper。
+                    if let Some(strategy) = strategy {
+                        args.push("--strategy".to_string());
+                        args.push(strategy_token(strategy).to_string());
+                    }
+                    if strict_links {
+                        args.push("--strict-links".to_string());
+                    }
+                    if no_sign {
+                        args.push("--no-sign".to_string());
+                    }
+                    if on_immutable {
+                        args.push("--on-immutable".to_string());
+                        args.push("usroverlay".to_string());
+                    }
                     privilege::run_helper_via_pkexec(
                         &args,
                         progress,
@@ -1769,6 +1924,139 @@ fn run_gui() -> AppResult<()> {
                         &running_thread,
                         false,
                         format!("还原失败：{err}"),
+                    ),
+                }
+            });
+        });
+    }
+
+    // ---- 回调 3b：W6 文件对话框（rfd）/ 诊断包 / 回滚入口 ----
+    {
+        let weak = app.as_weak();
+        app.on_pick_archive(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut dialog =
+                rfd::FileDialog::new().add_filter("驱动备份归档", &["gz", "tgz", "tar.gz"]);
+            if let Some(home) = std::env::var_os("HOME") {
+                dialog = dialog.set_directory(home);
+            }
+            let Some(path) = dialog.pick_file() else {
+                return;
+            };
+            // 前置校验：归档必须存在（避免运行到一半才失败）。
+            if !path.is_file() {
+                ui.set_status_text(format!("所选归档不存在：{}", path.display()).into());
+                return;
+            }
+            ui.set_archive_path(path.to_string_lossy().to_string().into());
+            ui.set_status_text(format!("已选择归档：{}", path.display()).into());
+        });
+    }
+    {
+        let weak = app.as_weak();
+        app.on_pick_out_path(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let kver = distro::kernel_release();
+            let default_name = backup::default_out_path(&kver)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("driver-backup-{kver}.tar.gz"));
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(default_name)
+                .add_filter("驱动备份归档", &["gz"])
+                .save_file()
+            else {
+                return;
+            };
+            // 前置校验：父目录必须存在（可写性交给实际写入阶段报错）。
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                    ui.set_status_text(format!("输出目录不存在：{}", parent.display()).into());
+                    return;
+                }
+            }
+            ui.set_out_path(path.to_string_lossy().to_string().into());
+            ui.set_status_text(format!("备份将输出到：{}", path.display()).into());
+        });
+    }
+    {
+        let weak = app.as_weak();
+        let running = Arc::clone(&running);
+        app.on_diagnose(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if running.swap(true, Ordering::SeqCst) {
+                ui.set_status_text("已有任务正在运行。".into());
+                return;
+            }
+            ui.set_busy(true);
+            ui.set_progress(0.0);
+            ui.set_status_text("正在生成脱敏诊断包…".into());
+            let weak_thread = weak.clone();
+            let running_thread = Arc::clone(&running);
+            std::thread::spawn(move || {
+                let outcome = diagnose::run(None);
+                let _ = weak_thread.upgrade_in_event_loop(move |ui| {
+                    running_thread.store(false, Ordering::SeqCst);
+                    ui.set_busy(false);
+                    ui.set_progress(1.0);
+                    match outcome {
+                        Ok(path) => ui.set_status_text(
+                            format!("诊断包已生成：{}", path.display()).into(),
+                        ),
+                        Err(err) => {
+                            ui.set_status_text(format!("诊断收集失败：{err}").into());
+                        }
+                    }
+                });
+            });
+        });
+    }
+    {
+        let weak = app.as_weak();
+        let running = Arc::clone(&running);
+        let cancel = Arc::clone(&cancel);
+        app.on_rollback(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !begin_task(&ui, &running, &cancel, "正在回滚上一次还原…") {
+                return;
+            }
+            let progress = gui_progress(weak.clone());
+            let weak_thread = weak.clone();
+            let running_thread = Arc::clone(&running);
+            let cancel_thread = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let outcome: AppResult<String> = if distro::is_root() {
+                    restore::run_rollback(Path::new("/"), None, progress).map(|report| {
+                        format!(
+                            "回滚完成：恢复 {} 个文件，删除 {} 个链接",
+                            report.restored, report.removed
+                        )
+                    })
+                } else if !distro::pkexec_available() {
+                    Err(AppError::Privilege(
+                        "未找到 pkexec（polkit 未安装或不可用），无法自动提权。\
+                         请在终端执行：sudo linux-driver-backup --rollback last"
+                            .to_string(),
+                    ))
+                } else {
+                    // W6：提权重入本二进制执行回滚（与还原同一 pkexec 机制）。
+                    privilege::run_helper_via_pkexec_with(
+                        privilege::ROLLBACK_FLAG,
+                        &[],
+                        progress,
+                        Arc::clone(&cancel_thread),
+                    )
+                };
+                match outcome {
+                    Ok(message) => finish_gui(&weak_thread, &running_thread, true, message),
+                    Err(AppError::Cancelled) => {
+                        finish_gui(&weak_thread, &running_thread, false, "回滚已取消。".to_string())
+                    }
+                    Err(err) => finish_gui(
+                        &weak_thread,
+                        &running_thread,
+                        false,
+                        format!("回滚失败：{err}"),
                     ),
                 }
             });
@@ -1911,6 +2199,7 @@ fn main() {
         ),
         Cmd::Verify { archive, json } => run_cli_verify(archive, json),
         Cmd::Diagnose { out } => run_cli_diagnose(out),
+        Cmd::HelperRollback { journal, root } => run_helper_rollback(journal, root),
         Cmd::Gui => match run_gui() {
             Ok(()) => 0,
             Err(err) => {

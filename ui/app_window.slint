@@ -21,10 +21,13 @@ import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ListView, Progress
 // 扫描条目列表项，对应 src/model.rs 的 ScanEntry；size/kind 由 Rust 侧预格式化。
 // List row for a scanned entry (mirrors ScanEntry); size/kind are pre-formatted strings.
 export struct ModuleItem {
+    selected: bool, // W6/P1-5：是否纳入还原（默认预选）
     name: string,   // 文件名，如 "nvidia.ko" / file name
     path: string,   // 归档内相对路径 / relative path inside the archive
     size: string,   // 人类可读体积，如 "1.2 MiB" / human readable size
     kind: string,   // 分类 module | dkms | config | firmware / entry kind
+    owner: string,  // W6：来源包，如 "dpkg:nvidia-dkms"（可空）
+    vermagic: string, // W6：模块 ABI 指纹（可空）
 }
 
 export component AppWindow inherits Window {
@@ -47,6 +50,12 @@ export component AppWindow inherits Window {
     in-out property <bool> dry-run: true;                   // 还原前仅预演
 
     // ===== 扩展属性 / extended properties（ITERATION §5.3，新增非冻结） =====
+    // W6 能力对齐 CLI：策略选择与安全开关（写回 RestoreRequest）。
+    in-out property <int> strategy-index: 0;                // 0 auto / 1 rebuild / 2 reinstall / 3 weak / 4 copy
+    in-out property <bool> strict-links: false;             // --strict-links
+    in-out property <bool> no-sign: false;                  // --no-sign
+    in-out property <bool> on-immutable: false;             // --on-immutable usroverlay
+    in property <string> warnings-text: "";                 // W6/P1-6：扫描告警常驻面板（空则隐藏）
     in-out property <bool> confirm-visible: false;          // 真实还原确认框是否可见（C-35）
     in-out property <string> confirm-detail;                // 确认框详情（归档/内核/架构差异）
     in-out property <bool> restore-ack: false;              // 用户已在确认框确认（内部传递）
@@ -60,6 +69,11 @@ export component AppWindow inherits Window {
     // ===== 扩展回调 / extended callbacks（ITERATION §5.3，新增非冻结） =====
     callback confirm-restore();                             // 确认框：确认还原（C-35）
     callback dismiss-confirm();                             // 确认框：取消（C-35）
+    // W6：文件对话框 / 诊断 / 回滚入口。
+    callback pick-archive();                                // rfd：选择还原归档
+    callback pick-out-path();                               // rfd：选择备份输出路径
+    callback diagnose();                                    // --diagnose 等价入口
+    callback rollback();                                    // 回滚上一次还原
 
     VerticalBox {
         padding: 14px;
@@ -96,39 +110,55 @@ export component AppWindow inherits Window {
             ListView {
                 visible: root.modules.length > 0;
 
-                for item in root.modules : Rectangle {
-                    height: 30px;
+                // W6/P1-5：带勾选列 + 依赖闭包（Rust 侧计算）；行内补 path/owner/vermagic。
+                for item[i] in root.modules : Rectangle {
+                    height: 44px;
                     horizontal-stretch: 1;
                     background: #ffffff;
 
-                    HorizontalBox {
-                        spacing: 8px;
-                        padding: 5px;
+                    VerticalBox {
+                        spacing: 1px;
+                        padding: 4px;
 
+                        HorizontalBox {
+                            spacing: 6px;
+
+                            CheckBox {
+                                checked <=> item.selected;
+                            }
+                            Text {
+                                text: item.name;
+                                color: #111827;
+                                font-size: 13px;
+                                overflow: elide;
+                                horizontal-stretch: 3;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: item.kind;
+                                color: #2b6cb0;
+                                font-size: 12px;
+                                horizontal-stretch: 0;
+                                preferred-width: 76px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: item.size;
+                                color: #111827;
+                                font-size: 12px;
+                                horizontal-alignment: right;
+                                horizontal-stretch: 0;
+                                preferred-width: 80px;
+                                vertical-alignment: center;
+                            }
+                        }
                         Text {
-                            text: item.name;
-                            color: #111827;
-                            font-size: 13px;
+                            text: item.path
+                                  + (item.owner != "" ? "  ·  " + item.owner : "")
+                                  + (item.vermagic != "" ? "  ·  " + item.vermagic : "");
+                            color: #6b7280;
+                            font-size: 11px;
                             overflow: elide;
-                            horizontal-stretch: 3;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: item.kind;
-                            color: #2b6cb0;
-                            font-size: 12px;
-                            horizontal-stretch: 0;
-                            preferred-width: 76px;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: item.size;
-                            color: #111827;
-                            font-size: 12px;
-                            horizontal-alignment: right;
-                            horizontal-stretch: 0;
-                            preferred-width: 80px;
-                            vertical-alignment: center;
                         }
                     }
                 }
@@ -150,6 +180,28 @@ export component AppWindow inherits Window {
             font-size: 12px;
             overflow: elide;
             vertical-stretch: 0;
+        }
+
+        // 4b) W6/P1-6：扫描告警常驻面板（warnings-text 为空时自动隐藏）。
+        if (root.warnings-text != "") : Rectangle {
+            background: #fff8e1;
+            border-color: #f0c36d;
+            border-width: 1px;
+            border-radius: 4px;
+            min-height: 36px;
+            max-height: 130px;
+            vertical-stretch: 0;
+
+            VerticalLayout {
+                padding: 6px;
+                Text {
+                    text: root.warnings-text;
+                    color: #7a5c00;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    overflow: clip;
+                }
+            }
         }
 
         // 5) 备份设置：三级模式 ComboBox（写回 mode-index）+ 输出路径 LineEdit（写回 out-path）。
@@ -204,6 +256,71 @@ export component AppWindow inherits Window {
                 text: "还原前仅预演 (dry-run)";
                 checked <=> root.dry-run;
                 horizontal-stretch: 0;
+            }
+        }
+
+        // 6b) W6：还原策略与安全开关（对齐 CLI 的 --strategy/--strict-links/--no-sign/--on-immutable）。
+        HorizontalBox {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Text {
+                text: "还原策略";
+                color: #1f2933;
+                font-size: 13px;
+                horizontal-stretch: 0;
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: ["auto 自动 (默认)", "rebuild 重建", "reinstall 重装", "weak-modules 弱更新", "copy 拷贝"];
+                current-index <=> root.strategy-index;
+                horizontal-stretch: 1;
+            }
+            CheckBox {
+                text: "严格链接";
+                checked <=> root.strict-links;
+                horizontal-stretch: 0;
+            }
+            CheckBox {
+                text: "不签名";
+                checked <=> root.no-sign;
+                horizontal-stretch: 0;
+            }
+            CheckBox {
+                text: "OSTree overlay";
+                checked <=> root.on-immutable;
+                horizontal-stretch: 0;
+            }
+        }
+
+        // 6c) W6：文件对话框 / 诊断 / 回滚入口。
+        HorizontalBox {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            Button {
+                text: "选择归档…";
+                enabled: !root.busy && !root.confirm-visible;
+                horizontal-stretch: 1;
+                clicked => { root.pick-archive(); }
+            }
+            Button {
+                text: "选择输出…";
+                enabled: !root.busy && !root.confirm-visible;
+                horizontal-stretch: 1;
+                clicked => { root.pick-out-path(); }
+            }
+            Button {
+                text: "诊断包";
+                enabled: !root.busy && !root.confirm-visible;
+                horizontal-stretch: 1;
+                clicked => { root.diagnose(); }
+            }
+            Button {
+                text: "回滚上次还原";
+                enabled: !root.busy && !root.confirm-visible;
+                horizontal-stretch: 1;
+                clicked => { root.rollback(); }
             }
         }
 

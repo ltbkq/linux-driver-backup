@@ -37,6 +37,10 @@ use crate::model::{AppError, AppResult, ProgressFn};
 /// 标记"由 pkexec 重入的 root 还原 helper"的命令行开关。
 pub const HELPER_FLAG: &str = "--helper-restore";
 
+/// Command-line flag for the root-side rollback helper (W6 GUI rollback entry).
+/// 标记"由 pkexec 重入的 root 回滚 helper"的命令行开关（W6 回滚入口）。
+pub const ROLLBACK_FLAG: &str = "--helper-rollback";
+
 /// Max number of stderr lines echoed back in an error message.
 /// 错误信息里回显的 stderr 末尾行数上限。
 const STDERR_TAIL_LINES: usize = 20;
@@ -309,6 +313,19 @@ pub fn run_helper_via_pkexec(
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> AppResult<String> {
+    run_helper_via_pkexec_with(HELPER_FLAG, args, progress, cancel)
+}
+
+/// Same as [`run_helper_via_pkexec`] but with an explicit helper flag
+/// (restore: [`HELPER_FLAG`], rollback: [`ROLLBACK_FLAG`]).
+/// 与 [`run_helper_via_pkexec`] 相同，但显式指定 helper 旗标
+/// （还原用 [`HELPER_FLAG`]，回滚用 [`ROLLBACK_FLAG`]）。
+pub fn run_helper_via_pkexec_with(
+    flag: &str,
+    args: &[String],
+    progress: ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> AppResult<String> {
     if cancel.load(Ordering::Relaxed) {
         return Err(AppError::Cancelled);
     }
@@ -316,7 +333,7 @@ pub fn run_helper_via_pkexec(
     let exe = self_exe()?;
     let mut cmd = Command::new("pkexec");
     cmd.arg(&exe)
-        .arg(HELPER_FLAG)
+        .arg(flag)
         .args(args)
         .stdin(Stdio::piped()) // C-04：取消 = 关闭本管道写端（helper 收到 EOF）
         .stdout(Stdio::piped())
