@@ -685,6 +685,7 @@ fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
         distro: DistroInfo::detect(),
         mode,
         progress: cli_progress(),
+        firmware_policy: None, // 预置字段：W5 接线 --firmware
         cancel: Arc::new(AtomicBool::new(false)),
     };
 
@@ -834,6 +835,7 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         dry_run: opts.dry_run,
         allow_kernel_mismatch: opts.allow_kernel_mismatch,
         allow_arch_mismatch,
+        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
         with_firmware: opts.with_firmware,
         root: opts.root.as_deref().map(expand_tilde),
         strategy: opts.strategy,
@@ -957,6 +959,7 @@ fn run_helper(
         dry_run: false,
         allow_kernel_mismatch,
         allow_arch_mismatch,
+        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
         with_firmware,
         root: root.as_deref().map(expand_tilde),
         strategy,
@@ -1153,6 +1156,7 @@ fn run_gui() -> AppResult<()> {
                     distro: DistroInfo::detect(),
                     mode,
                     progress,
+                    firmware_policy: None, // 预置字段：W5 接线 --firmware
                     cancel: Arc::clone(&cancel_thread),
                 };
                 match backup::run_backup(request) {
@@ -1313,6 +1317,7 @@ fn run_gui() -> AppResult<()> {
                         dry_run: true,
                         // 预演无副作用：允许跨内核/跨架构预览，附带提示信息。
                         allow_kernel_mismatch: true,
+                        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
@@ -1364,6 +1369,7 @@ fn run_gui() -> AppResult<()> {
                         allow_kernel_mismatch: false,
                         // 能走到这里说明用户已在确认框点"确认还原"（C-35），
                         // 架构不一致的警告已列在确认框详情里，视为已确认（C-32）。
+                        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,

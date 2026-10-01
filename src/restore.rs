@@ -239,6 +239,11 @@ pub struct RestoreRequest {
     pub allow_kernel_mismatch: bool,
     /// 用户已确认"备份架构与当前不符"时为 true；与内核检查解耦（ITERATION §2.1 C-32）。
     pub allow_arch_mismatch: bool,
+    /// 系统阶段（depmod/签名/initramfs）失败时**不**自动回滚文件（W1/C-14 逃生口）。
+    /// 默认 false = 系统阶段失败即自动回滚已提交的文件后再报错。
+    // TODO(W1): C-14 实现读取本字段后移除 allow(dead_code)。
+    #[allow(dead_code)]
+    pub no_auto_rollback_on_post: bool,
     /// 是否还原 `EntryKind::Firmware` 条目（默认关闭）。
     pub with_firmware: bool,
     /// 目标根：`None` = `/`；`Some(dir)` 用于离线/救援还原（ROADMAP P1-1）。
@@ -271,6 +276,7 @@ impl Default for RestoreRequest {
             dry_run: false,
             allow_kernel_mismatch: false,
             allow_arch_mismatch: false,
+            no_auto_rollback_on_post: false,
             with_firmware: false,
             root: None,
             strategy: None,
@@ -2748,6 +2754,7 @@ mod tests {
             dry_run: true,
             allow_kernel_mismatch: false,
             allow_arch_mismatch: false,
+            no_auto_rollback_on_post: false,
             with_firmware: false,
             progress,
             cancel: Arc::new(AtomicBool::new(false)),

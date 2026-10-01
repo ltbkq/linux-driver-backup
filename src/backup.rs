@@ -247,6 +247,11 @@ pub struct BackupRequest {
     pub distro: DistroInfo,
     /// 备份模式。
     pub mode: BackupMode,
+    /// 固件收集策略（v0.3.0 W5/P1-3，可选）：`"all"` | `"needed"` | `"none"`。
+    /// `None` = 按 `mode` 现有行为（零行为变化，待 CLI `--firmware` 接线）。
+    /// Firmware collection policy (W5): `"all"` | `"needed"` | `"none"`;
+    /// `None` keeps today's mode-driven behaviour until `--firmware` is wired up.
+    pub firmware_policy: Option<String>,
     /// 进度回调 `0.0..1.0`。
     pub progress: ProgressFn,
     /// 取消标志：置位后流水线尽快停止并删除半成品。
@@ -295,9 +300,12 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         kver: _,
         distro,
         mode,
+        firmware_policy,
         progress,
         cancel,
     } = req;
+    // W5 接线占位：策略选择在固件收集阶段生效（主任务随后实现）。
+    let _ = firmware_policy;
     if out_file.as_os_str().is_empty() {
         return Err(AppError::Validation(
             "备份输出路径为空 / empty output path".to_string(),
