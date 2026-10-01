@@ -39,7 +39,7 @@
 
 | 项 | 结果 | 备注 |
 |---|---|---|
-| 工具链 | rustc/cargo **1.98.1** ≥ MSRV 1.83（`Cargo.toml:13`） | 本机 rustup stable |
+| 工具链 | rustc/cargo **1.98.1** ≥ MSRV 1.92（`Cargo.toml:13`；slint 1.18 要求 1.92） | 本机 rustup stable |
 | 系统依赖 | `fontconfig`/`freetype2`/`gtk3 3.24`/`wayland-client` 齐备 | Slint winit 后端可链接 |
 | `cargo test --no-fail-fast --locked` | **103 passed / 0 failed**（0.34s） | 比 ROADMAP §17 记录的 102 项多 1（期间新增） |
 | `cargo clippy --all-targets -- -D warnings` | **零告警**（基线复验） | README:363 承诺的 lint 门槛 |
@@ -190,7 +190,7 @@
 
 | # | 断言 | 方法与证据 | 结论 |
 |---|---|---|---|
-| 1 | 工具链满足 MSRV | `rustc --version` → 1.98.1 ≥ 1.83 | ✅ 构建基线成立 |
+| 1 | 工具链满足 MSRV | `rustc --version` → 1.98.1 ≥ 1.92 | ✅ 构建基线成立 |
 | 2 | 现有测试不被破坏 | `cargo test --no-fail-fast --locked` → **103 passed / 0 failed** | ✅ 重构有回归护栏 |
 | 3 | lint 门槛可达 | `cargo clippy --all-targets -- -D warnings` → **零告警** | ✅ 可直接入 CI（W9） |
 | 4 | **C-22 修复方案可行** | `dpkg-query -S <存在的路径> <不存在的路径>` → `exit=1`，但 stdout 仍输出 `coreutils: /usr/bin/env` | ✅ "无视退出码读 stdout"即可挽回整批数据 |
@@ -335,7 +335,7 @@
 
 ### W9 CI 加固 / CI hardening
 
-- 门禁：`cargo fmt --check`、`clippy -D warnings`（README 已承诺）、`cargo audit`、`shellcheck`、`desktop-file-validate`、MSRV 1.83 job、全部构建 `--locked`、release 前 **tag == Cargo.toml version** 断言。
+- 门禁：`cargo fmt --check`、`clippy -D warnings`（README 已承诺）、`cargo audit`、`shellcheck`、`desktop-file-validate`、MSRV 1.92 job、全部构建 `--locked`、release 前 **tag == Cargo.toml version** 断言。
 - 供应链：第三方 action 全部 pin 到 commit SHA（C-09）；appimagetool 下载加 SHA-256 校验，删除一层 `exit 0`/`continue-on-error`（C-08）。
 - 冒烟：`dpkg -i`/`rpm -ivh`/`tar+install.sh` 安装后跑 `--version`/`--scan --format json`；aarch64 用 `qemu-user` 执行（C-57）。
 

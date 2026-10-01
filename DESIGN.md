@@ -78,7 +78,7 @@
 name = "linux-driver-backup"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.92"
 description = "Linux out-of-tree driver (kernel module) backup & restore tool with adaptive distro support"
 license = "GPL-3.0-only"
 build = "build.rs"

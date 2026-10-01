@@ -6,7 +6,7 @@
 #   1) test    —— 单元测试（cargo test --locked --no-fail-fast）
 #   2) lint    —— 门禁：fmt --check / clippy -D warnings / shellcheck / desktop-file-validate（W9-C54）
 #   3) audit   —— cargo audit 依赖漏洞扫描（W9-C54）
-#   4) msrv    —— MSRV 1.83 编译（W9-C54）
+#   4) msrv    —— MSRV 1.92 编译（W9-C54）
 #   5) build   —— 矩阵编译（x86_64 / aarch64）+ sha256 清单 + aarch64 qemu 运行冒烟
 #   6) package —— 复用二进制产出 deb / tar.gz / rpm（fedora+suse 双目标）/ AppImage 并做安装冒烟
 #   7) aur     —— 打 tag 时渲染 AUR PKGBUILD + .SRCINFO（W8-C52）
@@ -71,7 +71,8 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libfontconfig1-dev \
-            libfreetype-dev
+            libfreetype-dev \
+            libgtk-3-dev
 
       - name: 缓存 cargo / Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
@@ -109,6 +110,7 @@ jobs:
             libx11-dev \
             libfontconfig1-dev \
             libfreetype-dev \
+            libgtk-3-dev \
             shellcheck \
             desktop-file-utils
 
@@ -154,19 +156,19 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ----------------------------------------------------------
-  # 4) MSRV 编译 / MSRV build（W9-C54，Cargo.toml rust-version = 1.83）
+  # 4) MSRV 编译 / MSRV build（W9-C54，Cargo.toml rust-version = 1.92）
   # ----------------------------------------------------------
   msrv:
-    name: MSRV 1.83
+    name: MSRV 1.92
     runs-on: ubuntu-22.04
     steps:
       - name: 检出源码 / Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
 
-      - name: 安装 Rust 1.83 / Install Rust 1.83
+      - name: 安装 Rust 1.92 / Install Rust 1.92
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (pinned)
         with:
-          toolchain: 1.83.0
+          toolchain: 1.92.0
 
       - name: 安装编译期系统依赖 / Install build-time system deps
         run: |
@@ -177,7 +179,8 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libfontconfig1-dev \
-            libfreetype-dev
+            libfreetype-dev \
+            libgtk-3-dev
 
       - name: 缓存 cargo / Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
@@ -225,7 +228,8 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libfontconfig1-dev \
-            libfreetype-dev
+            libfreetype-dev \
+            libgtk-3-dev
 
       - name: 配置 aarch64 交叉工具链 / Set up aarch64 cross toolchain
         if: matrix.cross
@@ -270,8 +274,11 @@ jobs:
             export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
             export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
             export PKG_CONFIG_SYSROOT_DIR=/
+            # aarch64 交叉无 GTK sysroot：关闭 gui-dialogs（原生文件对话框可选特性）。
+            cargo build --locked --release --target ${{ matrix.target }} --no-default-features
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
           fi
-          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: strip 二进制 / Strip the binary
         run: |

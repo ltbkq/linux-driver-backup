@@ -9,7 +9,7 @@
 <!-- 徽章 / Badges -->
 [![CI](https://github.com/ltbkq/linux-driver-backup/actions/workflows/build/badge.svg)](https://github.com/ltbkq/linux-driver-backup/actions/workflows/build.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
-[![Rust: 1.83+](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org/tools/install)
+[![Rust: 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/tools/install)
 
 ---
 
@@ -200,11 +200,11 @@ linux-driver-backup
 
 前置条件：
 
-- **Rust 工具链**：`rustup` 安装的**稳定版 ≥ 1.83**（`Cargo.toml` 中 `rust-version = "1.83"`，edition 2021）。
+- **Rust 工具链**：`rustup` 安装的**稳定版 ≥ 1.92**（`Cargo.toml` 中 `rust-version = "1.92"`，edition 2021；slint 1.18 要求 1.92）。
 
   ```bash
   rustup update stable
-  rustc --version   # 应 >= 1.83
+  rustc --version   # 应 >= 1.92
   ```
 
 - **编译期系统依赖**（Slint 使用 winit X11/Wayland 后端 + 软件渲染，编译需要 pkg-config 与窗口系统头文件）：

@@ -1540,6 +1540,64 @@ extern "C" {
 // GUI 模式 / GUI mode
 // ===========================================================================
 
+/// W6：打开“选择归档”原生对话框（需 `gui-dialogs` 特性）。
+/// Open the native "pick archive" dialog (requires the `gui-dialogs` feature).
+#[cfg(feature = "gui-dialogs")]
+fn pick_archive(ui: &AppWindow) {
+    let mut dialog = rfd::FileDialog::new().add_filter("驱动备份归档", &["gz", "tgz", "tar.gz"]);
+    if let Some(home) = std::env::var_os("HOME") {
+        dialog = dialog.set_directory(home);
+    }
+    let Some(path) = dialog.pick_file() else {
+        return;
+    };
+    // 前置校验：归档必须存在（避免运行到一半才失败）。
+    if !path.is_file() {
+        ui.set_status_text(format!("所选归档不存在：{}", path.display()).into());
+        return;
+    }
+    ui.set_archive_path(path.to_string_lossy().to_string().into());
+    ui.set_status_text(format!("已选择归档：{}", path.display()).into());
+}
+
+/// 无 `gui-dialogs` 特性时的回退：提示手动输入。
+#[cfg(not(feature = "gui-dialogs"))]
+fn pick_archive(ui: &AppWindow) {
+    ui.set_status_text("此构建未包含文件对话框，请手动输入归档路径。".into());
+}
+
+/// W6：打开“选择输出路径”原生保存对话框（需 `gui-dialogs` 特性）。
+#[cfg(feature = "gui-dialogs")]
+fn pick_out_path(ui: &AppWindow) {
+    let kver = distro::kernel_release();
+    let default_name = backup::default_out_path(&kver)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("driver-backup-{kver}.tar.gz"));
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .add_filter("驱动备份归档", &["gz"])
+        .save_file()
+    else {
+        return;
+    };
+    // 前置校验：父目录必须存在（可写性交给实际写入阶段报错）。
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            ui.set_status_text(format!("输出目录不存在：{}", parent.display()).into());
+            return;
+        }
+    }
+    ui.set_out_path(path.to_string_lossy().to_string().into());
+    ui.set_status_text(format!("备份将输出到：{}", path.display()).into());
+}
+
+/// 无 `gui-dialogs` 特性时的回退：提示手动输入。
+#[cfg(not(feature = "gui-dialogs"))]
+fn pick_out_path(ui: &AppWindow) {
+    ui.set_status_text("此构建未包含文件对话框，请手动输入输出路径。".into());
+}
+
 /// 启动 Slint 图形界面并绑定 4 个冻结回调。
 /// Launch the Slint GUI and wire the four frozen callbacks.
 fn run_gui() -> AppResult<()> {
@@ -2049,49 +2107,17 @@ fn run_gui() -> AppResult<()> {
     {
         let weak = app.as_weak();
         app.on_pick_archive(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let mut dialog =
-                rfd::FileDialog::new().add_filter("驱动备份归档", &["gz", "tgz", "tar.gz"]);
-            if let Some(home) = std::env::var_os("HOME") {
-                dialog = dialog.set_directory(home);
+            if let Some(ui) = weak.upgrade() {
+                pick_archive(&ui);
             }
-            let Some(path) = dialog.pick_file() else {
-                return;
-            };
-            // 前置校验：归档必须存在（避免运行到一半才失败）。
-            if !path.is_file() {
-                ui.set_status_text(format!("所选归档不存在：{}", path.display()).into());
-                return;
-            }
-            ui.set_archive_path(path.to_string_lossy().to_string().into());
-            ui.set_status_text(format!("已选择归档：{}", path.display()).into());
         });
     }
     {
         let weak = app.as_weak();
         app.on_pick_out_path(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let kver = distro::kernel_release();
-            let default_name = backup::default_out_path(&kver)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("driver-backup-{kver}.tar.gz"));
-            let Some(path) = rfd::FileDialog::new()
-                .set_file_name(default_name)
-                .add_filter("驱动备份归档", &["gz"])
-                .save_file()
-            else {
-                return;
-            };
-            // 前置校验：父目录必须存在（可写性交给实际写入阶段报错）。
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    ui.set_status_text(format!("输出目录不存在：{}", parent.display()).into());
-                    return;
-                }
+            if let Some(ui) = weak.upgrade() {
+                pick_out_path(&ui);
             }
-            ui.set_out_path(path.to_string_lossy().to_string().into());
-            ui.set_status_text(format!("备份将输出到：{}", path.display()).into());
         });
     }
     {

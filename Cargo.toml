@@ -10,7 +10,7 @@
 name = "linux-driver-backup"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.92"
 description = "Linux out-of-tree driver (kernel module) backup & restore tool with adaptive distro support"
 license = "GPL-3.0-only"
 build = "build.rs"
@@ -31,9 +31,15 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
-# W6：原生文件对话框（归档 / 输出目录）。GTK 后端，本机 gtk+-3.0 3.24 可用；
-# CI 需 libgtk-3-dev（W9）。ITERATION §3.3 依赖评估已选定 rfd。
-rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+# W6：原生文件对话框（归档 / 输出目录）。GTK 后端；默认启用，无 GTK sysroot 的
+# 交叉编译/精简构建可用 `--no-default-features` 关闭（见 gui-dialogs 特性）。
+rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
+
+[features]
+# 默认包含原生文件对话框（GTK 后端，CI 需 libgtk-3-dev）。
+# aarch64 交叉编译等无 GTK sysroot 的场景以 `--no-default-features` 关闭。
+default = ["gui-dialogs"]
+gui-dialogs = ["dep:rfd"]
 
 [build-dependencies]
 slint-build = "1.18"
