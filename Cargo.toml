@@ -35,9 +35,8 @@ walkdir = "2"
 # 交叉编译/精简构建可用 `--no-default-features` 关闭（见 gui-dialogs 特性）。
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
 # W10：zstd 多线程压缩（`zstdmt`）。
-zstd = "0.14"
-# W11：age 流式加密（纯 Rust，无 GPG 依赖）。
-age = "0.11"
+zstd = { version = "0.14", features = ["zstdmt"] }
+# 注：age 流式加密（W11）推迟到 v0.4.1，暂不引入。
 
 [features]
 # 默认包含原生文件对话框（GTK 后端，CI 需 libgtk-3-dev）。

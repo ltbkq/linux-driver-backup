@@ -338,10 +338,8 @@ pub struct ManifestEntry {
     /// 建议的还原策略（v2）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy_hint: Option<RestoreStrategy>,
-    /// 内容寻址块 id（v0.4.0 W11，可选）：内容存入 `blocks/<sha256>` 而非 `data/<path>`。
-    /// `None` = 内容按 v2 方式存于 `data/<path>`（或本就不存内容）。
-    /// Content-addressed block id (v0.4.0 W11): content lives in `blocks/<sha256>`.
-    /// `None` = v2 layout (`data/<path>`) or no content stored.
+    /// 内容寻址块 id（**保留字段**，v0.4.1 W11 启用）。当前恒为 `None`（内容存于 `data/<path>`）。
+    /// Reserved content-addressed block id (enabled in v0.4.1 W11); currently always `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<String>,
 }
@@ -423,9 +421,8 @@ pub struct Manifest {
     /// Absent = existing v2 behaviour (`needed`) for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware_policy: Option<String>,
-    /// 归档加密头（v0.4.0 W11/P2-3，可选）：`age` 或 `gpg`。
-    /// 缺省 = 不加密。还原侧据此选择解密器；`recipient` 为公钥标识。
-    /// Encryption header (v0.4.0 W11): `"age"` | `"gpg"`. Absent = unencrypted.
+    /// 归档加密头（**保留字段**，v0.4.1 W11 启用）：`age` 或 `gpg`。当前恒为 `None`。
+    /// Reserved encryption header (enabled in v0.4.1 W11); currently always `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<ManifestEncryption>,
 }
@@ -454,9 +451,9 @@ impl Manifest {
     }
 }
 
-/// 归档格式版本号（v0.4.0 W11 起为 3：manifest 前置 + 内容寻址块 + 可选加密）。
-/// Archive format version; 3 since v0.4.0 W11 (manifest-at-head + content-addressed blocks + optional encryption).
-pub const MANIFEST_FORMAT_VERSION: u32 = 3;
+/// 归档格式版本号（当前为 2；v0.4.0 的 v3 布局/加密推迟到 v0.4.1）。
+/// Archive format version; currently 2 (v0.4.0 v3 layout/encryption deferred to v0.4.1).
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// 仍然可读的最低归档格式版本（v1 归档向后兼容）。
 /// Oldest archive format version we can still read (v1 stays compatible).
@@ -591,6 +588,7 @@ mod tests {
     fn sample_manifest() -> Manifest {
         Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
+            encryption: None,
             tool_version: "0.2.0".to_string(),
             created_at: "2026-09-27T12:00:00Z".to_string(),
             kernel_release: "6.8.0-45-generic".to_string(),
@@ -614,6 +612,7 @@ mod tests {
             entries: vec![
                 ManifestEntry {
                     path: "lib/modules/6.8.0-45-generic/updates/dkms/foo.ko".to_string(),
+                    block: None,
                     size: 123_456,
                     sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                         .to_string(),
@@ -636,6 +635,7 @@ mod tests {
                 },
                 ManifestEntry {
                     path: "lib/modules/6.8.0-45-generic/weak-updates/foo.ko".to_string(),
+                    block: None,
                     size: 0,
                     sha256: "abc".to_string(),
                     kind: EntryKind::Symlink,

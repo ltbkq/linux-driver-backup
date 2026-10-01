@@ -180,7 +180,7 @@ fn config_out_dir_supplies_backup_default() {
     assert!(
         produced
             .iter()
-            .any(|n| n.starts_with("driver-backup-") && n.ends_with(".tar.gz")),
+            .any(|n| n.starts_with("driver-backup-") && n.ends_with(".tar.zst")),
         "out_dir 内未生成归档: {produced:?}"
     );
 

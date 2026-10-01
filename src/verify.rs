@@ -26,7 +26,6 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
 use crate::distro;
@@ -114,16 +113,19 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// 打开 gzip/tar 归档（与 `restore::inspect` 相同的读取方式）。
-/// Open the gzip/tar archive (same reading path as `restore::inspect`).
-fn open(archive: &Path) -> AppResult<tar::Archive<GzDecoder<fs::File>>> {
+/// 打开归档（与 `restore::open_archive` 同一读取路径：按魔数选 gzip/zstd/裸读）。
+/// Open the archive through the same magic-byte path as `restore::open_archive`.
+///
+/// W10 起默认压缩为 zstd，若这里仍硬编码 gzip，`--verify` 会把**健康**的默认
+/// 归档误判成「归档条目损坏」。判定逻辑只保留 [`crate::restore::archive_reader`] 一份。
+fn open(archive: &Path) -> AppResult<tar::Archive<crate::restore::ArchiveReader>> {
     let file = fs::File::open(archive).map_err(|err| {
         AppError::Format(format!(
             "无法打开归档 / cannot open archive {}: {err}",
             archive.display()
         ))
     })?;
-    Ok(tar::Archive::new(GzDecoder::new(file)))
+    Ok(tar::Archive::new(crate::restore::archive_reader(file)?))
 }
 
 /// 体检归档：逐条校验 SHA-256 + 内核/架构/vermagic 信息比对。
@@ -136,7 +138,7 @@ pub fn verify(archive: &Path) -> AppResult<VerifyReport> {
     let mut reader = open(archive)?;
     let entries = reader.entries().map_err(|err| {
         AppError::Format(format!(
-            "无法读取归档（不是有效的 gzip/tar 或已损坏）/ unreadable archive: {err}"
+            "无法读取归档（不是有效的 gzip/zstd/tar 或已损坏）/ unreadable archive: {err}"
         ))
     })?;
 
@@ -456,6 +458,7 @@ mod tests {
     use crate::model::{
         BackupMode, EntryKind, Manifest, ManifestDistro, ManifestEntry, MANIFEST_FORMAT_VERSION,
     };
+    use flate2::read::GzDecoder;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::path::PathBuf;
@@ -505,6 +508,7 @@ mod tests {
             };
             entries_json.push(ManifestEntry {
                 path: (*rel).to_string(),
+                block: None,
                 size: bytes.len() as u64,
                 sha256: sha,
                 kind: EntryKind::Config,
@@ -526,6 +530,7 @@ mod tests {
                 .expect("append link");
             entries_json.push(ManifestEntry {
                 path: (*rel).to_string(),
+                block: None,
                 size: 0,
                 sha256: hex_of(target.as_bytes()),
                 kind: EntryKind::Symlink,
@@ -539,6 +544,7 @@ mod tests {
         for (rel, stored) in extra_manifest {
             entries_json.push(ManifestEntry {
                 path: (*rel).to_string(),
+                block: None,
                 size: 4,
                 sha256: hex_of(b"skip"),
                 kind: EntryKind::Module,
@@ -562,6 +568,7 @@ mod tests {
 
         let manifest = Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
+            encryption: None,
             tool_version: "0.3.0-test".to_string(),
             created_at: "2026-10-01T00:00:00Z".to_string(),
             kernel_release: distro::kernel_release(),

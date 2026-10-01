@@ -397,16 +397,56 @@ fn is_firmware(kinds: &HashMap<String, EntryKind>, rel: &Path) -> bool {
 // 归档读取 / Archive reading
 // ---------------------------------------------------------------------------
 
-/// Open a `.tar.gz` for streaming, read-only access.
-/// 只读打开 `.tar.gz`，返回可流式遍历的 tar 归档。
-fn open_archive(archive: &Path) -> AppResult<tar::Archive<GzDecoder<fs::File>>> {
+/// W10：归档读取器 —— 按魔数在 gzip / zstd / 裸读之间选择（整档压缩）。
+/// Archive reader: pick the decompressor by magic bytes (whole-archive compression).
+///
+/// `verify` 与 `restore` 共用同一读取路径（`verify::open` → [`archive_reader`]），
+/// 避免两边对压缩算法的判定漂移。
+pub(crate) enum ArchiveReader {
+    Gzip(GzDecoder<fs::File>),
+    Zstd(zstd::Decoder<'static, std::io::BufReader<fs::File>>),
+    Plain(fs::File),
+}
+
+impl Read for ArchiveReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ArchiveReader::Gzip(r) => r.read(buf),
+            ArchiveReader::Zstd(r) => r.read(buf),
+            ArchiveReader::Plain(r) => r.read(buf),
+        }
+    }
+}
+
+/// 从已打开的文件按魔数构造解压器（gzip / zstd / 裸读）。
+/// Build the decompressor for an already-open file by sniffing its magic bytes.
+///
+/// `restore::open_archive` 与 `verify::open` 共用：体检与还原必须对同一归档
+/// 得出一致结论，压缩算法判定只允许存在一份实现。
+pub(crate) fn archive_reader(mut file: fs::File) -> AppResult<ArchiveReader> {
+    use std::io::{Seek, SeekFrom};
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        Ok(ArchiveReader::Gzip(GzDecoder::new(file)))
+    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        Ok(ArchiveReader::Zstd(zstd::Decoder::new(file)?))
+    } else {
+        Ok(ArchiveReader::Plain(file))
+    }
+}
+
+/// Open a `.tar.gz`/`.tar.zst`/`.tar` for streaming, read-only access.
+/// 只读打开归档，按魔数自动选择解压器，返回可流式遍历的 tar 归档。
+fn open_archive(archive: &Path) -> AppResult<tar::Archive<ArchiveReader>> {
     let file = fs::File::open(archive)?;
-    Ok(tar::Archive::new(GzDecoder::new(file)))
+    Ok(tar::Archive::new(archive_reader(file)?))
 }
 
 /// Read one entry's path as an owned string.
 /// 读取条目路径并转为自有字符串（tar 内部的长文件名扩展等由 tar 自行处理）。
-fn entry_path(entry: &tar::Entry<'_, GzDecoder<fs::File>>) -> AppResult<String> {
+fn entry_path(entry: &tar::Entry<'_, ArchiveReader>) -> AppResult<String> {
     let p = entry
         .path()
         .map_err(|e| AppError::Format(format!("归档条目路径无效：{}", e)))?;

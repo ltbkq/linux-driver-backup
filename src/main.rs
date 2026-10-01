@@ -67,7 +67,6 @@ enum Cmd {
         firmware: Option<String>,
         config: Option<String>,
         compression: Option<String>,
-        encryption: Option<(String, String)>,
     },
     /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`
     ///   `[--root <dir>] [--strategy <s>] [--on-immutable <p>] [--strict-links] [--no-sign] [--chroot-exec]`
@@ -168,26 +167,6 @@ fn parse_compression(value: &str) -> Result<String, String> {
             "`--compress` 取值非法：`{other}`（可选 zstd | gzip | none）"
         )),
     }
-}
-
-/// 解析 `--encrypt <scheme:recipient>`（W11 / ITERATION §4-W11）。
-/// Parse `--encrypt <scheme:recipient>` into a (scheme, recipient) pair.
-fn parse_encryption(value: &str) -> Result<(String, String), String> {
-    let (scheme, recipient) = value.split_once(':').ok_or_else(|| {
-        format!("`--encrypt` 取值非法：`{value}`（格式 <scheme:recipient>，如 age:age1ql3z...）")
-    })?;
-    match scheme {
-        "age" | "gpg" => {}
-        other => {
-            return Err(format!(
-                "`--encrypt` 方案非法：`{other}`（可选 age | gpg）"
-            ))
-        }
-    }
-    if recipient.is_empty() {
-        return Err("`--encrypt` 接收方为空".to_string());
-    }
-    Ok((scheme.to_string(), recipient.to_string()))
 }
 
 /// 把 `--firmware` 取值映射为三态策略（W5 / ITERATION §4-W5）。
@@ -291,7 +270,6 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut firmware: Option<String> = None;
             let mut config: Option<String> = None;
             let mut compression: Option<String> = None;
-            let mut encryption: Option<(String, String)> = None;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -311,12 +289,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
                     "--compress" => {
                         compression = Some(parse_compression(&take_value(
-                            args, &mut idx, "--compress", inline,
-                        )?)?)
-                    }
-                    "--encrypt" => {
-                        encryption = Some(parse_encryption(&take_value(
-                            args, &mut idx, "--encrypt", inline,
+                            args,
+                            &mut idx,
+                            "--compress",
+                            inline,
                         )?)?)
                     }
                     other => return Err(format!("`--backup` 不支持参数 `{other}`")),
@@ -331,7 +307,6 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 firmware,
                 config,
                 compression,
-                encryption,
             })
         }
         "--restore" => {
@@ -1098,8 +1073,8 @@ fn run_cli_diagnose(out: Option<String>) -> i32 {
     }
 }
 
-/// `--backup`：打包外置驱动到 `.tar.gz`。
-/// `--backup`: pack out-of-tree drivers into a `.tar.gz` archive.
+/// `--backup`：打包外置驱动到归档（`--compress zstd|gzip|none`，默认 zstd → `.tar.zst`）。
+/// `--backup`: pack out-of-tree drivers into an archive (`--compress`, default zstd).
 fn run_cli_backup(
     out: Option<String>,
     mode: Option<BackupMode>,
@@ -1107,7 +1082,6 @@ fn run_cli_backup(
     firmware: Option<String>,
     config: Option<String>,
     compression: Option<String>,
-    encryption: Option<(String, String)>,
 ) -> i32 {
     // W7：配置补全模式 / 输出目录 / 固件策略（CLI 旗标永远优先）。
     let cfg = match config::Config::load(config.as_deref()) {
@@ -1125,7 +1099,11 @@ fn run_cli_backup(
     let out_path = match out {
         Some(raw) => expand_tilde(&raw),
         None => match &cfg.out_dir {
-            Some(dir) => dir.join(format!("driver-backup-{kver}.tar.gz")),
+            // W10：默认文件名扩展名跟随压缩算法（默认 zstd → `.tar.zst`）。
+            Some(dir) => dir.join(format!(
+                "driver-backup-{kver}.{}",
+                backup::archive_ext(compression.as_deref())
+            )),
             None => {
                 eprintln!(
                     "`--backup` 必须提供 `--out <归档路径>`（或在配置中设置 out_dir / \
@@ -1143,7 +1121,6 @@ fn run_cli_backup(
         progress: cli_progress(),
         firmware_policy,
         compression,
-        encryption,
         cancel: Arc::new(AtomicBool::new(false)),
     };
 
@@ -1597,7 +1574,12 @@ extern "C" {
 /// Open the native "pick archive" dialog (requires the `gui-dialogs` feature).
 #[cfg(feature = "gui-dialogs")]
 fn pick_archive(ui: &AppWindow) {
-    let mut dialog = rfd::FileDialog::new().add_filter("驱动备份归档", &["gz", "tgz", "tar.gz"]);
+    let mut dialog = rfd::FileDialog::new()
+        // W10：解锁后可能是 gzip/zstd/裸 tar，过滤器需覆盖全部三种。
+        .add_filter(
+            "驱动备份归档",
+            &["gz", "tgz", "tar.gz", "zst", "tar.zst", "tar"],
+        );
     if let Some(home) = std::env::var_os("HOME") {
         dialog = dialog.set_directory(home);
     }
@@ -1621,15 +1603,16 @@ fn pick_archive(ui: &AppWindow) {
 
 /// W6：打开“选择输出路径”原生保存对话框（需 `gui-dialogs` 特性）。
 #[cfg(feature = "gui-dialogs")]
-fn pick_out_path(ui: &AppWindow) {
+fn pick_out_path(ui: &AppWindow, compression: Option<&str>) {
     let kver = distro::kernel_release();
-    let default_name = backup::default_out_path(&kver)
+    let ext = backup::archive_ext(compression);
+    let default_name = backup::default_out_path(&kver, compression)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("driver-backup-{kver}.tar.gz"));
+        .unwrap_or_else(|| format!("driver-backup-{kver}.{ext}"));
     let Some(path) = rfd::FileDialog::new()
         .set_file_name(default_name)
-        .add_filter("驱动备份归档", &["gz"])
+        .add_filter("驱动备份归档", &[ext])
         .save_file()
     else {
         return;
@@ -1647,7 +1630,7 @@ fn pick_out_path(ui: &AppWindow) {
 
 /// 无 `gui-dialogs` 特性时的回退：提示手动输入。
 #[cfg(not(feature = "gui-dialogs"))]
-fn pick_out_path(ui: &AppWindow) {
+fn pick_out_path(ui: &AppWindow, _compression: Option<&str>) {
     ui.set_status_text("此构建未包含文件对话框，请手动输入输出路径。".into());
 }
 
@@ -1663,6 +1646,8 @@ fn run_gui() -> AppResult<()> {
     // W7：GUI 读取配置补全固件策略 / 回滚代数 / 压缩算法（GUI 没有 CLI 旗标，配置即默认）。
     let gui_cfg = config::Config::load(None).unwrap_or_default();
     let gui_compression = gui_cfg.compression.clone();
+    // 备份回调会 move 走 `gui_compression`，这里留一份给 GUI 默认文件名 / 保存对话框。
+    let gui_compression_name = gui_compression.clone();
 
     // ---- 启动时的静态信息 ----
     let kver = distro::kernel_release();
@@ -1684,7 +1669,7 @@ fn run_gui() -> AppResult<()> {
         .into(),
     );
     app.set_out_path(
-        backup::default_out_path(&kver)
+        backup::default_out_path(&kver, gui_compression.as_deref())
             .to_string_lossy()
             .to_string()
             .into(),
@@ -1783,7 +1768,7 @@ fn run_gui() -> AppResult<()> {
             let out = ui.get_out_path().to_string();
             let kver = distro::kernel_release();
             let out_path = if out.trim().is_empty() {
-                backup::default_out_path(&kver)
+                backup::default_out_path(&kver, gui_compression.as_deref())
             } else {
                 expand_tilde(out.trim())
             };
@@ -1809,7 +1794,6 @@ fn run_gui() -> AppResult<()> {
                     kver,
                     distro: DistroInfo::detect(),
                     compression: gui_compression.clone(),
-                    encryption: None, // GUI 暂不暴露加密（CLI 专属）
                     mode,
                     progress,
                     firmware_policy: gui_firmware.clone(),
@@ -2171,9 +2155,10 @@ fn run_gui() -> AppResult<()> {
     }
     {
         let weak = app.as_weak();
+        let gui_compression_name = gui_compression_name.clone();
         app.on_pick_out_path(move || {
             if let Some(ui) = weak.upgrade() {
-                pick_out_path(&ui);
+                pick_out_path(&ui, gui_compression_name.as_deref());
             }
         });
     }
@@ -2334,8 +2319,7 @@ fn main() {
             firmware,
             config,
             compression,
-            encryption,
-        } => run_cli_backup(out, mode, kver, firmware, config, compression, encryption),
+        } => run_cli_backup(out, mode, kver, firmware, config, compression),
         Cmd::Restore {
             archive,
             dry_run,
@@ -2535,6 +2519,7 @@ mod tests {
                 kver: None,
                 firmware: None,
                 config: None,
+                compression: None,
             }
         );
         assert_eq!(
@@ -2545,6 +2530,7 @@ mod tests {
                 kver: None,
                 firmware: None,
                 config: None,
+                compression: None,
             }
         );
         assert_eq!(
@@ -2567,6 +2553,7 @@ mod tests {
                 kver: Some("6.8.0-45-generic".to_string()),
                 firmware: Some("needed".to_string()),
                 config: Some("/etc/ldb.toml".to_string()),
+                compression: None,
             }
         );
         assert!(parse_args(&args(&["--backup", "--firmware", "yes"])).is_err());

@@ -198,6 +198,98 @@ fn failed_restore_exits_one() {
     }
 }
 
+/// W10 / §6：`--compress` 三档退出码矩阵 —— `zstd|gzip|none` 各自备份→体检→
+/// 还原预演全为 0，非法取值为 2（§5.2 契约）。
+/// W10 / §6: the `--compress` exit-code matrix — each of `zstd|gzip|none` backs up,
+/// verifies and dry-run restores with 0; an unknown algorithm exits 2.
+///
+/// 这是 W10 的验收用例：默认压缩已改为 zstd，任何一档若退化成「归档条目损坏」
+/// 都会在这里暴露（`verify` 曾硬编码 gzip，见 `verify::open`）。
+#[test]
+fn compress_matrix_exits_as_contracted() {
+    let dir = std::env::temp_dir().join(format!("ldb-compress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tempdir");
+
+    for algo in ["zstd", "gzip", "none"] {
+        let archive = dir.join(format!("a-{algo}.tar"));
+
+        let backup = bin()
+            .args([
+                "--backup",
+                "--out",
+                archive.to_str().expect("utf8"),
+                "--mode",
+                "minimal",
+                "--compress",
+                algo,
+            ])
+            .output()
+            .expect("spawn");
+        assert_eq!(
+            backup.status.code(),
+            Some(0),
+            "compress={algo} stderr: {}",
+            String::from_utf8_lossy(&backup.stderr)
+        );
+        assert!(
+            archive.is_file(),
+            "compress={algo}: 归档未产出 / archive missing"
+        );
+
+        // 体检必须通过：默认档为 zstd，读取端按魔数选解压器。
+        let verify = bin()
+            .args(["--verify", "--archive", archive.to_str().expect("utf8")])
+            .output()
+            .expect("spawn");
+        assert_eq!(
+            verify.status.code(),
+            Some(0),
+            "compress={algo} verify stderr: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        // 还原预演：三档都必须能被还原端解压。
+        let dry = bin()
+            .args([
+                "--restore",
+                "--archive",
+                archive.to_str().expect("utf8"),
+                "--dry-run",
+                "--yes",
+            ])
+            .output()
+            .expect("spawn");
+        assert_eq!(
+            dry.status.code(),
+            Some(0),
+            "compress={algo} dry-run stderr: {}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+    }
+
+    // 非法压缩算法 → 用法错误 2。
+    let bad = dir.join("bad.tar");
+    let out = bin()
+        .args([
+            "--backup",
+            "--out",
+            bad.to_str().expect("utf8"),
+            "--compress",
+            "brotli",
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// C-07：非 root 下 `--helper-restore` 必须自证失败（RESULT FAIL + 退出码 1）。
 /// C-07: `--helper-restore` must refuse to run without root.
 #[test]

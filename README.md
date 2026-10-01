@@ -289,7 +289,7 @@ target/release/linux-driver-backup
 |---|---|
 | *(无参数 / no args)* | 启动 GUI / launch the GUI |
 | `--scan [--mode <m>] [--json]` | 扫描并打印结果；`--json` 输出机器可读 JSON（便于测试），`<m>` 为 `minimal`/`standard`/`full` |
-| `--backup --out <f> [--mode <m>] [--kver <k>]` | 备份到指定归档文件 `<f>`；模式默认 `standard`，内核版本默认取当前运行内核 |
+| `--backup --out <f> [--mode <m>] [--kver <k>] [--compress zstd\|gzip\|none]` | 备份到指定归档文件 `<f>`；模式默认 `standard`，内核版本默认取当前运行内核；压缩默认 `zstd`（多线程）。自动生成的默认文件名扩展名跟随算法：`zstd → .tar.zst`、`gzip → .tar.gz`、`none → .tar` |
 | `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch] [--allow-arch-mismatch] [--root <dir>] [--strategy …]` | 从归档 `<f>` 还原；`--dry-run` 只预演不写盘，`--yes` 跳过交互确认，`--with-firmware` 允许还原固件；备份内核与当前不符用 `--allow-kernel-mismatch`（或交互确认），**架构不符**需独立的 `--allow-arch-mismatch`（或交互确认） |
 | `--helper-restore --archive <f> …` | **仅供内部使用**：由 `pkexec <自身> --helper-restore …` 以 root 重入时解析的内部标志，用户不应手动调用 |
 
@@ -301,8 +301,11 @@ target/release/linux-driver-backup
 # 1) 扫描外置驱动并以 JSON 输出（无需 root）
 ./target/release/linux-driver-backup --scan --mode standard --json
 
-# 2) 以 standard 模式备份到指定文件（无需 root）
-./target/release/linux-driver-backup --backup --out ~/driver-backup.tar.gz --mode standard
+# 2) 以 standard 模式备份（默认 zstd，扩展名随算法）
+./target/release/linux-driver-backup --backup --out ~/driver-backup.tar.zst --mode standard
+
+# 2b) 需要 gzip 兼容归档时
+./target/release/linux-driver-backup --backup --out ~/driver-backup.tar.gz --compress gzip
 
 # 3) 还原前先 dry-run 预演（只打印计划，不写盘）
 ./target/release/linux-driver-backup --restore --archive ~/driver-backup.tar.gz --dry-run --yes

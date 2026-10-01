@@ -1,0 +1,12 @@
+<!-- OBS 服务定义 / OBS source service definition
+     从 GitHub 拉取源码并回填 spec 版本占位（见 README §5）。 -->
+<services>
+  <service name="obs_scm">
+    <param name="scm">git</param>
+    <param name="url">https://github.com/ltbkq/linux-driver-backup.git</param>
+    <param name="versionformat">@VERSION@</param>
+  </service>
+  <service name="set_version">
+    <param name="file">linux-driver-backup.spec</param>
+  </service>
+</services>

@@ -95,7 +95,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -121,8 +121,65 @@ use crate::scan::{scan, ScanOptions};
 /// Walker 发给哈希阶段的任务：`(扫描序号, 条目)`。
 type ScanTask = (usize, ScanEntry);
 
-/// tar 的具体写者类型：gzip 压缩层 + tar 打包层。
-type TarWriter = TarBuilder<GzEncoder<File>>;
+/// tar 的具体写者类型：压缩层（gzip/zstd/无）+ tar 打包层。
+type TarWriter = TarBuilder<Compressor>;
+
+/// W10：整档压缩器 —— 按 `--compress zstd|gzip|none` 选择（默认 zstd）。
+/// Whole-archive compressor selected by `--compress` (default zstd).
+enum Compressor {
+    Gzip(GzEncoder<File>),
+    Zstd(zstd::Encoder<'static, File>),
+    None(File),
+}
+
+impl Compressor {
+    /// 按算法名创建压缩器；未知算法返回 `Err(Validation)`。
+    fn new(file: File, algorithm: &str) -> AppResult<Self> {
+        match algorithm {
+            "gzip" => Ok(Compressor::Gzip(GzEncoder::new(
+                file,
+                Compression::default(),
+            ))),
+            "zstd" => {
+                let mut encoder = zstd::Encoder::new(file, 3).map_err(AppError::Io)?;
+                // 多线程（0 = 自动按 CPU 核数）；失败则退回单线程，不中止。
+                let _ = encoder.multithread(0);
+                Ok(Compressor::Zstd(encoder))
+            }
+            "none" => Ok(Compressor::None(file)),
+            other => Err(AppError::Validation(format!(
+                "未知压缩算法 / unknown compression: {other}（可选 zstd | gzip | none）"
+            ))),
+        }
+    }
+
+    /// 收尾并返回底层文件（gzip/zstd 需 flush 帧）。
+    /// Finish the stream and return the underlying file.
+    fn finish(self) -> io::Result<File> {
+        match self {
+            Compressor::Gzip(w) => w.finish(),
+            Compressor::Zstd(w) => w.finish(),
+            Compressor::None(f) => Ok(f),
+        }
+    }
+}
+
+impl Write for Compressor {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Compressor::Gzip(w) => w.write(buf),
+            Compressor::Zstd(w) => w.write(buf),
+            Compressor::None(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Compressor::Gzip(w) => w.flush(),
+            Compressor::Zstd(w) => w.flush(),
+            Compressor::None(w) => w.flush(),
+        }
+    }
+}
 
 const CHANNEL_CAP: usize = 64;
 const HASH_CHUNK: usize = 64 * 1024;
@@ -340,18 +397,34 @@ impl Pipeline {
     }
 }
 
-/// 供 GUI 预填的默认输出路径：`$HOME/driver-backup-<kver>-<YYYYMMDD-HHMMSS>.tar.gz`。
-/// Default output path prefilled by the GUI: `~/driver-backup-<kver>-<ts>.tar.gz`.
+/// W10：按压缩算法给出归档扩展名（不含前导点）。
+/// Archive extension for the chosen algorithm (no leading dot).
 ///
+/// `zstd`（含默认/缺省）→ `tar.zst`；`gzip` → `tar.gz`；`none` → `tar`。
+/// 自动命名必须与归档内容一致，否则用户 `tar -xzf` 会对 zstd 流报错。
+/// Auto-generated names must match the stream, otherwise `tar -xzf` fails on zstd.
+pub fn archive_ext(compression: Option<&str>) -> &'static str {
+    match compression.unwrap_or("zstd") {
+        "gzip" => "tar.gz",
+        "none" => "tar",
+        _ => "tar.zst",
+    }
+}
+
+/// 供 GUI 预填的默认输出路径：`$HOME/driver-backup-<kver>-<YYYYMMDD-HHMMSS>.<ext>`。
+/// Default output path prefilled by the GUI: `~/driver-backup-<kver>-<ts>.<ext>`.
+///
+/// 扩展名由 [`archive_ext`] 按压缩算法决定（默认 zstd → `.tar.zst`）。
 /// `HOME` 取 `std::env::var("HOME")`，失败回退 `"."`；文件名中的 `kver` 先把 `/`
 /// 替换为 `_`，再用 [`is_safe_kernel_version`] 兜底清洗（只保留 `[0-9A-Za-z._+-]`、
 /// 首字符字母数字、长度 ≤ 128），时间戳为 UTC。
-pub fn default_out_path(kver: &str) -> PathBuf {
+pub fn default_out_path(kver: &str, compression: Option<&str>) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let name = format!(
-        "driver-backup-{}-{}.tar.gz",
+        "driver-backup-{}-{}.{}",
         sanitize_kver_filename(kver),
-        utc_timestamp(unix_now(), true)
+        utc_timestamp(unix_now(), true),
+        archive_ext(compression)
     );
     Path::new(&home).join(name)
 }
@@ -359,7 +432,7 @@ pub fn default_out_path(kver: &str) -> PathBuf {
 /// 备份请求：目标文件、内核版本、发行版、模式，以及进度/取消句柄。
 /// A backup request: destination, kernel release, distro, mode, progress and cancel handles.
 pub struct BackupRequest {
-    /// 目标 `.tar.gz` 路径。
+    /// 目标归档路径（扩展名由 [`archive_ext`] 按压缩算法决定）。
     pub out_file: PathBuf,
     /// 内核版本串（`uname -r`），须通过 [`is_safe_kernel_version`]。
     pub kver: String,
@@ -376,9 +449,6 @@ pub struct BackupRequest {
     /// 压缩算法（v0.4.0 W10）：`"zstd"` | `"gzip"` | `"none"`；`None` = 默认 `zstd`。
     /// Compression (W10): `"zstd"` | `"gzip"` | `"none"`; `None` = default `zstd`.
     pub compression: Option<String>,
-    /// 加密（v0.4.0 W11）：`Some((scheme, recipient))`，`scheme` 为 `"age"` | `"gpg"`；`None` = 不加密。
-    /// Encryption (W11): `Some((scheme, recipient))`; `None` = unencrypted.
-    pub encryption: Option<(String, String)>,
     /// 进度回调 `0.0..1.0`。
     pub progress: ProgressFn,
     /// 取消标志：置位后流水线尽快停止并删除半成品。
@@ -389,9 +459,9 @@ pub struct BackupRequest {
 /// Backup result: output path, byte size, entry count, elapsed time and the manifest.
 #[derive(Debug)]
 pub struct BackupReport {
-    /// 实际写出的 `.tar.gz`。
+    /// 实际写出的归档（`.tar.zst` / `.tar.gz` / `.tar`）。
     pub out_file: PathBuf,
-    /// `.tar.gz` 的最终字节数（压缩后）。
+    /// 归档的最终字节数（压缩后）。
     pub bytes_written: u64,
     /// 归档条目数（不含 `manifest.json`）。
     pub entry_count: usize,
@@ -430,7 +500,6 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         mode,
         firmware_policy,
         compression,
-        encryption,
         progress,
         cancel,
     } = req;
@@ -508,7 +577,6 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
                     mode,
                     firmware_policy,
                     compression,
-                    encryption,
                     &partial_started,
                 );
                 match outcome {
@@ -577,7 +645,7 @@ fn partial_out_path(out_file: &Path) -> PathBuf {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let name = match out_file.file_name() {
         Some(n) if !n.is_empty() => n.to_string_lossy().into_owned(),
-        _ => "driver-backup.tar.gz".to_string(),
+        _ => "driver-backup.tar".to_string(),
     };
     out_file.with_file_name(format!("{name}.ldb-partial-{}-{seq}", std::process::id()))
 }
@@ -927,13 +995,14 @@ fn packer_main(
     mode: BackupMode,
     firmware_policy: Option<FirmwarePolicy>,
     compression: Option<String>,
-    encryption: Option<(String, String)>,
     partial_started: &AtomicBool,
 ) -> AppResult<PackerOutcome> {
     // C-37：写入同目录 partial（不是 out_file 本体），成功后才 rename 替换。
     let file = File::create(partial)?;
     partial_started.store(true, Ordering::SeqCst);
-    let encoder = GzEncoder::new(file, Compression::default());
+    // W10：压缩算法（None = 默认 zstd）。
+    let algorithm = compression.clone().unwrap_or_else(|| "zstd".to_string());
+    let encoder = Compressor::new(file, &algorithm)?;
     let mut builder = TarWriter::new(encoder);
 
     let mut pending: BTreeMap<usize, ScanEntry> = BTreeMap::new();
@@ -1030,13 +1099,6 @@ fn packer_main(
     let manifest = Manifest {
         format_version: MANIFEST_FORMAT_VERSION,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        // W11：加密头（v3）；缺省 None = 不加密。
-        encryption: encryption
-            .as_ref()
-            .map(|(scheme, recipient)| crate::model::ManifestEncryption {
-                scheme: scheme.clone(),
-                recipient: recipient.clone(),
-            }),
         created_at: utc_timestamp(now, false),
         kernel_release: kver.to_string(),
         kernel_vermagic: crate::distro::reference_vermagic(kver),
@@ -1045,7 +1107,9 @@ fn packer_main(
         immutability: Some(crate::distro::immutability().tag().to_string()),
         secure_boot: Some(crate::distro::secure_boot_state().to_info()),
         mode,
-        compression: Some("gzip".to_string()),
+        compression: Some(algorithm.clone()),
+        // W11 保留字段：v0.4.1 起写入加密头；当前恒为不加密。
+        encryption: None,
         entries: manifest_entries,
         dkms,
         warnings,
@@ -1512,7 +1576,7 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let out = dir.join("out.tar.gz");
         let file = File::create(&out).expect("create archive");
-        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+        let mut builder = TarWriter::new(Compressor::new(file, "gzip").unwrap());
         let pipe = test_pipeline();
         let mut warnings = Vec::new();
         let written = write_entry(&mut builder, entry, &pipe, &mut warnings)
@@ -1579,16 +1643,17 @@ mod tests {
 
     #[test]
     fn default_out_path_is_a_safe_filename() {
-        let p = default_out_path("6.8.0/45-generic");
+        // W10：默认压缩为 zstd，扩展名必须跟随算法（否则 `tar -xzf` 会失败）。
+        let p = default_out_path("6.8.0/45-generic", None);
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
         assert!(
             name.starts_with("driver-backup-6.8.0_45-generic-"),
             "unexpected name: {name}"
         );
-        assert!(name.ends_with(".tar.gz"), "unexpected name: {name}");
+        assert!(name.ends_with(".tar.zst"), "unexpected name: {name}");
         assert!(!name.contains('/'), "unexpected name: {name}");
 
-        let p2 = default_out_path("../../evil");
+        let p2 = default_out_path("../../evil", Some("gzip"));
         let name2 = p2.file_name().and_then(|s| s.to_str()).unwrap_or("");
         assert!(
             name2.starts_with("driver-backup-"),
@@ -1597,12 +1662,21 @@ mod tests {
         assert!(!name2.contains('/'), "unexpected name: {name2}");
         assert!(name2.ends_with(".tar.gz"), "unexpected name: {name2}");
 
-        let p3 = default_out_path("");
+        let p3 = default_out_path("", Some("none"));
         let name3 = p3.file_name().and_then(|s| s.to_str()).unwrap_or("");
         assert!(
             name3.starts_with("driver-backup-unknown-"),
             "unexpected: {name3}"
         );
+        assert!(name3.ends_with(".tar"), "unexpected: {name3}");
+    }
+
+    #[test]
+    fn archive_ext_follows_algorithm() {
+        assert_eq!(archive_ext(None), "tar.zst");
+        assert_eq!(archive_ext(Some("zstd")), "tar.zst");
+        assert_eq!(archive_ext(Some("gzip")), "tar.gz");
+        assert_eq!(archive_ext(Some("none")), "tar");
     }
 
     #[test]
@@ -1890,7 +1964,7 @@ mod tests {
         let dir = temp_dir("badlink");
         let out = dir.join("out.tar.gz");
         let file = File::create(&out).unwrap();
-        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+        let mut builder = TarWriter::new(Compressor::new(file, "gzip").unwrap());
         let pipe = test_pipeline();
         let mut warnings = Vec::new();
         match write_entry(&mut builder, &entry, &pipe, &mut warnings) {
@@ -1907,7 +1981,7 @@ mod tests {
         std::fs::write(&src, b"firmware-bytes").expect("write firmware");
         let out = dir.join("out.tar.gz");
         let file = File::create(&out).unwrap();
-        let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
+        let mut builder = TarWriter::new(Compressor::new(file, "gzip").unwrap());
 
         let mut entry = scan_entry("lib/firmware/vendor/fw.bin", EntryKind::Firmware);
         entry.abs_path = src.clone();
