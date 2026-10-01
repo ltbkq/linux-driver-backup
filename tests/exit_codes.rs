@@ -137,6 +137,44 @@ fn failed_restore_exits_one() {
     }
 }
 
+/// C-07：非 root 下 `--helper-restore` 必须自证失败（RESULT FAIL + 退出码 1）。
+/// C-07: `--helper-restore` must refuse to run without root.
+#[test]
+fn helper_refuses_non_root() {
+    if unsafe { geteuid() } == 0 {
+        eprintln!("euid==0，跳过非 root 拒绝断言 / skipping non-root refusal assertion");
+        return;
+    }
+    let out = bin()
+        .args(["--helper-restore", "--archive", "/nonexistent/a.tar.gz"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("RESULT\tFAIL") && stdout.contains("root"),
+        "stdout: {stdout}"
+    );
+}
+
+/// C-07：非法 PKEXEC_UID 必须拒绝（仅 root 环境可构造，非 root 走上面的 euid 门）。
+/// C-07: a malformed PKEXEC_UID must be refused (only reachable as root).
+#[test]
+fn helper_rejects_invalid_pkexec_uid() {
+    if unsafe { geteuid() } != 0 {
+        eprintln!("euid!=0，跳过 PKEXEC_UID 断言 / skipping PKEXEC_UID assertion");
+        return;
+    }
+    let out = bin()
+        .args(["--helper-restore", "--archive", "/nonexistent/a.tar.gz"])
+        .env("PKEXEC_UID", "not-a-number")
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("PKEXEC_UID"), "stdout: {stdout}");
+}
+
 // 直接读 euid（裸 extern 声明，避免为一个符号引入 libc 依赖）。
 // Read euid via a bare extern declaration (no libc dependency for one symbol).
 extern "C" {

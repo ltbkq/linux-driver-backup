@@ -14,11 +14,17 @@
 //! NOTE\t<消息>
 //! RESULT\tOK|FAIL\t<消息>
 //! ```
+//!
+//! 取消传播（C-04）：父进程把 helper 的 **stdin 保持为管道**；用户点"取消"时
+//! 先关闭写端 → helper 端 `read` 得到 EOF → 置位本地取消标志 → 回滚已做部分 →
+//! 输出 `RESULT\tFAIL\t已取消` 后退出。超过宽限期仍未退出则向进程组补发
+//! `SIGTERM`（`process_group(0)`）并 `kill` 兜底。
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +46,20 @@ const STDERR_TAIL_LINES: usize = 20;
 const STDERR_KEEP: usize = 500;
 
 /// Poll interval while waiting for helper output, so cancel stays responsive.
+/// helper 确认取消时使用的协议消息（`RESULT\tFAIL\t<此文本>`，§5.3）。
+/// Protocol message the helper uses to confirm a cancellation (§5.3).
+const CANCELLED_MSG: &str = "已取消";
+
+/// `RESULT\tFAIL` 的消息是否表示"用户取消"（C-04：区分取消与真实失败）。
+/// Whether a `RESULT\tFAIL` message means "user cancelled" (C-04).
+fn is_cancelled_msg(msg: &str) -> bool {
+    msg.trim() == CANCELLED_MSG
+}
+
+/// 取消后等待 helper 自行回滚退出的宽限期。
+/// Grace period after cancellation before the process-group fallback fires.
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
 /// 等待 helper 输出的轮询间隔（保证取消标志及时生效）。
 const POLL: Duration = Duration::from_millis(100);
 
@@ -298,9 +318,10 @@ pub fn run_helper_via_pkexec(
     cmd.arg(&exe)
         .arg(HELPER_FLAG)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped()) // C-04：取消 = 关闭本管道写端（helper 收到 EOF）
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0); // C-04 兜底：pkexec 与 helper 同组，便于组信号收敛
 
     let mut child = cmd.spawn().map_err(|e| {
         AppError::Privilege(format!(
@@ -309,6 +330,9 @@ pub fn run_helper_via_pkexec(
             e
         ))
     })?;
+
+    // 保留 stdin 句柄：取消时 drop 它 = 向 helper 传递 EOF（C-04）。
+    let mut child_stdin = child.stdin.take();
 
     let stdout = match child.stdout.take() {
         Some(s) => s,
@@ -372,6 +396,10 @@ pub fn run_helper_via_pkexec(
                         break;
                     }
                     Some(HelperMsg::Result(false, msg)) => {
+                        // W2/C-04：helper 自身确认的取消要归类为 Cancelled 而非提权失败。
+                        if is_cancelled_msg(&msg) {
+                            cancelled = true;
+                        }
                         fail_msg = Some(msg);
                         break;
                     }
@@ -384,6 +412,29 @@ pub fn run_helper_via_pkexec(
     }
 
     // 统一收割：确保子进程退出并回收线程。
+    if cancelled {
+        // C-04：先关闭 stdin 写端（helper EOF → 置位取消 → 回滚 → RESULT FAIL 已取消），
+        // 给它宽限期自行收敛；超时才动用进程组信号与 kill 兜底。
+        drop(child_stdin.take());
+        let deadline = Instant::now() + CANCEL_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,      // 已退出
+                Ok(None) => {}             // 仍在运行
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                // 兜底：向整个进程组（pkexec+helper）发 TERM，再强杀 pkexec 本体。
+                let _ = Command::new("kill")
+                    .args(["-s", "TERM", "--", &format!("-{}", child.id())])
+                    .status();
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    drop(child_stdin.take()); // 正常路径：确保写端关闭，避免孙进程持有管道
     let _ = child.kill(); // 已退出时返回 Err，忽略
     let status = child
         .wait()
@@ -391,7 +442,8 @@ pub fn run_helper_via_pkexec(
     // 有限等待排空线程收尾（孙进程可能继承管道，不能无限 join）
     join_within(Some(stdout_thread), DRAIN_WAIT);
     join_within(stderr_thread, DRAIN_WAIT);
-    if cancelled {        return Err(AppError::Cancelled);
+    if cancelled {
+        return Err(AppError::Cancelled);
     }
     if let Some(msg) = ok_msg {
         return Ok(msg);
@@ -424,6 +476,19 @@ pub fn run_helper_via_pkexec(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cancelled_result_line_is_recognised() {
+        // §5.3 行协议：取消 = RESULT FAIL 已取消（不能与真实失败混淆）。
+        assert!(is_cancelled_msg("已取消"));
+        assert!(is_cancelled_msg(" 已取消 "));
+        assert!(!is_cancelled_msg("提权失败"));
+        assert!(!is_cancelled_msg("还原失败：磁盘满"));
+        assert_eq!(
+            parse_line("RESULT\tFAIL\t已取消"),
+            Some(HelperMsg::Result(false, "已取消".to_string()))
+        );
+    }
 
     #[test]
     fn parses_progress_line() {

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!--
+  linux-driver-backup 的 polkit policy / polkit policy for linux-driver-backup
+  ============================================================================
+  · 契约 / Contract: docs/ITERATION-v0.3.0.md §4-W2（C-51 / P1-4）与 §5.3
+    - action id : io.github.ltbkq.linux-driver-backup
+    - 落盘位置  : /usr/share/polkit-1/actions/（四个打包器 + install.sh 统一安装）
+    - auth_admin_keep：同一活动会话内连续两次还原只认证一次（P1-4）。
+      auth_admin_keep: authenticate only once for consecutive restores (P1-4).
+  · pkexec 通过注解 org.freedesktop.policykit.exec.path 找到本 action：
+    二进制路径必须与实际安装路径一致，否则回落到通用的
+    org.freedesktop.policykit.exec（无品牌提示、每次都认证）。
+    pkexec matches this action via the exec.path annotation; if the path does not
+    match the installed binary, pkexec falls back to the generic action.
+  · packaging/install.sh 在安装时会把下面的路径改写成 $prefix/bin/…
+    （C-55：--prefix=/opt/ldb 等非 /usr 前缀也要拿到品牌化对话框）。
+  · vendor 元素按任务约定省略 / the <vendor> element is intentionally omitted.
+  · 校验 / validate:
+      xmllint --noout --valid packaging/polkit/linux-driver-backup.policy
+      pkaction | grep io.github.ltbkq     # 安装后 / after installation
+-->
+<policyconfig>
+  <vendor_url>https://github.com/ltbkq/linux-driver-backup</vendor_url>
+
+  <action id="io.github.ltbkq.linux-driver-backup">
+    <description>备份与还原 Linux 外置（out-of-tree）驱动模块 / Back up and restore out-of-tree (third-party) Linux kernel drivers</description>
+    <message>需要认证才能以 root 身份还原驱动模块 / Authentication is required to restore kernel drivers as root</message>
+    <defaults>
+      <!-- 任何会话都需要管理员认证 / admin auth in every session -->
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!-- 活动会话：认证后保持一段时间，连续两次还原只输一次密码（P1-4） -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <!-- pkexec 按此路径匹配 action；与安装路径不一致即失效 -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/linux-driver-backup</annotate>
+    <!-- 允许在图形会话里以 root 启动 GUI 入口 / allow launching the GUI entry as root -->
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

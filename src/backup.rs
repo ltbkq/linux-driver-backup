@@ -1,33 +1,58 @@
-//! 备份流水线：扫描 → 哈希 → 打包（三段多线程流水作业）。
-//! Backup pipeline: scan → hash → pack (three-stage multithreaded pipeline).
+//! 备份流水线：扫描 → 打包（两段流水作业，**单遍读**）。
+//! Backup pipeline: scan → pack (two-stage pipeline, single read pass).
 //!
 //! # 线程结构 / Thread structure
 //!
 //! ```text
-//! Stage 1 Walker ──sync_channel(64)──▶ Stage 2 Hasher×N ──sync_channel(64)──▶ Stage 3 Packer
-//!  crate::scan::scan()                  读文件 + SHA-256                      GzEncoder<File>
-//!  产出 (index, ScanEntry)              累加 bytes_hashed 计数器             + tar::Builder
-//!  （有界通道 = 背压）                    （有界通道 = 背压）                    末尾追加 manifest.json
+//! Stage 1 Walker ──sync_channel(64)──▶ Stage 2 Packer
+//!  crate::scan::scan()                  open 一次 → HashingReader 单遍读
+//!  产出 (index, ScanEntry)              tar 读取的同时同步喂 SHA-256
+//!  （有界通道 = 背压）                    末尾追加 manifest.json → fsync → rename
 //! ```
 //!
-//! - **Stage 1 Walker**：调用 [`crate::scan::scan`] 得到 [`ScanReport`]，为每个条目分配
-//!   其在 `entries` 中的下标后，经 `sync_channel::<(usize, ScanEntry)>(64)` 送入哈希阶段。
+//! - **Stage 1 Walker**：调用 [`crate::scan::scan`] 得到 [`ScanReport`]，先按
+//!   [`FirmwarePolicy`] 过滤固件条目（W5 固件按需收集），再为每个条目分配其在
+//!   `entries` 中的下标后，经 `sync_channel::<(usize, ScanEntry)>(64)` 送入打包阶段。
 //!   有界通道提供背压，full 模式下的 `/lib/firmware` 不会把内存吃光。
-//! - **Stage 2 Hasher × N**（`N = min(4, available_parallelism())`）：打开文件计算 SHA-256，
-//!   **边读边把字节数累加到共享原子计数器 `bytes_hashed`** 供进度使用，产出
-//!   [`HashedEntry`] 再经 `sync_channel::<HashedEntry>(64)` 送入打包阶段。
-//!   tar 只能有唯一写者，因此哈希阶段**绝不写 tar**，只做"读 + 哈希"。
-//! - **Stage 3 Packer**：`flate2::write::GzEncoder<File>` + `tar::Builder` 的唯一写者，
+//! - **Stage 2 Packer**：`flate2::write::GzEncoder<File>` + `tar::Builder` 的唯一写者，
 //!   按序写入 `data/<rel_path>`（mode `0o644`、uid/gid `0`、mtime 取自源文件
 //!   `std::os::unix::fs::MetadataExt::mtime`），末尾追加 `manifest.json`。
+//!   **每个文件只 `open` 一次**：[`HashingReader`] 在 tar 拉取数据的同时把字节喂给
+//!   SHA-256 与进度计数器 —— C-38 的"哈希与打包双读"由此消灭（v0.2.x 的
+//!   Stage 2 Hasher×N 已并入本阶段）。
+//!
+//! # sha256 语义（C-38；v2 字段格式不变，仅语义收紧）
+//!
+//! `ManifestEntry.sha256` 自 v0.3.0 起描述**归档内实际写入的字节**：数据条目在
+//! 单遍读取时由 [`HashingReader`] 同步喂入 hasher，`tar::Builder::append_data`
+//! 返回即得到该条目的最终摘要，随后（`manifest.json` 在全部数据条目之后追加，
+//! 现有顺序已如此）写入 `ManifestEntry.sha256`。此前摘要来自独立的第二遍读取，
+//! 内容在两遍之间被修改时摘要与归档不一致；现在**摘要恒等于归档内容的哈希**。
+//! 字段格式（64 位小写十六进制）与 v2 字段布局保持不变。读取前后尽力检测
+//! mtime/len/inode 变化并记 warning，但**摘要始终描述已写入归档的字节**。
+//!
+//! # 输出原子性 / Output atomicity（C-37）
+//!
+//! 实际写入的不是 `out_file` 本身，而是**同目录**临时名 `<out>.ldb-partial-<pid>-<seq>`
+//! （见 [`partial_out_path`]）：全部成功（manifest 落位、tar finish、`sync_all`）后
+//! `fs::rename` 原子替换目标路径；任何失败或取消都只删除 partial ——
+//! **同路径的旧备份文件在失败时完好无损**（旧实现 `File::create` 先截断目标是缺陷）。
+//!
+//! # 单文件失败 / Per-file failures（C-37）
+//!
+//! 单个不可读文件（权限、竞态删除、打开期 IO 错误、扫描后被换成符号链接的竞态）
+//! → **跳过该条目 + 计入 manifest warnings**
+//! （`跳过不可读文件 / skipped unreadable: <path>`），不再中止整个备份；
+//! 结构性错误（无法创建输出、`rel_path` 非法、归档头失败、数据读取中途 IO 错误、
+//! manifest 序列化失败）仍然中止。
 //!
 //! # 顺序一致性策略 / Ordering strategy
 //!
-//! 采用 **「扫描序号 + Packer 侧 `BTreeMap` 重排」**（即允许多哈希线程并行的正确版本）：
+//! 采用 **「扫描序号 + Packer 侧 `BTreeMap` 重排」**：
 //!
 //! 1. Walker 给每个 `ScanEntry` 分配其在 `ScanReport::entries` 中的下标 `index`；
-//! 2. N 个哈希线程并发读取，完成顺序必然乱序；
-//! 3. Packer **先 `recv()` 再重排**：结果放入 `BTreeMap<usize, HashedEntry>`，只有当
+//! 2. 条目经有界通道送达，完成顺序不作假设；
+//! 3. Packer **先 `recv()` 再重排**：结果放入 `BTreeMap<usize, ScanEntry>`，只有当
 //!    `next` 序号就绪时才写入 tar 并推进 `next`。因此 **tar 内条目顺序、
 //!    `manifest.entries` 顺序与扫描顺序完全一致**；又因为 Packer 每轮都先接收，
 //!    等待某个序号不会堵住通道，背压依然成立、也不会死锁；
@@ -36,23 +61,25 @@
 //!
 //! # 进度 / Progress
 //!
-//! 按 DESIGN.md §4.4 的字节加权分段：
+//! 按 DESIGN.md §4.4 的字节加权分段（哈希段由 Packer 内的 [`HashingReader`] 喂入）：
 //!
 //! - `0.00` 开始扫描 → `0.10` 扫描完成（强制回调，附体积与条目统计）；
-//! - `0.10..=0.70` 哈希阶段：`bytes_hashed / total_bytes` 线性映射；
-//! - `0.70..=0.95` 打包阶段：`bytes_packed / total_bytes` 叠加映射；
+//! - `0.10..=0.70` 哈希段：`bytes_hashed / total_bytes` 线性映射；
+//! - `0.70..=0.95` 打包段：`bytes_packed / total_bytes` 叠加映射；
 //!   两个计数器都只增不减，因此整体进度**单调不回退**；
 //! - `0.95` 写入 manifest 前 → `1.00` 备份完成（强制回调）。
 //!
-//! 回调统一节流：**距上次回调 ≥ 100ms 或进度变化 ≥ 1%** 才上抛（阶段边界的
-//! 0.00/0.10/0.95/1.00 强制上抛），避免刷爆 UI 事件队列。
+//! C-44（以下两句与 `restore.rs` 节流对齐，恢复侧逐字照抄）：
+//! - 进度回调节流统一为「距上次回调 ≥ 40ms **或** 进度增量 ≥ 0.01」（**或**语义，任一满足即上抛）。
+//! - 回调**前**先在锁内取快照（值 + 消息 clone），释放锁后再调用 callback，慢回调不再阻塞流水线线程。
 //!
 //! # 取消 / Cancel
 //!
-//! `Arc<AtomicBool>` 三阶段共享，并透传给 `scan()`（Walker 阶段即可中断）。任一阶段
+//! `Arc<AtomicBool>` 各阶段共享，并透传给 `scan()`（Walker 阶段即可中断）。任一阶段
 //! 看到取消或其它阶段报错（内部 `abort` 标志）就停止工作并关闭自己的发送端，从而让上游
 //! `send()` 失败并连锁退出 —— **不会留下永久阻塞的线程**。调用线程在 join 全部阶段后
-//! 删除半成品 `out_file`（删除失败忽略），再返回 [`AppError::Cancelled`] 或首个错误。
+//! 删除 partial 临时文件（删除失败忽略；`out_file` 从不被失败路径触碰），
+//! 再返回 [`AppError::Cancelled`] 或首个错误。
 //!
 //! # 错误传播 / Error propagation
 //!
@@ -66,7 +93,7 @@
 //! 写入 tar 前逐条校验 `rel_path`：拒绝含 `..` 组件的路径、拒绝以 `/` 开头的绝对路径、
 //! 拒绝空路径与 NUL 字节，否则返回 [`AppError::Format`]（见 DESIGN.md §4.5）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -98,7 +125,10 @@ type TarWriter = TarBuilder<GzEncoder<File>>;
 
 const CHANNEL_CAP: usize = 64;
 const HASH_CHUNK: usize = 64 * 1024;
-const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// C-44：进度回调节流的最小间隔（与 restore.rs 对齐，`或` 语义的其中一支）。
+/// C-44: minimum interval between progress callbacks (OR-semantics, aligned with restore.rs).
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(40);
+/// C-44：进度回调节流的最小增量（`或` 语义的另一支）。
 const PROGRESS_MIN_DELTA: f32 = 0.01;
 
 /// 一次成功打包的产物（Packer → 调用线程）。
@@ -108,12 +138,93 @@ struct PackerOutcome {
     entry_count: usize,
 }
 
-/// 哈希阶段的产出：条目 + 序号 + SHA-256 + 实际读到的字节数。
-struct HashedEntry {
-    index: usize,
-    entry: ScanEntry,
+/// W5 固件收集策略（`BackupRequest::firmware_policy` 解析结果）。
+/// Firmware collection policy (W5), parsed from `BackupRequest::firmware_policy`.
+///
+/// `BackupRequest::firmware_policy` 为 `None` 时整个枚举都为 `None`，
+/// 扫描与过滤**完全保持 mode 现行为**（minimal/standard/full 各自现状，零行为变化）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwarePolicy {
+    /// `all`：整棵 `/lib/firmware` 整树收集（等同现有 full 模式行为）。
+    All,
+    /// `needed`：只收集模块 `modinfo.firmware` 命中的条目（standard 模式默认目标）。
+    Needed,
+    /// `none`：不收集任何固件条目。
+    None,
+}
+
+impl FirmwarePolicy {
+    /// 解析 CLI 值；未知取值返回 `None`（由调用方转成 [`AppError::Validation`]）。
+    /// Parse a CLI value; unknown strings yield `None`.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "all" => Some(FirmwarePolicy::All),
+            "needed" => Some(FirmwarePolicy::Needed),
+            "none" => Some(FirmwarePolicy::None),
+            _ => None,
+        }
+    }
+
+    /// 写入 `manifest.firmware_policy` 的规范串。
+    /// The canonical string recorded into `manifest.firmware_policy`.
+    fn as_str(self) -> &'static str {
+        match self {
+            FirmwarePolicy::All => "all",
+            FirmwarePolicy::Needed => "needed",
+            FirmwarePolicy::None => "none",
+        }
+    }
+}
+
+/// 解析并校验 `BackupRequest::firmware_policy`（W5 接线；非法值直接拒绝）。
+/// Parse and validate `BackupRequest::firmware_policy` (W5 wiring; invalid values are rejected).
+fn parse_firmware_policy(raw: Option<&str>) -> AppResult<Option<FirmwarePolicy>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match FirmwarePolicy::parse(raw.trim()) {
+        Some(policy) => Ok(Some(policy)),
+        None => Err(AppError::Validation(format!(
+            "非法固件收集策略: {raw:?}（应为 all|needed|none）/ invalid firmware policy"
+        ))),
+    }
+}
+
+/// W5：把（模式, 策略）换算成实际交给 `scan()` 的扫描模式。
+/// W5: map (mode, policy) onto the mode actually handed to `scan()`.
+///
+/// 只在**固件维度**上调整扫描范围（manifest 记录的仍是用户选择的原始 `mode`）：
+///
+/// | policy | Minimal | Standard | Full |
+/// |---|---|---|---|
+/// | `None` | Minimal | Standard | Full（零行为变化） |
+/// | `all` / `needed` | Minimal（不扩权） | **Full** | Full |
+/// | `none` | Minimal | Standard | **Standard**（跳过整树遍历，等价于"扫了再全丢"） |
+///
+/// `Standard → Full` 恰好等于"加上固件扫描"（`scan()` 里 Full = Standard + 固件树），
+/// 因此 standard + `needed` 能真正收集到命中的固件；Minimal 保持不扩权，
+/// 不会因为固件策略顺带引入 Standard 的 DKMS 收录范围。
+fn scan_mode_for(policy: Option<FirmwarePolicy>, mode: BackupMode) -> BackupMode {
+    match (policy, mode) {
+        (None, m) => m,
+        (Some(FirmwarePolicy::None), BackupMode::Full) => BackupMode::Standard,
+        (Some(FirmwarePolicy::None), m) => m,
+        (Some(FirmwarePolicy::All | FirmwarePolicy::Needed), BackupMode::Standard) => {
+            BackupMode::Full
+        }
+        (Some(FirmwarePolicy::All | FirmwarePolicy::Needed), m) => m,
+    }
+}
+
+/// 单个条目写入 tar 的结果：`None` 表示该条目被跳过（不可读，C-37）。
+/// Outcome of writing one entry: `None` means the entry was skipped (unreadable, C-37).
+#[derive(Debug)]
+struct WrittenEntry {
+    /// 实际写入内容区的字节数（符号链接与 `content_stored=false` 为 0）。
+    bytes: u64,
+    /// 归档内容的 SHA-256（C-38：恒等于归档内字节的摘要；
+    /// 符号链接为目标字符串摘要，`content_stored=false` 为磁盘内容摘要）。
     sha256: String,
-    hashed_bytes: u64,
 }
 
 /// 进度节流状态（三阶段共用一把锁，保证回调有序）。
@@ -193,19 +304,27 @@ impl Pipeline {
     }
 
     /// 上报进度；`force` 用于阶段边界，绕过节流。
+    ///
+    /// C-44（以下两句与 `restore.rs` 节流对齐，恢复侧逐字照抄）：
+    /// - 进度回调节流统一为「距上次回调 ≥ 40ms **或** 进度增量 ≥ 0.01」（**或**语义，任一满足即上抛）。
+    /// - 回调**前**先在锁内取快照（值 + 消息 clone），释放锁后再调用 callback，慢回调不再阻塞流水线线程。
     fn emit(&self, value: f32, msg: &str, force: bool) {
-        let mut state = heal(&self.throttle);
-        let now = Instant::now();
-        if !force {
-            let elapsed = now.duration_since(state.last_at);
-            let delta = (value - state.last_value).abs();
-            if elapsed < PROGRESS_MIN_INTERVAL && delta < PROGRESS_MIN_DELTA {
-                return;
+        let snapshot = {
+            let mut state = heal(&self.throttle);
+            let now = Instant::now();
+            if !force {
+                let elapsed = now.duration_since(state.last_at);
+                let delta = (value - state.last_value).abs();
+                if elapsed < PROGRESS_MIN_INTERVAL && delta < PROGRESS_MIN_DELTA {
+                    return;
+                }
             }
-        }
-        state.last_at = now;
-        state.last_value = value;
-        (self.progress)(value, msg.to_string());
+            state.last_at = now;
+            state.last_value = value;
+            (value, msg.to_string())
+        };
+        // 锁已释放，慢回调不会阻塞其它流水线线程（C-44）。
+        (self.progress)(snapshot.0, snapshot.1);
     }
 
     /// 依据两个单调递增的字节计数器上报进度，换算到 `0.10..=0.95`（哈希与打包共用）。
@@ -248,9 +367,10 @@ pub struct BackupRequest {
     /// 备份模式。
     pub mode: BackupMode,
     /// 固件收集策略（v0.3.0 W5/P1-3，可选）：`"all"` | `"needed"` | `"none"`。
-    /// `None` = 按 `mode` 现有行为（零行为变化，待 CLI `--firmware` 接线）。
+    /// `None` = 按 `mode` 现有行为（零行为变化）；非 `None` 时按 [`FirmwarePolicy`]
+    /// 过滤（或扩展）固件条目，非法取值报 [`AppError::Validation`]。
     /// Firmware collection policy (W5): `"all"` | `"needed"` | `"none"`;
-    /// `None` keeps today's mode-driven behaviour until `--firmware` is wired up.
+    /// `None` keeps today's mode-driven behaviour (zero change).
     pub firmware_policy: Option<String>,
     /// 进度回调 `0.0..1.0`。
     pub progress: ProgressFn,
@@ -274,11 +394,12 @@ pub struct BackupReport {
     pub manifest: Manifest,
 }
 
-/// 运行三段流水备份：Walker → Hasher×N → Packer，内部自建线程。
-/// Run the three-stage backup pipeline (Walker → Hashers → Packer) on internal threads.
+/// 运行两段流水备份：Walker → Packer（单遍读），内部自建线程。
+/// Run the two-stage backup pipeline (Walker → Packer, single read pass) on internal threads.
 ///
-/// 成功返回 [`BackupReport`]；失败时删除半成品 `out_file`（删除失败忽略）并返回：
-/// - [`AppError::Validation`]：`kver` 非法或输出路径为空；
+/// 成功返回 [`BackupReport`]；失败时删除 partial 临时文件并返回（**同路径的旧
+/// `out_file` 保持原样**，C-37）：
+/// - [`AppError::Validation`]：`kver` 非法、输出路径为空或 `firmware_policy` 取值非法；
 /// - [`AppError::Cancelled`]：用户取消；
 /// - [`AppError::Format`]：`rel_path` 含 `..` / 绝对路径等不安全路径；
 /// - [`AppError::Io`] / [`AppError::Json`]：读写或序列化失败。
@@ -304,8 +425,10 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         progress,
         cancel,
     } = req;
-    // W5 接线占位：策略选择在固件收集阶段生效（主任务随后实现）。
-    let _ = firmware_policy;
+    // W5：解析固件收集策略（`None` = 按 mode 现行为，零行为变化；非法取值直接拒绝）。
+    let firmware_policy = parse_firmware_policy(firmware_policy.as_deref())?;
+    // 固件维度换算出的扫描模式；manifest 记录的仍是用户选择的原始 `mode`。
+    let scan_mode = scan_mode_for(firmware_policy, mode);
     if out_file.as_os_str().is_empty() {
         return Err(AppError::Validation(
             "备份输出路径为空 / empty output path".to_string(),
@@ -316,6 +439,8 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // C-37：实际写入同目录 partial，全部成功后才 rename 到 out_file。
+    let partial_path = partial_out_path(&out_file);
 
     // ---- 1. 共享状态 / shared pipeline state ----
     let pipe = Arc::new(Pipeline {
@@ -333,13 +458,11 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         entry_total: Arc::new(AtomicUsize::new(0)),
         scan_slot: Arc::new(Mutex::new(None)),
     });
-    let file_started = Arc::new(AtomicBool::new(false));
+    let partial_started = Arc::new(AtomicBool::new(false));
 
-    // ---- 2. 三段之间的有界通道 / bounded channels between stages ----
+    // ---- 2. 段间有界通道 / bounded channel between the two stages ----
     let (scan_tx, scan_rx) = sync_channel::<ScanTask>(CHANNEL_CAP);
-    let (hash_tx, hash_rx) = sync_channel::<HashedEntry>(CHANNEL_CAP);
     let (done_tx, done_rx) = channel::<Option<PackerOutcome>>();
-    let shared_scan_rx = Arc::new(Mutex::new(scan_rx));
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -350,46 +473,33 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
         let distro = distro.clone();
         let spawned = thread::Builder::new()
             .name("backup-walker".to_string())
-            .spawn(move || walker_main(&p, &kver, &distro, mode, scan_tx));
+            .spawn(move || walker_main(&p, &kver, &distro, scan_mode, firmware_policy, scan_tx));
         match spawned {
             Ok(h) => handles.push(h),
             Err(e) => pipe.fail(AppError::Io(e)),
         }
     }
 
-    // Stage 2：Hasher × N（N = min(4, 可用核数)）
-    let n_hashers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4);
-    for i in 0..n_hashers {
-        let p = pipe.clone();
-        let input = shared_scan_rx.clone();
-        let output = hash_tx.clone();
-        let spawned = thread::Builder::new()
-            .name(format!("backup-hasher-{i}"))
-            .spawn(move || hasher_main(&p, &input, &output));
-        match spawned {
-            Ok(h) => handles.push(h),
-            Err(e) => pipe.fail(AppError::Io(e)),
-        }
-    }
-    // 关键：主线程不保留发送端副本，最后一个哈希线程退出即关闭哈希通道。
-    drop(hash_tx);
-    drop(shared_scan_rx);
-
-    // Stage 3：Packer 线程（tar 的唯一写者）
+    // Stage 2：Packer 线程（tar 的唯一写者；单遍读 + 原子替换）
     {
         let p = pipe.clone();
-        let out_file = out_file.clone();
+        let partial_path = partial_path.clone();
         let kver = kver.clone();
         let distro = distro.clone();
-        let file_started = file_started.clone();
+        let partial_started = partial_started.clone();
         let spawned = thread::Builder::new()
             .name("backup-packer".to_string())
             .spawn(move || {
-                let outcome =
-                    packer_main(&p, hash_rx, &out_file, &kver, &distro, mode, &file_started);
+                let outcome = packer_main(
+                    &p,
+                    scan_rx,
+                    &partial_path,
+                    &kver,
+                    &distro,
+                    mode,
+                    firmware_policy,
+                    &partial_started,
+                );
                 match outcome {
                     Ok(o) => {
                         let _ = done_tx.send(Some(o));
@@ -417,20 +527,28 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
 
     pipe.sweep_cancel();
     if let Some(err) = pipe.take_error() {
-        remove_partial(&out_file, &file_started);
+        remove_partial(&partial_path, &partial_started);
         return Err(err);
     }
 
     match done {
-        Some(Some(o)) => Ok(BackupReport {
-            out_file,
-            bytes_written: o.bytes_written,
-            entry_count: o.entry_count,
-            duration_ms: started.elapsed().as_millis(),
-            manifest: o.manifest,
-        }),
+        Some(Some(o)) => {
+            // C-37：只有流水线全部成功（manifest 落位 + tar finish + `sync_all`）后，
+            // 才把同目录 partial **原子 rename** 到目标路径；rename 前 `out_file` 从未被触碰。
+            if let Err(err) = std::fs::rename(&partial_path, &out_file) {
+                remove_partial(&partial_path, &partial_started);
+                return Err(AppError::Io(err));
+            }
+            Ok(BackupReport {
+                out_file,
+                bytes_written: o.bytes_written,
+                entry_count: o.entry_count,
+                duration_ms: started.elapsed().as_millis(),
+                manifest: o.manifest,
+            })
+        }
         _ => {
-            remove_partial(&out_file, &file_started);
+            remove_partial(&partial_path, &partial_started);
             Err(AppError::Format(
                 "备份流水线异常终止 / backup pipeline terminated unexpectedly".to_string(),
             ))
@@ -438,11 +556,28 @@ pub fn run_backup(req: BackupRequest) -> AppResult<BackupReport> {
     }
 }
 
-/// 删除半成品输出文件（仅在确实创建过时才删，删除失败忽略）。
-/// Remove the partially written archive; failures are ignored.
-fn remove_partial(out_file: &Path, file_started: &AtomicBool) {
-    if file_started.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_file(out_file);
+/// C-37：生成与目标**同目录**的临时输出名 `<name>.ldb-partial-<pid>-<seq>`。
+/// C-37: build the sibling temporary output name `<name>.ldb-partial-<pid>-<seq>`.
+///
+/// 同目录保证 `fs::rename` 原子（不跨文件系统）；`pid` + 进程内自增序号避免并发
+/// 备份互相踩踏。失败/取消路径只删除该临时文件，`out_file` 从不被触碰。
+fn partial_out_path(out_file: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = match out_file.file_name() {
+        Some(n) if !n.is_empty() => n.to_string_lossy().into_owned(),
+        _ => "driver-backup.tar.gz".to_string(),
+    };
+    out_file.with_file_name(format!("{name}.ldb-partial-{}-{seq}", std::process::id()))
+}
+
+/// 删除 partial 临时文件（仅在确实创建过时才删，删除失败忽略）。
+/// **绝不触碰 `out_file`**：同路径旧备份在任何失败路径下都完好无损（C-37）。
+/// Remove the partial temp file (only when it was created; failures are ignored).
+/// The final `out_file` is never touched, so a pre-existing backup survives any failure.
+fn remove_partial(partial: &Path, started: &AtomicBool) {
+    if started.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(partial);
     }
 }
 
@@ -450,13 +585,14 @@ fn remove_partial(out_file: &Path, file_started: &AtomicBool) {
 // Stage 1: Walker
 // ---------------------------------------------------------------------------
 
-/// Stage 1：全树扫描并把条目（带序号）送入哈希阶段。
-/// Stage 1: scan the whole tree and feed indexed entries into the hashing stage.
+/// Stage 1：全树扫描，按固件策略（W5）过滤后把条目（带序号）送入打包阶段。
+/// Stage 1: scan the whole tree, apply the firmware policy (W5) and feed indexed entries downstream.
 fn walker_main(
     pipe: &Pipeline,
     kver: &str,
     distro: &DistroInfo,
-    mode: BackupMode,
+    scan_mode: BackupMode,
+    firmware_policy: Option<FirmwarePolicy>,
     output: SyncSender<ScanTask>,
 ) {
     pipe.emit(0.0, "扫描中… / scanning", true);
@@ -464,7 +600,7 @@ fn walker_main(
     let opt = ScanOptions {
         kver,
         distro,
-        mode,
+        mode: scan_mode,
         cancel: Some(&*pipe.cancel),
     };
     let mut report = match scan(&opt) {
@@ -479,22 +615,29 @@ fn walker_main(
         return;
     }
 
-    let total: u64 = report.entries.iter().map(|e| e.size).sum();
-    pipe.total_bytes.store(total, Ordering::SeqCst);
+    // W5：按固件收集策略过滤扫描结果（策略为 None 时原样返回，零行为变化）。
     let entries = std::mem::take(&mut report.entries);
+    let (entries, fw_stats) = apply_firmware_policy(entries, firmware_policy, &mut report);
+
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    pipe.total_bytes.store(total, Ordering::SeqCst);
     pipe.entry_total.store(entries.len(), Ordering::SeqCst);
 
-    pipe.emit(
-        0.10,
-        &format!(
-            "扫描完成：{} 个文件，{}（in-tree 跳过 {}，固件预估 {}）/ scanned",
-            entries.len(),
-            human_size(total),
-            report.skipped_in_tree,
-            human_size(report.firmware_bytes)
-        ),
-        true,
+    let mut msg = format!(
+        "扫描完成：{} 个文件，{}（in-tree 跳过 {}，固件预估 {}）/ scanned",
+        entries.len(),
+        human_size(total),
+        report.skipped_in_tree,
+        human_size(report.firmware_bytes)
     );
+    if let Some((considered, kept)) = fw_stats {
+        if considered > 0 {
+            msg.push_str(&format!(
+                "；固件策略：收录 {kept}/{considered} 条 / firmware entries kept"
+            ));
+        }
+    }
+    pipe.emit(0.10, &msg, true);
     *heal(&pipe.scan_slot) = Some(report);
 
     for (index, entry) in entries.into_iter().enumerate() {
@@ -510,70 +653,232 @@ fn walker_main(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: Hasher × N
+// W5: 固件按需收集 / On-demand firmware collection
 // ---------------------------------------------------------------------------
 
-/// Stage 2：读文件算 SHA-256，边读边累加进度计数，再把结果送入打包阶段。
-/// Stage 2: read files, compute SHA-256, feed the progress counter and hand over.
-///
-/// 多个哈希线程共享同一个 `Receiver`（`Arc<Mutex<Receiver>>`，recv 返回后立即释放锁），
-/// 各自持有独立的 `SyncSender` 发送端。本阶段不写 tar。
-fn hasher_main(
-    pipe: &Pipeline,
-    input: &Mutex<Receiver<ScanTask>>,
-    output: &SyncSender<HashedEntry>,
-) {
-    loop {
-        if pipe.stopped() {
-            pipe.note_stop();
-            return;
-        }
-        // 只在 recv 期间持锁，取到任务立刻释放，保证多线程并发哈希。
-        let task = {
-            let guard = heal(input);
-            guard.recv()
+/// 判断条目是否属于固件命名空间：`kind == Firmware`，或路径位于 `/lib/firmware`
+/// 树内（含 usr-merge 的 `usr/lib/firmware`；对分类异常的条目也兜住，宁可宽勿漏）。
+/// Whether an entry lives in the firmware namespace (kind or path based).
+fn is_firmware_entry(entry: &ScanEntry) -> bool {
+    entry.kind == EntryKind::Firmware || is_firmware_rel(&entry.rel_path)
+}
+
+/// 路径是否落在固件目录树内（去前导 `/` 后比较）。
+/// Whether a relative path sits inside the firmware tree.
+fn is_firmware_rel(rel: &str) -> bool {
+    let r = rel.trim_start_matches('/');
+    r == "lib/firmware"
+        || r == "usr/lib/firmware"
+        || r.starts_with("lib/firmware/")
+        || r.starts_with("usr/lib/firmware/")
+}
+
+/// 把任意路径/标签归一化到**固件命名空间内的相对路径**：去前导 `/`，再去掉
+/// `lib/firmware/`、`usr/lib/firmware/` 前缀。`modinfo.firmware` 标签（如
+/// `nvidia/550.54.14/firmware.elf`）本来就是该命名空间，归一化后与 `rel_path` 可直接比较。
+/// Normalize any path/tag into the firmware namespace (strip `/`, `lib/firmware/`, `usr/lib/firmware/`).
+fn firmware_namespace(path: &str) -> String {
+    let p = path.trim_start_matches('/');
+    let p = p
+        .strip_prefix("lib/firmware/")
+        .or_else(|| p.strip_prefix("usr/lib/firmware/"))
+        .unwrap_or(p);
+    p.to_string()
+}
+
+/// 从扫描结果中收集模块声明的"需要的固件名集合"（W5：`modinfo.firmware` 标签）。
+/// Collect the set of firmware names requested by scanned modules (`modinfo.firmware`, W5).
+fn wanted_firmware(entries: &[ScanEntry]) -> HashSet<String> {
+    let mut wanted = HashSet::new();
+    for entry in entries {
+        let Some(modinfo) = &entry.modinfo else {
+            continue;
         };
-        let (index, entry) = match task {
-            Ok(t) => t,
-            // Walker 已结束：本线程退出并释放发送端。
-            Err(_) => return,
-        };
-        // 符号链接不读取目标：哈希"链接目标字符串"本身（P0-1 归档侧）。
-        // Symlinks do not open their target: hash the link target string instead.
-        let hash_result = if entry.kind == EntryKind::Symlink {
-            let target = entry.link_target.as_deref().unwrap_or("");
-            Ok((sha256_hex(target.as_bytes()), 0))
-        } else {
-            hash_file(&entry.abs_path, pipe)
-        };
-        match hash_result {
-            Ok((sha256, hashed_bytes)) => {
-                let item = HashedEntry {
-                    index,
-                    entry,
-                    sha256,
-                    hashed_bytes,
-                };
-                if output.send(item).is_err() {
-                    // Packer 已退出。
-                    return;
-                }
+        for tag in &modinfo.firmware {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                continue;
             }
-            Err(e) => {
-                pipe.fail(e);
-                return;
+            wanted.insert(firmware_namespace(tag));
+        }
+    }
+    wanted
+}
+
+/// W5 `needed` 的核心判定：固件条目 `rel_path` 是否命中"需要的固件名集合"。
+/// Core matcher for W5 `needed`: does a firmware entry hit the wanted-name set?
+///
+/// # 规则 / Rules
+///
+/// 两侧都先归一化到固件命名空间（[`firmware_namespace`]），命中任一规则即为 `true`。
+/// **宁可宽勿漏**（宁可多打包，也不漏掉模块需要的固件）：
+///
+/// 1. **(a) 精确名**：`normalize(rel_path) == normalize(w)`，
+///    如 `nvidia/550.54.14/firmware.elf`。
+/// 2. **(b) 压缩变体**：两侧各剥掉一次 `.xz` / `.zst` / `.gz` 后相等 —— 同时覆盖
+///    "需要未压缩名、磁盘上是 `.xz`/`.zst`"与"需要的名字自带扩展、磁盘上是无扩展"
+///    两个方向（`fw.bin` ↔ `fw.bin.xz` ↔ `fw.bin.zst`）。
+/// 3. **(c) 同目录版本族**：剥压缩扩展后**删除所有连续数字段**得到"文件名模式"
+///    （[`stem_family`]），两侧模式相等即命中。该规则作用于**整个归一化路径**
+///    （目录与文件名都参与模式比较），因此同目录的版本族
+///    （`iwlwifi-7850-29.ucode` ↔ `iwlwifi-8000-34.ucode`）、同目录同模式的
+///    文件版本（`nvidia/550.54.14/firmware.elf` ↔ `…/firmware2.elf`）、以及
+///    版本子目录本身（`nvidia/550.54.14/` ↔ `nvidia/550.54.15/` 的同名文件）
+///    都会被一并纳入；不同厂商目录（`amdgpu/…` vs `nvidia/…`）因路径模式不同
+///    不会互串，固件根目录也不会被整棵拉进来（文件名仍参与比较）。
+/// 4. **(e) 目录前缀**：`rel_path` 位于 `w` 之下（`w` 是目录名时整棵子树纳入）。
+///
+/// `wanted` 为空集合时恒返回 `false`；空集合的 fail-open 处理见
+/// [`apply_firmware_policy`]（保留全部固件 + warning），不在本函数内。
+///
+/// English: both sides are normalized into the firmware namespace; a match happens on
+/// the exact name, on equality after stripping one `.xz`/`.zst`/`.gz` suffix on either
+/// side, on an equal "stem family" (compression stripped, every digit run deleted —
+/// covering same-directory version families and version subdirectories), or on a
+/// directory prefix. Deliberately wide: over-archiving is preferred to missing
+/// firmware a module needs.
+fn firmware_matches(wanted: &HashSet<String>, rel_path: &str) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    let fw = firmware_namespace(rel_path);
+    if fw.is_empty() {
+        return false;
+    }
+    let fw_stripped = strip_compression_suffix(&fw);
+    let fw_family = stem_family(&fw);
+    for w in wanted {
+        if w.is_empty() {
+            continue;
+        }
+        if w == &fw {
+            return true; // (a) 精确名 / exact name
+        }
+        if strip_compression_suffix(w) == fw_stripped {
+            return true; // (b) 压缩变体（双向）/ compression variants, both directions
+        }
+        if stem_family(w) == fw_family {
+            return true; // (c) 同目录版本族 / same stem family (incl. version dirs)
+        }
+        if fw.starts_with(w) && fw.as_bytes().get(w.len()) == Some(&b'/') {
+            return true; // (e) 目录前缀 / wanted names a directory
+        }
+    }
+    false
+}
+
+/// 剥掉一次 `.xz` / `.zst` / `.gz` 后缀（没有则原样返回）。
+/// Strip one `.xz`/`.zst`/`.gz` suffix, if present.
+fn strip_compression_suffix(path: &str) -> &str {
+    for suffix in [".xz", ".zst", ".gz"] {
+        if path.len() > suffix.len() && path.ends_with(suffix) {
+            return &path[..path.len() - suffix.len()];
+        }
+    }
+    path
+}
+
+/// 版本族模式：剥一次压缩扩展后，删除**所有连续数字段**（`iwlwifi-7850-29.ucode`
+/// → `iwlwifi--.ucode`、`nvidia/550.54.14/…` → `nvidia/.././…`），用于把同一
+/// 文件名模式下的不同版本号一并纳入（W5 规则 c）。
+/// Stem family: compression stripped, every run of digits deleted (rule c).
+fn stem_family(path: &str) -> String {
+    let base = strip_compression_suffix(path);
+    let mut out = String::with_capacity(base.len());
+    let mut in_digits = false;
+    for c in base.chars() {
+        if c.is_ascii_digit() {
+            in_digits = true;
+            continue;
+        }
+        if in_digits {
+            in_digits = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// W5：按固件收集策略过滤扫描结果。
+/// Apply the firmware collection policy to the scanned entries (W5).
+///
+/// - 策略为 `None` → **原样返回，零行为变化**（minimal/standard/full 各自现状）；
+/// - [`FirmwarePolicy::All`] → 保留全部固件条目（= 现有 full 模式整树收集行为）；
+/// - [`FirmwarePolicy::None`] → 丢弃全部固件条目（不收集任何固件）；
+/// - [`FirmwarePolicy::Needed`] → 只保留 [`firmware_matches`] 命中的条目；
+///   命中集合为空（模块未提供 `modinfo.firmware` 标签）时**宁可宽勿漏**：
+///   保留全部固件并把原因记入 `report.warnings`。
+///
+/// 包提供者条目（`owner` 命中、`content_stored == false`）只要命中就照常保留 ——
+/// 现有机制"归档只记名、不存内容"在 `needed` 下同样生效。
+///
+/// 过滤后按结果重算 `report.firmware_bytes`（W3/C-28 口径：只累计
+/// `content_stored = true` 的固件字节）。返回 `(条目, Some((固件总数, 保留数)))`，
+/// `None` 表示策略未启用。
+fn apply_firmware_policy(
+    entries: Vec<ScanEntry>,
+    policy: Option<FirmwarePolicy>,
+    report: &mut ScanReport,
+) -> (Vec<ScanEntry>, Option<(usize, usize)>) {
+    let Some(policy) = policy else {
+        return (entries, None);
+    };
+    let considered = entries.iter().filter(|e| is_firmware_entry(e)).count();
+    let mut entries = entries;
+    match policy {
+        FirmwarePolicy::All => {}
+        FirmwarePolicy::None => {
+            entries.retain(|e| !is_firmware_entry(e));
+        }
+        FirmwarePolicy::Needed => {
+            let wanted = wanted_firmware(&entries);
+            if wanted.is_empty() {
+                if considered > 0 {
+                    report.warnings.push(
+                        "固件策略 needed 未取到任何模块固件标签，保留全部固件条目 / \
+                         'needed' collected no firmware tags; keeping every firmware entry"
+                            .to_string(),
+                    );
+                }
+            } else {
+                entries.retain(|e| !is_firmware_entry(e) || firmware_matches(&wanted, &e.rel_path));
             }
         }
     }
+    report.firmware_bytes = entries
+        .iter()
+        .filter(|e| is_firmware_entry(e) && e.content_stored)
+        .map(|e| e.size)
+        .sum();
+    let kept = entries.iter().filter(|e| is_firmware_entry(e)).count();
+    (entries, Some((considered, kept)))
 }
 
-/// 读取整个文件并计算 SHA-256，同时把读取字节累加到 `bytes_hashed` 并上报进度。
-/// Read a whole file, compute SHA-256, count the bytes into `bytes_hashed` and report progress.
-fn hash_file(path: &Path, pipe: &Pipeline) -> AppResult<(String, u64)> {
-    let mut file = File::open(path)?;
+/// 摘要字节 → 64 位小写十六进制串。
+/// Format digest bytes as 64 lowercase hex characters.
+fn hex_lower(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
+    for &b in digest {
+        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// 计算任意字节串的 SHA-256（64 位小写十六进制），用于符号链接目标的语义哈希。
+/// Compute the SHA-256 of arbitrary bytes (lowercase hex); used for symlink target hashing.
+fn sha256_hex(data: &[u8]) -> String {
+    hex_lower(&Sha256::digest(data))
+}
+
+/// 读完**已打开**的文件并返回 SHA-256（`content_stored == false` 的条目用：
+/// 内容不入档，但按 v2 语义保留磁盘内容摘要；不产生第二次 `open`）。
+/// Read an already-open file to EOF and return its SHA-256 (no second `open`).
+///
+/// 每块检查一次取消；读取字节同步累加到 `bytes_hashed`（进度哈希段）。
+fn hash_file_contents(file: &mut File, pipe: &Pipeline) -> AppResult<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_CHUNK];
-    let mut total: u64 = 0;
     loop {
         // 大文件也要能及时响应取消：每个块检查一次。
         if pipe.stopped() {
@@ -584,62 +889,41 @@ fn hash_file(path: &Path, pipe: &Pipeline) -> AppResult<(String, u64)> {
             break;
         }
         hasher.update(&buf[..n]);
-        total += n as u64;
         pipe.bytes_hashed.fetch_add(n as u64, Ordering::SeqCst);
     }
-    let digest = hasher.finalize();
-    let mut sha256 = String::with_capacity(digest.len() * 2);
-    for byte in digest.iter() {
-        let b = *byte;
-        sha256.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        sha256.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    pipe.emit_progress(&format!(
-        "已哈希 {} / {} / hashing",
-        human_size(pipe.bytes_hashed.load(Ordering::SeqCst)),
-        human_size(pipe.total_bytes.load(Ordering::SeqCst))
-    ));
-    Ok((sha256, total))
-}
-
-/// 计算任意字节串的 SHA-256（64 位小写十六进制），用于符号链接目标的语义哈希。
-/// Compute the SHA-256 of arbitrary bytes (lowercase hex); used for symlink target hashing.
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest.iter() {
-        let b = *byte;
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    out
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: Packer
+// Stage 2: Packer
 // ---------------------------------------------------------------------------
 
-/// Stage 3：tar+gzip 的唯一写者，按序写入 `data/<rel_path>` 并在末尾追加 `manifest.json`。
-/// Stage 3: the single tar+gzip writer; appends `data/<rel_path>` entries and `manifest.json`.
+/// Stage 2：tar+gzip 的唯一写者，单遍读取源文件（[`HashingReader`] 同步喂 SHA-256），
+/// 按序写入 `data/<rel_path>`，末尾追加 `manifest.json`，fsync 后把 partial 原子
+/// rename 到 `out_file`（C-37）。
+/// Stage 2: the single tar+gzip writer; single-pass reads, manifest, fsync, atomic rename.
 ///
-/// 乱序到达的哈希结果先放进 `BTreeMap` 缓冲，只有 `next` 序号就绪才写入 tar，
+/// 乱序到达的条目先放进 `BTreeMap` 缓冲，只有 `next` 序号就绪才写入 tar，
 /// 从而保证归档顺序 == 扫描顺序（详见模块文档）。
+/// 单个不可读文件只跳过并记 warning（C-37）；结构性错误返回 `Err` 中止。
 #[allow(clippy::too_many_arguments)]
 fn packer_main(
     pipe: &Pipeline,
-    input: Receiver<HashedEntry>,
-    out_file: &Path,
+    input: Receiver<ScanTask>,
+    partial: &Path,
     kver: &str,
     distro: &DistroInfo,
     mode: BackupMode,
-    file_started: &AtomicBool,
+    firmware_policy: Option<FirmwarePolicy>,
+    partial_started: &AtomicBool,
 ) -> AppResult<PackerOutcome> {
-    let file = File::create(out_file)?;
-    file_started.store(true, Ordering::SeqCst);
+    // C-37：写入同目录 partial（不是 out_file 本体），成功后才 rename 替换。
+    let file = File::create(partial)?;
+    partial_started.store(true, Ordering::SeqCst);
     let encoder = GzEncoder::new(file, Compression::default());
     let mut builder = TarWriter::new(encoder);
 
-    let mut pending: BTreeMap<usize, HashedEntry> = BTreeMap::new();
+    let mut pending: BTreeMap<usize, ScanEntry> = BTreeMap::new();
     let mut next: usize = 0;
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut local_warnings: Vec<String> = Vec::new();
@@ -653,37 +937,29 @@ fn packer_main(
             return Err(AppError::Cancelled);
         }
         match input.recv() {
-            Ok(item) => {
-                pending.insert(item.index, item);
+            Ok((index, entry)) => {
+                pending.insert(index, entry);
             }
-            // 所有哈希线程退出 → 通道关闭。
+            // Walker 已退出 → 通道关闭。
             Err(_) => break,
         }
         // 先接收后重排：始终排空通道，等待某个序号不会造成阻塞。
-        while pending.contains_key(&next) {
-            let item = match pending.remove(&next) {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(entry) = pending.remove(&next) {
             let total = pipe.total_bytes.load(Ordering::SeqCst);
-            let written = write_entry(
-                &mut builder,
-                &item.entry,
-                item.hashed_bytes,
-                pipe,
-                &mut local_warnings,
-            )?;
-            packed_bytes += written;
-            pipe.bytes_packed.fetch_add(written, Ordering::SeqCst);
+            let written = write_entry(&mut builder, &entry, pipe, &mut local_warnings)?;
             next += 1;
-            let dkms = dkms_cache.get_or_insert_with(|| manifest_dkms(pipe));
-            manifest_entries.push(build_manifest_entry(
-                &item.entry,
-                item.sha256.clone(),
-                written,
-                dkms.as_slice(),
-                family,
-            ));
+            if let Some(w) = written {
+                packed_bytes += w.bytes;
+                pipe.bytes_packed.fetch_add(w.bytes, Ordering::SeqCst);
+                let dkms = dkms_cache.get_or_insert_with(|| manifest_dkms(pipe));
+                manifest_entries.push(build_manifest_entry(
+                    &entry,
+                    w.sha256,
+                    w.bytes,
+                    dkms.as_slice(),
+                    family,
+                ));
+            }
 
             let entry_total = pipe.entry_total.load(Ordering::SeqCst);
             pipe.emit_progress(&format!(
@@ -701,18 +977,18 @@ fn packer_main(
     }
     if !pending.is_empty() {
         return Err(AppError::Format(format!(
-            "哈希结果不完整：{} 个条目未按序到达 / {} hashed entries missing in order",
+            "条目未按序到达：{} 个序号缺口 / {} entries missing in order",
             pending.len(),
             pending.len()
         )));
     }
-    // 兜底：条目数必须与扫描结果完全一致 —— 即使某个哈希线程在"最后一个条目"处
+    // 兜底：条目数必须与扫描结果完全一致 —— 即使 Walker 在"最后一个条目"处
     // 异常退出（通道正常关闭、pending 恰好为空），也不会悄悄漏备份。
     let expected = pipe.entry_total.load(Ordering::SeqCst);
     if next != expected {
         return Err(AppError::Format(format!(
-            "哈希结果不完整：扫描得到 {expected} 个条目，按序到达 {next} 个 \
-             / hashed entries incomplete: {next} of {expected}"
+            "条目不完整：扫描得到 {expected} 个条目，按序到达 {next} 个 \
+             / entries incomplete: {next} of {expected}"
         )));
     }
 
@@ -753,7 +1029,7 @@ fn packer_main(
         entries: manifest_entries,
         dkms,
         warnings,
-        firmware_policy: None, // 预置字段：W5 阶段由 --firmware 策略接线
+        firmware_policy: firmware_policy.map(|p| p.as_str().to_string()),
     };
 
     let json = serde_json::to_vec_pretty(&manifest)?;
@@ -878,24 +1154,26 @@ fn module_matches_dkms(rel_path: &str, dkms: &[DkmsPackage]) -> bool {
     })
 }
 
-/// 把一个条目写进 tar，返回实际写入内容区的字节数（符号链接与未存储内容均为 0）。
-/// Append one entry to the tar archive and return the bytes written for its content.
+/// 把一个条目写进 tar，返回其 manifest 摘要与实际写入内容区字节数（`None` = 跳过该条目）。
+/// Append one entry, returning its manifest digest and content bytes (`None` = skipped).
 ///
 /// 三种分支：
 /// - **符号链接**（`kind == Symlink`）：用 `append_link` 写 tar symlink 条目，
 ///   **绝不打开/读取目标文件**；链接目标先经 [`validate_link_target`] 安全校验。
-///   该条目的 `sha256` 由哈希阶段按"链接目标字符串"计算，`size = 0`。
+///   摘要 = 目标字符串的 SHA-256（v2 语义），`bytes = 0`。
 /// - **`content_stored == false`**：文件由系统包提供（典型为 `linux-firmware`），
-///   此处**不写入 tar 内容、也不打开源文件**，仅由调用方在 `manifest.json` 中保留该条目
-///   （`content_stored=false`）；还原侧据此把动作从"解包"改为"校验该路径已存在"。
-/// - **普通文件**：按 `data/<rel_path>` 写入并比对哈希阶段记录的字节数。
+///   tar 内**不出现**该路径；仍只读打开并计算磁盘内容摘要，供 manifest 记录（v2 语义）。
+/// - **普通文件**：按 `data/<rel_path>` 写入；C-38 起由 [`HashingReader`] **单遍读**，
+///   摘要恒等于归档实际写入的字节；读取前后尽力检测大小变化并记 warning。
+///
+/// C-37：**打开期**不可读（权限/竞态删除/元数据错误）→ `Ok(None)` + warning，
+/// 跳过该条目而不中止；**写入中途** IO 错误会留下半个 tar 条目，无法回滚 → `Err` 中止。
 fn write_entry(
     builder: &mut TarWriter,
     entry: &ScanEntry,
-    hashed_bytes: u64,
     pipe: &Pipeline,
     warnings: &mut Vec<String>,
-) -> AppResult<u64> {
+) -> AppResult<Option<WrittenEntry>> {
     let rel = entry.rel_path.as_str();
     validate_rel_path(rel)?;
 
@@ -919,16 +1197,53 @@ fn write_entry(
         // append_link 写入 linkname（过长时自动补 GNU 'K' longlink 扩展）并计算校验和；
         // 条目类型须由调用方显式设为 Symlink（append_link 不会代设）。
         builder.append_link(&mut header, tar_path.as_str(), target)?;
-        return Ok(0);
+        return Ok(Some(WrittenEntry {
+            sha256: sha256_hex(target.as_bytes()),
+            bytes: 0,
+        }));
     }
 
-    // 由系统包提供、内容不入库：tar 里不出现该路径，manifest 记录由调用方保留。
+    // 由系统包提供、内容不入库：tar 里不出现该路径，但按 v2 语义保留磁盘内容摘要。
     if !entry.content_stored {
-        return Ok(0);
+        let mut file = match File::open(&entry.abs_path) {
+            Ok(f) => f,
+            Err(err) => {
+                warnings.push(format!(
+                    "跳过不可读文件 / skipped unreadable: {rel}（{err}）"
+                ));
+                return Ok(None);
+            }
+        };
+        return match hash_file_contents(&mut file, pipe) {
+            Ok(sha256) => Ok(Some(WrittenEntry { sha256, bytes: 0 })),
+            Err(AppError::Cancelled) => Err(AppError::Cancelled),
+            Err(err) => {
+                warnings.push(format!(
+                    "跳过不可读文件 / skipped unreadable: {rel}（{err}）"
+                ));
+                Ok(None)
+            }
+        };
     }
 
-    let file = File::open(&entry.abs_path)?;
-    let meta = file.metadata()?;
+    let file = match File::open(&entry.abs_path) {
+        Ok(f) => f,
+        Err(err) => {
+            warnings.push(format!(
+                "跳过不可读文件 / skipped unreadable: {rel}（{err}）"
+            ));
+            return Ok(None);
+        }
+    };
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(err) => {
+            warnings.push(format!(
+                "跳过不可读文件 / skipped unreadable: {rel}（{err}）"
+            ));
+            return Ok(None);
+        }
+    };
     let size = meta.len();
 
     let mut header = Header::new_gnu();
@@ -941,10 +1256,13 @@ fn write_entry(
     header.set_entry_type(EntryType::Regular);
 
     let tar_path = format!("data/{rel}");
-    let mut reader = ExactReader {
-        inner: file,
-        remaining: size,
-        pipe,
+    let mut reader = HashingReader {
+        inner: ExactReader {
+            inner: file,
+            remaining: size,
+            pipe,
+        },
+        hasher: Sha256::new(),
     };
     // append_data 会先写入路径（过长时自动追加 GNU longname 扩展）再计算校验和；
     // 路径以 &str 传入，兼容 tar 0.4 对 `P: AsRef<Path>` / `Into<Vec<u8>>` 的两种签名。
@@ -953,17 +1271,24 @@ fn write_entry(
         if pipe.stopped() {
             return Err(AppError::Cancelled);
         }
+        // 数据读取中途 IO 错误：tar 已写入半个条目，无法回滚 → 结构性错误中止。
         return Err(AppError::Io(e));
     }
 
-    let written = size - reader.remaining;
-    if written != hashed_bytes {
-        warnings.push(format!(
-            "文件在备份期间大小变化：{rel}（哈希 {hashed_bytes} 字节，写入 {written} 字节）\
-             / size changed during backup"
-        ));
+    let written = size - reader.inner.remaining;
+    // 尽力检测部分写入（若文件在打包期间被追加，tar 只写了原始的 `size` 字节）。
+    if let Ok(after) = reader.inner.inner.metadata() {
+        if after.len() != size {
+            warnings.push(format!(
+                "文件在备份期间大小变化：{rel}（哈希时 {size} 字节，写入 {written} 字节）                 / size changed during backup"
+            ));
+        }
     }
-    Ok(written)
+    let sha256 = hex_lower(&reader.hasher.finalize());
+    Ok(Some(WrittenEntry {
+        sha256,
+        bytes: written,
+    }))
 }
 
 /// 恰好读取 `remaining` 字节的读取器：提前 EOF 视为错误，避免 tar 头与数据长度不一致。
@@ -992,6 +1317,25 @@ impl Read for ExactReader<'_> {
             ));
         }
         self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// 单遍哈希读取器：透传 [`ExactReader`] 的字节，同步喂入 SHA-256 与进度哈希段（C-38）。
+/// Single-pass hashing reader: forwards bytes into SHA-256 and the hash progress counter.
+struct HashingReader<'a> {
+    inner: ExactReader<'a>,
+    hasher: Sha256,
+}
+
+impl Read for HashingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.inner
+            .pipe
+            .bytes_hashed
+            .fetch_add(n as u64, Ordering::SeqCst);
         Ok(n)
     }
 }
@@ -1340,8 +1684,10 @@ mod tests {
         let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
         let pipe = test_pipeline();
         let mut warnings = Vec::new();
-        let written =
-            write_entry(&mut builder, entry, 0, &pipe, &mut warnings).expect("write entry");
+        let written = write_entry(&mut builder, entry, &pipe, &mut warnings)
+            .expect("write entry")
+            .map(|w| w.bytes)
+            .unwrap_or(0);
         let file = builder
             .into_inner()
             .expect("into_inner")
@@ -1724,7 +2070,7 @@ mod tests {
         let mut builder = TarWriter::new(GzEncoder::new(file, Compression::default()));
         let pipe = test_pipeline();
         let mut warnings = Vec::new();
-        match write_entry(&mut builder, &entry, 0, &pipe, &mut warnings) {
+        match write_entry(&mut builder, &entry, &pipe, &mut warnings) {
             Err(AppError::Format(_)) => {}
             other => panic!("expected AppError::Format, got {other:?}"),
         }
@@ -1746,7 +2092,10 @@ mod tests {
 
         let pipe = test_pipeline();
         let mut warnings = Vec::new();
-        let written = write_entry(&mut builder, &entry, 14, &pipe, &mut warnings).unwrap();
+        let written = write_entry(&mut builder, &entry, &pipe, &mut warnings)
+            .unwrap()
+            .expect("content_stored=false 仍产出 manifest 摘要")
+            .bytes;
         assert_eq!(written, 0, "content_stored=false 不写内容字节");
         assert!(warnings.is_empty(), "不应触发大小变化告警: {warnings:?}");
 

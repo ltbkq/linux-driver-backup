@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Distribution family that decides the initramfs command and extra restore steps.
 /// 发行版家族，决定 initramfs 更新命令与还原期的附加步骤（详见 DESIGN.md §4.1）。
@@ -71,15 +72,34 @@ pub struct DistroInfo {
 }
 
 impl DistroInfo {
-    /// Detect the running distribution from `os-release`.
+    /// Detect the distribution of the running (host) system from `os-release`.
     ///
     /// 读 `/etc/os-release`，按规范在它缺失时回退到 `/usr/lib/os-release`；
     /// 两个文件都不可读时返回 [`Family::Unknown`] 的空信息（不 panic、不报错，
     /// 由调用方通过 [`DistroInfo::family`] 决定降级行为）。
+    ///
+    /// 语义等价于 [`DistroInfo::detect_at`]`(Path::new("/"))`（W0→W4 起为薄包装）。
     pub fn detect() -> Self {
-        for path in ["/etc/os-release", "/usr/lib/os-release"] {
-            if let Ok(content) = fs::read_to_string(path) {
+        Self::detect_at(Path::new("/"))
+    }
+
+    /// Detect the distribution described by an (offline) target root — `os-release` under `root`.
+    ///
+    /// 读 `<root>/etc/os-release`，缺失回退 `<root>/usr/lib/os-release`；目标根下两者
+    /// 都不可读时**回退宿主** `/etc/os-release`（Live USB 救援场景仍能给出可用信息，
+    /// 与 [`DistroInfo::detect`] 的语义衔接）；全部失败返回 [`Family::Unknown`] 空信息。
+    /// `root = "/"` 时与 [`DistroInfo::detect`] 完全一致（C-20：`--root` 模式只读目标根）。
+    pub fn detect_at(root: &Path) -> Self {
+        for rel in ["etc/os-release", "usr/lib/os-release"] {
+            if let Ok(content) = fs::read_to_string(root.join(rel)) {
                 return parse_os_release(&content);
+            }
+        }
+        if root != Path::new("/") {
+            for path in ["/etc/os-release", "/usr/lib/os-release"] {
+                if let Ok(content) = fs::read_to_string(path) {
+                    return parse_os_release(&content);
+                }
             }
         }
         DistroInfo {
@@ -289,38 +309,208 @@ pub fn depmod_cmd(kver: &str) -> SystemCmd {
     }
 }
 
-/// Family-specific initramfs update command, `None` for [`Family::Unknown`].
+/// Family-specific initramfs update command; `None` when no known tool applies.
 ///
-/// Debian → `update-initramfs -u -k <kver>`；RHEL → `dracut --force --kver <kver>`；
-/// Arch → `mkinitcpio -P`（全量重建，不接收 kver）；未知发行版返回 `None` 表示"跳过"，
-/// 调用方须如实上报 `initramfs_done = None` 而非谎报成功。
+/// 发行版 initramfs 更新命令矩阵（DESIGN.md §4.1 + v0.3.0 W4 / ROADMAP P1-2 / D11）：
+///
+/// - **Debian** → `update-initramfs -u -k <kver>`；
+/// - **RHEL** → `dracut --force --kver <kver>`；
+/// - **Arch** → `mkinitcpio -P`（全量重建，不接收 kver）；
+/// - **[`Family::Unknown`]（SUSE / Alpine / Void / Gentoo 等未归入三族的发行版）按
+///   可用命令探测**：
+///   - `mkinitfs` → **Alpine**：`mkinitfs <kver>`（工具名是 `mkinitfs`，**不是**
+///     `mkinitramfs` —— 后者是 Debian initramfs-tools 的内部脚本，见 ROADMAP 核验 #23）；
+///   - `dracut` → **Void / Gentoo / SUSE**：`dracut --force --kver <kver>`（SUSE 的
+///     `mkinitrd` 只是 dracut 的包装，两者并存时优先直接 dracut —— 参数确定无疑；
+///     **命令矩阵待 P-2（opensuse/tumbleweed、alpine 容器）验证**）；
+///   - `mkinitrd` → 只装了 SUSE 旧式 `mkinitrd` 的系统：`mkinitrd -k <kver>`
+///     （参数格式 **待 P-2 验证**）；
+///   - 以上皆无（**Slackware** 等无统一标准的发行版，只有
+///     `mkinitrd_command_generator.sh` 之类站点脚本）→ 返回 `None`：**调用方已有
+///     逻辑**（`restore.rs` 的 `initramfs_cmd` `None` 分支）会把
+///     `initramfs_done = None` 并提示"跳过 initramfs"，不谎报成功。
+/// - UKI（统一内核镜像）系统的 `ukify build` 路线是**独立的保守实现**
+///   （[`uki_detected_at`] + [`ukify_build_cmd_at`]，未接线进本函数）——无法确定
+///   目标是否 UKI 系统时保持现有行为不变，**待 P-2 容器验证**后再决定是否接线。
 pub fn initramfs_cmd(family: Family, kver: &str) -> Option<SystemCmd> {
+    initramfs_cmd_with(family, kver, has_cmd)
+}
+
+/// [`initramfs_cmd`] 的可测试核心：命令可用性由 `has` 注入（逐 family 单测用）。
+/// Testable core of [`initramfs_cmd`] with injectable command availability.
+fn initramfs_cmd_with<F>(family: Family, kver: &str, has: F) -> Option<SystemCmd>
+where
+    F: Fn(&str) -> bool,
+{
+    let dracut = || SystemCmd {
+        program: "dracut".to_string(),
+        args: vec!["--force".to_string(), "--kver".to_string(), kver.to_string()],
+    };
     let cmd = match family {
         Family::Debian => SystemCmd {
             program: "update-initramfs".to_string(),
             args: vec!["-u".to_string(), "-k".to_string(), kver.to_string()],
         },
-        Family::Rhel => SystemCmd {
-            program: "dracut".to_string(),
-            args: vec!["--force".to_string(), "--kver".to_string(), kver.to_string()],
-        },
+        Family::Rhel => dracut(),
         Family::Arch => SystemCmd {
             program: "mkinitcpio".to_string(),
             args: vec!["-P".to_string()],
         },
-        Family::Unknown => return None,
+        Family::Unknown => {
+            if has("mkinitfs") {
+                SystemCmd {
+                    program: "mkinitfs".to_string(),
+                    args: vec![kver.to_string()],
+                }
+            } else if has("dracut") {
+                dracut()
+            } else if has("mkinitrd") {
+                SystemCmd {
+                    program: "mkinitrd".to_string(),
+                    args: vec!["-k".to_string(), kver.to_string()],
+                }
+            } else {
+                // Slackware 等：无统一标准工具 → None（调用方已有提示逻辑，见文档）。
+                return None;
+            }
+        }
     };
     Some(cmd)
 }
+
+/// Detect a UKI (Unified Kernel Image) based installation under `root` (W4/P1-2, 保守实现).
+///
+/// 检测 `<root>/boot/efi/EFI/` 下的 UKI 特征：任一子目录中的 `systemd-boot*.efi`
+/// 引导器，或 `<root>/boot/efi/EFI/Linux/*.efi` 机器 UKI 的标准落位。
+///
+/// **未接线**：本函数只做检测与命令构造，不改变 [`initramfs_cmd`] 的现有行为 ——
+/// 无法确定目标是否为 UKI 系统时宁可维持现状（ROADMAP P1-2 要求 UKI 系统改走
+/// `ukify build` 并重签，接线前需 P-2/QEMU 场景验证）。**待 P-2 容器验证**。
+#[allow(dead_code)] // W4 预留 API：restore 侧 UKI 接线前暂未调用 / reserved until wired (P-2)
+pub fn uki_detected_at(root: &Path) -> bool {
+    let efi_dir = root.join("boot/efi/EFI");
+    let Ok(rd) = fs::read_dir(&efi_dir) else {
+        return false;
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        // EFI/Linux/*.efi：机器 UKI 的标准落位
+        if path.is_dir() && lower == "linux" {
+            if dir_has_efi_image(&path) {
+                return true;
+            }
+            continue;
+        }
+        // EFI/<loader>/systemd-boot*.efi：systemd-boot 引导器特征
+        if lower.starts_with("systemd-boot") && lower.ends_with(".efi") {
+            return true;
+        }
+    }
+    false
+}
+
+/// 目录下是否存在 `.efi` 镜像（UKI 检测的辅助判断）。
+/// Whether a directory contains any `.efi` image (helper for UKI detection).
+fn dir_has_efi_image(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".efi")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Provisional `ukify build` command for `<kver>` (W4/P1-2; 参数为草案，待 P-2 验证).
+///
+/// 需要 PATH 上有 `ukify`；`--linux`/`--initrd` 在 `<root>` 下按常见路径探测（Debian
+/// 的 `/boot/initrd.img-<kver>`、RHEL 的 `/boot/initramfs-<kver>.img` …），探测不到
+/// 时省略对应参数（由 `ukify` 自行报错）。**未接线，待 P-2 容器验证。**
+#[allow(dead_code)] // W4 预留 API：restore 侧 UKI 接线前暂未调用 / reserved until wired (P-2)
+pub fn ukify_build_cmd_at(root: &Path, kver: &str) -> Option<SystemCmd> {
+    ukify_build_cmd_inner(root, kver, has_cmd)
+}
+
+/// [`ukify_build_cmd_at`] 的可测试核心：`ukify` 可用性由 `has` 注入。
+/// Testable core of [`ukify_build_cmd_at`] with injectable `ukify` availability.
+fn ukify_build_cmd_inner<F>(root: &Path, kver: &str, has: F) -> Option<SystemCmd>
+where
+    F: Fn(&str) -> bool,
+{
+    if !has("ukify") {
+        return None;
+    }
+    let linux_candidates = [format!("boot/vmlinuz-{kver}"), "boot/vmlinuz".to_string()];
+    let initrd_candidates = [
+        format!("boot/initrd.img-{kver}"),       // Debian / Ubuntu
+        format!("boot/initramfs-{kver}.img"),    // RHEL / Fedora
+        format!("boot/initramfs-{kver}"),        // Gentoo
+        format!("boot/initramfs.img-{kver}"),    // 部分旧 RHEL
+    ];
+    let mut args: Vec<String> = vec!["build".to_string()];
+    if let Some(linux) = linux_candidates.iter().map(|p| root.join(p)).find(|p| p.is_file()) {
+        args.push("--linux".to_string());
+        args.push(linux.display().to_string());
+    }
+    if let Some(initrd) = initrd_candidates
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| p.is_file())
+    {
+        args.push("--initrd".to_string());
+        args.push(initrd.display().to_string());
+    }
+    args.push("--uname".to_string());
+    args.push(kver.to_string());
+    Some(SystemCmd {
+        program: "ukify".to_string(),
+        args,
+    })
+}
+
+/// `has_cmd` 的进程级结果缓存（C-43 ②）：PATH 扫描是纯读操作，同一进程内
+/// PATH 不会变化，重复扫描纯属浪费（restore 侧逐条 `has_cmd(&cmd.program)` 尤甚）。
+/// Process-wide cache of `has_cmd` results (C-43): PATH lookups are pure reads and the
+/// environment does not change mid-process, so results are memoised.
+///
+/// 键为 `String` 而非 `&'static str`：调用方会传动态串（如 `has_cmd(&cmd.program)`）。
+/// 测试若改动 PATH，须在改动前后调用 [`reset_has_cmd_cache`]（仅测试构建可用）。
+static HAS_CMD_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 
 /// Look a program up in `PATH`; `true` when an executable file is found.
 ///
 /// 含 `/` 的名字按路径直接检查；否则逐个 PATH 目录检查
 /// （任意可执行位 `0o111` 置位即认为可执行，跟随符号链接）。
+/// 结果经 [`HAS_CMD_CACHE`] 进程级缓存（C-43 ②）。
 pub fn has_cmd(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
+    if let Some(cache) = HAS_CMD_CACHE.get() {
+        // 缓存锁中毒（持锁线程 panic）不影响判定，只是退回一次性查询。
+        if let Ok(guard) = cache.lock() {
+            if let Some(cached) = guard.get(name) {
+                return *cached;
+            }
+        }
+    }
+    let found = has_cmd_uncached(name);
+    if let Some(cache) = HAS_CMD_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(name.to_string(), found);
+        }
+    }
+    found
+}
+
+/// [`has_cmd`] 的未缓存实现（先做缓存查找失败后的实际 PATH 查询）。
+/// Uncached PATH lookup behind [`has_cmd`].
+fn has_cmd_uncached(name: &str) -> bool {
     if name.contains('/') {
         return is_executable(Path::new(name));
     }
@@ -340,6 +530,17 @@ pub fn has_cmd(name: &str) -> bool {
         .collect(),
     };
     dirs.iter().any(|dir| is_executable(&dir.join(name)))
+}
+
+/// 清空 `has_cmd` 的进程级缓存（**仅测试**：有测试改动 PATH 时在改动前后调用）。
+/// Drop the `has_cmd` cache — test-only, for tests that mutate `PATH`.
+#[cfg(test)]
+pub fn reset_has_cmd_cache() {
+    if let Some(cache) = HAS_CMD_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.clear();
+        }
+    }
 }
 
 /// 是否为（跟随符号链接后的）可执行普通文件 / Executable regular file (symlinks followed).
@@ -956,5 +1157,15 @@ HOME_URL=\"https://www.ubuntu.com/\"
     fn kernel_release_is_never_empty() {
         assert!(!kernel_release().is_empty());
         assert!(!arch().is_empty());
+    }
+
+    /// C-43 ②：`has_cmd` 进程级缓存可清空且结果稳定（测试改动 PATH 前后须可重置）。
+    #[test]
+    fn has_cmd_cache_is_resettable() {
+        reset_has_cmd_cache();
+        let first = has_cmd("sh");
+        reset_has_cmd_cache();
+        assert_eq!(first, has_cmd("sh"), "缓存清空不改变 PATH 查询结果");
+        assert!(!has_cmd("ldb-no-such-binary-xyzzy"), "不存在的命令应为 false");
     }
 }

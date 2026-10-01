@@ -15,11 +15,14 @@
 //! root-only, GUI-less re-entry driven by the `PROGRESS/NOTE/RESULT` line protocol.
 
 mod backup;
+mod config;
+mod diagnose;
 mod distro;
 mod model;
 mod privilege;
 mod restore;
 mod scan;
+mod verify;
 
 slint::include_modules!();
 
@@ -46,13 +49,21 @@ enum Cmd {
     Help,
     /// `--version` / `-V`。
     Version,
-    /// `--scan [--mode <m>] [--json]`。
-    Scan { mode: BackupMode, json: bool },
-    /// `--backup --out <f> [--mode <m>] [--kver <k>]`。
+    /// `--scan [--mode <m>] [--json] [--config <f>]`。
+    /// `mode`/`config` 为 `None` 表示未显式指定，由配置文件或默认值补全（W7）。
+    Scan {
+        mode: Option<BackupMode>,
+        json: bool,
+        config: Option<String>,
+    },
+    /// `--backup [--out <f>] [--mode <m>] [--kver <k>] [--firmware <p>] [--config <f>]`
+    ///   （`out` 缺省时可由配置 `out_dir` 补全，W7）。
     Backup {
-        out: String,
-        mode: BackupMode,
+        out: Option<String>,
+        mode: Option<BackupMode>,
         kver: Option<String>,
+        firmware: Option<String>,
+        config: Option<String>,
     },
     /// `--restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]`
     ///   `[--root <dir>] [--strategy <s>] [--on-immutable <p>] [--strict-links] [--no-sign] [--chroot-exec]`
@@ -69,6 +80,14 @@ enum Cmd {
         strict_links: bool,
         no_sign: bool,
         chroot_exec: bool,
+        /// 还原前强制执行 `--verify` 完整性校验（W7 / §5.2）。
+        require_verify: bool,
+        /// 系统阶段失败时不自动回滚（W1-C14 逃生口）。
+        no_auto_rollback_on_post: bool,
+        /// 回滚保留代数（`None` 取配置或默认值）。
+        keep_rollback: Option<usize>,
+        /// `--config <f>` 显式配置路径。
+        config: Option<String>,
     },
     /// `--rollback [last|<id>] [--root <dir>]`
     Rollback { journal: Option<String>, root: Option<String> },
@@ -85,7 +104,13 @@ enum Cmd {
         strict_links: bool,
         no_sign: bool,
         chroot_exec: bool,
+        /// 回滚保留代数（GUI 经参数透传，root 下读不到用户配置）。
+        keep_rollback: Option<usize>,
     },
+    /// `--verify --archive <f> [--json]`（或位置参数 `--verify <f>`）。
+    Verify { archive: String, json: bool },
+    /// `--diagnose [--out <f>]`（或位置参数 `--diagnose <f>`）。
+    Diagnose { out: Option<String> },
 }
 
 // ===========================================================================
@@ -118,6 +143,26 @@ fn parse_strategy(value: &str) -> Result<Option<RestoreStrategy>, String> {
             "`--strategy` 取值非法：`{other}`（可选 auto | rebuild | reinstall | weak-modules | copy）"
         )),
     }
+}
+
+/// 把 `--firmware` 取值映射为三态策略（W5 / ITERATION §4-W5）。
+/// Map the `--firmware` value onto the three-state firmware policy.
+fn parse_firmware(value: &str) -> Result<String, String> {
+    match value {
+        v @ ("all" | "needed" | "none") => Ok(v.to_string()),
+        other => Err(format!(
+            "`--firmware` 取值非法：`{other}`（可选 all | needed | none）"
+        )),
+    }
+}
+
+/// 解析非负整数取值（`--keep-rollback`）。
+/// Parse a non-negative integer option value (`--keep-rollback`).
+fn parse_usize(value: &str) -> Result<usize, String> {
+    value
+        .replace('_', "")
+        .parse::<usize>()
+        .map_err(|_| format!("`--keep-rollback` 取值非法：`{value}`（需非负整数）"))
 }
 
 /// 取参数值：支持 `--mode standard` 与 `--mode=standard` 两种写法。
@@ -171,8 +216,9 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
         "--version" | "-V" => Ok(Cmd::Version),
         "--scan" => {
             let mut idx = 1;
-            let mut mode = BackupMode::Standard;
+            let mut mode: Option<BackupMode> = None;
             let mut json = false;
+            let mut config: Option<String> = None;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -183,28 +229,48 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         json = true;
                         idx += 1;
                     }
-                    "--mode" => mode = parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?,
+                    "--mode" => {
+                        mode = Some(parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?)
+                    }
+                    "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
                     other => return Err(format!("`--scan` 不支持参数 `{other}`")),
                 }
             }
-            Ok(Cmd::Scan { mode, json })
+            Ok(Cmd::Scan { mode, json, config })
         }
         "--backup" => {
             let mut idx = 1;
             let mut out: Option<String> = None;
-            let mut mode = BackupMode::Standard;
+            let mut mode: Option<BackupMode> = None;
             let mut kver: Option<String> = None;
+            let mut firmware: Option<String> = None;
+            let mut config: Option<String> = None;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
                     "--out" => out = Some(take_value(args, &mut idx, "--out", inline)?),
-                    "--mode" => mode = parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?,
+                    "--mode" => {
+                        mode = Some(parse_mode(&take_value(args, &mut idx, "--mode", inline)?)?)
+                    }
                     "--kver" => kver = Some(take_value(args, &mut idx, "--kver", inline)?),
+                    "--firmware" => {
+                        firmware = Some(parse_firmware(&take_value(
+                            args, &mut idx, "--firmware", inline,
+                        )?)?)
+                    }
+                    "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
                     other => return Err(format!("`--backup` 不支持参数 `{other}`")),
                 }
             }
-            let out = out.ok_or_else(|| "`--backup` 必须提供 `--out <归档路径>`".to_string())?;
-            Ok(Cmd::Backup { out, mode, kver })
+            // `--out` 缺省合法（W7）：由配置 `out_dir` + 默认文件名补全；
+            // 两者都没有时在执行期报用法错误（退出码 2）。
+            Ok(Cmd::Backup {
+                out,
+                mode,
+                kver,
+                firmware,
+                config,
+            })
         }
         "--restore" => {
             let mut idx = 1;
@@ -220,6 +286,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut strict_links = false;
             let mut no_sign = false;
             let mut chroot_exec = false;
+            let mut require_verify = false;
+            let mut no_auto_rollback_on_post = false;
+            let mut keep_rollback: Option<usize> = None;
+            let mut config: Option<String> = None;
             while idx < args.len() {
                 let (name, inline) = split_inline(&args[idx]);
                 match name {
@@ -275,6 +345,20 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         chroot_exec = true;
                         idx += 1;
                     }
+                    "--require-verify" => {
+                        require_verify = true;
+                        idx += 1;
+                    }
+                    "--no-auto-rollback-on-post" => {
+                        no_auto_rollback_on_post = true;
+                        idx += 1;
+                    }
+                    "--keep-rollback" => {
+                        keep_rollback = Some(parse_usize(&take_value(
+                            args, &mut idx, "--keep-rollback", inline,
+                        )?)?)
+                    }
+                    "--config" => config = Some(take_value(args, &mut idx, "--config", inline)?),
                     other => return Err(format!("`--restore` 不支持参数 `{other}`")),
                 }
             }
@@ -293,6 +377,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 strict_links,
                 no_sign,
                 chroot_exec,
+                require_verify,
+                no_auto_rollback_on_post,
+                keep_rollback,
+                config,
             })
         }
         "--rollback" => {
@@ -319,6 +407,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
             let mut archive: Option<String> = None;
             let mut kver: Option<String> = None;
             let mut with_firmware = false;
+            let mut keep_rollback: Option<usize> = None;
             let mut allow_kernel_mismatch = false;
             let mut allow_arch_mismatch = false;
             let mut root: Option<String> = None;
@@ -377,6 +466,11 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         chroot_exec = true;
                         idx += 1;
                     }
+                    "--keep-rollback" => {
+                        keep_rollback = Some(parse_usize(&take_value(
+                            args, &mut idx, "--keep-rollback", inline,
+                        )?)?)
+                    }
                     other => return Err(format!("`--helper-restore` 不支持参数 `{other}`")),
                 }
             }
@@ -395,7 +489,54 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 strict_links,
                 no_sign,
                 chroot_exec,
+                keep_rollback,
             })
+        }
+        "--verify" => {
+            let mut idx = 1;
+            let mut archive: Option<String> = None;
+            let mut json = false;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--archive" => {
+                        archive = Some(take_value(args, &mut idx, "--archive", inline)?)
+                    }
+                    "--json" => {
+                        if inline.is_some() {
+                            return Err("`--json` 不接受取值".to_string());
+                        }
+                        json = true;
+                        idx += 1;
+                    }
+                    // 位置参数写法：`--verify /path/a.tar.gz`（§5.2 的 `--verify [ARCHIVE]`）。
+                    other if !other.starts_with('-') && inline.is_none() => {
+                        archive = Some(other.to_string());
+                        idx += 1;
+                    }
+                    other => return Err(format!("`--verify` 不支持参数 `{other}`")),
+                }
+            }
+            let archive = archive
+                .ok_or_else(|| "`--verify` 需要归档路径（`--archive <f>` 或位置参数）".to_string())?;
+            Ok(Cmd::Verify { archive, json })
+        }
+        "--diagnose" => {
+            let mut idx = 1;
+            let mut out: Option<String> = None;
+            while idx < args.len() {
+                let (name, inline) = split_inline(&args[idx]);
+                match name {
+                    "--out" => out = Some(take_value(args, &mut idx, "--out", inline)?),
+                    // 位置参数写法：`--diagnose out.tar.gz`。
+                    other if !other.starts_with('-') && inline.is_none() => {
+                        out = Some(other.to_string());
+                        idx += 1;
+                    }
+                    other => return Err(format!("`--diagnose` 不支持参数 `{other}`")),
+                }
+            }
+            Ok(Cmd::Diagnose { out })
         }
         other => Err(format!(
             "未知子命令：`{other}`（参见 `--help` / see `--help`）"
@@ -412,15 +553,21 @@ fn usage() -> String {
          用法 / Usage:\n\
          \x20 linux-driver-backup                                   # 启动图形界面 / launch the GUI\n\
          \x20 linux-driver-backup --scan [--mode <m>] [--json]      # 扫描外置驱动 / scan out-of-tree drivers\n\
-         \x20 linux-driver-backup --backup --out <f> [--mode <m>] [--kver <k>]\n\
+         \x20 linux-driver-backup --backup [--out <f>] [--mode <m>] [--kver <k>] [--firmware all|needed|none]\n\
          \x20 linux-driver-backup --restore --archive <f> [--dry-run] [--yes] [--with-firmware] [--allow-kernel-mismatch]\n\
-         \x20                              [--allow-arch-mismatch] [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]\n\
+         \x20                              [--allow-arch-mismatch] [--require-verify] [--keep-rollback <n>] [--config <f>]\n\
+         \x20                              [--root <dir>] [--strategy auto|rebuild|reinstall|weak-modules|copy]\n\
          \x20                              [--on-immutable refuse|usroverlay] [--strict-links] [--no-sign] [--chroot-exec]\n\
+         \x20                              [--no-auto-rollback-on-post]\n\
          \x20 linux-driver-backup --rollback [last|<id>] [--root <dir>]   # 回滚上一次还原 / undo the last restore\n\
+         \x20 linux-driver-backup --verify [--archive] <f> [--json]       # 归档体检 / verify archive integrity\n\
+         \x20 linux-driver-backup --diagnose [--out <f>]                   # 诊断收集（脱敏）/ redacted diagnostics\n\
          \x20 linux-driver-backup --helper-restore --archive <f> [--kver <k>] [--with-firmware]\n\
          \n\
          说明 / Notes:\n\
          \x20 模式 <m>：minimal | standard（默认）| full（含 /lib/firmware）\n\
+         \x20 配置文件 / config: /etc/linux-driver-backup.toml 与 ~/.config/linux-driver-backup/config.toml\n\
+         \x20   （键 mode/out_dir/keep_rollback/sign_key/firmware/strategy；`--config` 显式指定，CLI 旗标优先）。\n\
          \x20 备份无需 root；真实还原需要 root（GUI 走 pkexec 单次提权，CLI 请用 sudo 运行）。\n\
          \x20 `--helper-restore` 仅供内部提权重入使用，用户不应手动调用。\n\
          \x20 Backup needs no root; a real restore does (GUI elevates once via pkexec,\n\
@@ -574,7 +721,16 @@ fn to_module_items(report: &ScanReport) -> (Vec<ModuleItem>, bool, usize) {
 
 /// `--scan`：扫描并打印（`--json` 输出机器可读 JSON）。
 /// `--scan`: scan and print, optionally as machine-readable JSON.
-fn run_cli_scan(mode: BackupMode, json: bool) -> i32 {
+fn run_cli_scan(mode: Option<BackupMode>, json: bool, config: Option<String>) -> i32 {
+    // W7：配置补全默认模式（CLI `--mode` 永远优先）。
+    let cfg = match config::Config::load(config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("参数错误 / invalid arguments: {err}");
+            return 2;
+        }
+    };
+    let mode = mode.or(cfg.mode).unwrap_or(BackupMode::Standard);
     let kver = distro::kernel_release();
     let info = DistroInfo::detect();
     let cancel = AtomicBool::new(false);
@@ -674,18 +830,128 @@ fn exit_code(err: &AppError) -> i32 {
     }
 }
 
+/// C-46：**备份**结果的唯一汇总文案（CLI / GUI 共用，避免多处措辞漂移）。
+/// C-46: single source of truth for the backup summary line (CLI / GUI).
+fn format_backup_summary(report: &backup::BackupReport) -> String {
+    format!(
+        "备份完成 / backup finished: {}（{} 个条目，{}，耗时 {:.1}s，归档格式 v{}）",
+        report.out_file.display(),
+        report.entry_count,
+        human_size(report.bytes_written),
+        report.duration_ms as f64 / 1000.0,
+        report.manifest.format_version
+    )
+}
+
+/// C-46：**还原**结果的唯一汇总文案（CLI / helper / GUI 共用）。
+/// C-46: single source of truth for the restore summary line (CLI / helper / GUI).
+fn format_restore_summary(report: &restore::RestoreReport) -> String {
+    if report.dry_run {
+        return "预演完成 / dry-run finished（未写盘 / nothing written）".to_string();
+    }
+    format!(
+        "还原完成 / restore finished: 写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}（未签名 {}）；depmod={}，initramfs={}",
+        report.written,
+        report.links_written,
+        report.skipped,
+        report.rebuilt,
+        report.reinstalled,
+        report.signed,
+        report.unsigned_left,
+        report.depmod_done,
+        match report.initramfs_done {
+            Some(true) => "已更新 / updated",
+            Some(false) => "失败 / failed",
+            None => "跳过 / skipped",
+        }
+    )
+}
+
+/// `--verify`：逐条校验归档完整性（C-06），默认文本，`--json` 输出结构化报告。
+/// `--verify`: per-entry archive integrity check (C-06); text by default, `--json` for machines.
+fn run_cli_verify(archive: String, json: bool) -> i32 {
+    let path = expand_tilde(&archive);
+    match verify::verify(&path) {
+        Ok(report) => {
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => {
+                        eprintln!("JSON 序列化失败 / JSON serialization failed: {err}");
+                        return 1;
+                    }
+                }
+            } else {
+                print!("{}", verify::format_report(&report));
+            }
+            if report.ok {
+                0
+            } else {
+                1
+            }
+        }
+        Err(err) => {
+            eprintln!("校验失败 / verification failed: {err}");
+            exit_code(&err)
+        }
+    }
+}
+
+/// `--diagnose`：生成脱敏诊断包（W7 / P1-6）。
+/// `--diagnose`: produce a redacted diagnostic bundle (W7 / P1-6).
+fn run_cli_diagnose(out: Option<String>) -> i32 {
+    match diagnose::run(out.as_deref()) {
+        Ok(path) => {
+            println!("诊断包已生成 / diagnostics written: {}", path.display());
+            0
+        }
+        Err(err) => {
+            eprintln!("诊断收集失败 / diagnose failed: {err}");
+            exit_code(&err)
+        }
+    }
+}
+
 /// `--backup`：打包外置驱动到 `.tar.gz`。
 /// `--backup`: pack out-of-tree drivers into a `.tar.gz` archive.
-fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
+fn run_cli_backup(
+    out: Option<String>,
+    mode: Option<BackupMode>,
+    kver: Option<String>,
+    firmware: Option<String>,
+    config: Option<String>,
+) -> i32 {
+    // W7：配置补全模式 / 输出目录 / 固件策略（CLI 旗标永远优先）。
+    let cfg = match config::Config::load(config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("参数错误 / invalid arguments: {err}");
+            return 2;
+        }
+    };
+    let mode = mode.or(cfg.mode).unwrap_or(BackupMode::Standard);
+    let firmware_policy = firmware.or(cfg.firmware);
     let kver = kver.unwrap_or_else(distro::kernel_release);
-    let out_path = expand_tilde(out);
+    let out_path = match out {
+        Some(raw) => expand_tilde(&raw),
+        None => match &cfg.out_dir {
+            Some(dir) => dir.join(format!("driver-backup-{kver}.tar.gz")),
+            None => {
+                eprintln!(
+                    "`--backup` 必须提供 `--out <归档路径>`（或在配置中设置 out_dir / \
+                     pass --out or set out_dir in the config）"
+                );
+                return 2;
+            }
+        },
+    };
     let request = backup::BackupRequest {
         out_file: out_path.clone(),
         kver: kver.clone(),
         distro: DistroInfo::detect(),
         mode,
         progress: cli_progress(),
-        firmware_policy: None, // 预置字段：W5 接线 --firmware
+        firmware_policy,
         cancel: Arc::new(AtomicBool::new(false)),
     };
 
@@ -696,14 +962,7 @@ fn run_cli_backup(out: &str, mode: BackupMode, kver: Option<String>) -> i32 {
     );
     match backup::run_backup(request) {
         Ok(report) => {
-            println!(
-                "备份完成 / done: {}（{} 个条目，{}，耗时 {:.1}s，归档格式 v{}）",
-                report.out_file.display(),
-                report.entry_count,
-                human_size(report.bytes_written),
-                report.duration_ms as f64 / 1000.0,
-                report.manifest.format_version
-            );
+            println!("{}", format_backup_summary(&report));
             0
         }
         Err(err) => {
@@ -732,6 +991,10 @@ struct RestoreCli {
     strict_links: bool,
     no_sign: bool,
     chroot_exec: bool,
+    require_verify: bool,
+    no_auto_rollback_on_post: bool,
+    keep_rollback: Option<usize>,
+    config: Option<String>,
 }
 
 /// `--restore`：校验并还原归档。
@@ -744,6 +1007,20 @@ struct RestoreCli {
 fn run_cli_restore(opts: RestoreCli) -> i32 {
     let path = expand_tilde(&opts.archive);
 
+    // W7：配置补全默认策略 / 回滚代数（CLI 旗标永远优先）。
+    let cfg = match config::Config::load(opts.config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("参数错误 / invalid arguments: {err}");
+            return 2;
+        }
+    };
+    let strategy = opts.strategy.or(cfg.strategy);
+    let keep_rollback = opts
+        .keep_rollback
+        .or(cfg.keep_rollback)
+        .unwrap_or(restore::DEFAULT_KEEP_ROLLBACK);
+
     // 普通权限即可读归档：先 inspect 用于打印确认信息与提示内核不一致。
     let info = match restore::inspect(&path) {
         Ok(info) => info,
@@ -752,6 +1029,25 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             return 1;
         }
     };
+    // W7 / §5.2：`--require-verify` 在还原前强制体检（补上 C-06 校验链）。
+    // `--require-verify`: integrity check before restoring (closes the C-06 gap).
+    if opts.require_verify {
+        eprintln!("前置校验 / pre-verify: {}", path.display());
+        match verify::verify(&path) {
+            Ok(report) if report.ok => {
+                eprintln!("  ✓ 校验通过 / passed（{} 条目）", report.entries_total);
+            }
+            Ok(report) => {
+                eprintln!("  ✗ 校验未通过 / FAILED");
+                eprintln!("{}", verify::format_report(&report));
+                return 1;
+            }
+            Err(err) => {
+                eprintln!("  ✗ 校验失败 / failed: {err}");
+                return 1;
+            }
+        }
+    }
     let current_kver = distro::kernel_release();
     let mismatch = info.manifest.kernel_release != current_kver;
     let arch_mismatch = info.manifest.arch != distro::arch();
@@ -783,7 +1079,7 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
             info.manifest.compression.as_deref().unwrap_or("unknown")
         );
         println!("  条目 / entries : {}", info.manifest.entries.len());
-        if let Some(st) = opts.strategy {
+        if let Some(st) = strategy {
             // C-48：英文 label 与中文 label_zh 并存，此处消费英文文案。
             println!("  策略 / strategy : {}（{}）", st.label(), st.label_zh());
         }
@@ -835,10 +1131,10 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         dry_run: opts.dry_run,
         allow_kernel_mismatch: opts.allow_kernel_mismatch,
         allow_arch_mismatch,
-        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
+        no_auto_rollback_on_post: opts.no_auto_rollback_on_post,
         with_firmware: opts.with_firmware,
         root: opts.root.as_deref().map(expand_tilde),
-        strategy: opts.strategy,
+        strategy,
         on_immutable: if opts.on_immutable {
             restore::ImmutablePolicy::Usroverlay
         } else {
@@ -847,33 +1143,14 @@ fn run_cli_restore(opts: RestoreCli) -> i32 {
         strict_links: opts.strict_links,
         no_sign: opts.no_sign,
         chroot_exec: opts.chroot_exec,
-        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
+        keep_rollback,
         progress: cli_progress(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
 
     match restore::run_restore(request) {
         Ok(report) => {
-            if report.dry_run {
-                println!("预演完成 / dry-run finished（未写盘 / nothing written）：");
-            } else {
-                println!(
-                    "还原完成 / restore finished: 写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}（未签名 {}）；depmod={}，initramfs={}",
-                    report.written,
-                    report.links_written,
-                    report.skipped,
-                    report.rebuilt,
-                    report.reinstalled,
-                    report.signed,
-                    report.unsigned_left,
-                    report.depmod_done,
-                    match report.initramfs_done {
-                        Some(true) => "已更新 / updated",
-                        Some(false) => "失败 / failed",
-                        None => "跳过 / skipped",
-                    }
-                );
-            }
+            println!("{}", format_restore_summary(&report));
             for note in &report.notes {
                 println!("  - {note}");
             }
@@ -946,9 +1223,64 @@ fn run_helper(
     strict_links: bool,
     no_sign: bool,
     chroot_exec: bool,
+    keep_rollback: Option<usize>,
 ) -> i32 {
     let sink_progress = privilege::HelperSink::new();
     let sink_result = privilege::HelperSink::new();
+
+    // ---- C-07 helper 自证：特权入口必须自证合法性 ----
+    // Helper self-attestation: the privileged entry point must prove its context.
+    let euid = unsafe { geteuid() };
+    if euid != 0 {
+        sink_result.result(
+            false,
+            "helper 必须以 root 运行 / helper must run as root (euid != 0)",
+        );
+        return 1;
+    }
+    // pkexec 路径：PKEXEC_UID 应为发起提权的原始用户 uid；sudo 路径无此变量，
+    // euid==0 已由上面断言，正常继续。
+    // Under pkexec the caller's uid must be valid; the sudo path has no PKEXEC_UID.
+    if let Ok(raw) = std::env::var("PKEXEC_UID") {
+        match raw.parse::<u32>() {
+            Ok(uid) => sink_progress.note(&format!("提权自调用者 / elevated from uid {uid}")),
+            Err(_) => {
+                sink_result.result(false, "PKEXEC_UID 非法 / invalid PKEXEC_UID");
+                return 1;
+            }
+        }
+    }
+
+    // ---- C-04 取消传播：监听 stdin EOF（父进程取消时关闭写端）----
+    // C-04 cancellation: watch stdin for EOF (the parent closes its end on cancel)。
+    let cancel = Arc::new(AtomicBool::new(false));
+    let restore_started = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = Arc::clone(&cancel);
+        let started = Arc::clone(&restore_started);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut byte = [0u8; 1];
+            loop {
+                match stdin.read(&mut byte) {
+                    // EOF：仅在还原已开始后才视为取消，避免 `--helper-restore < /dev/null`
+                    // 这类手动调用在启动前就被误取消。
+                    // EOF cancels only after the restore has started, so a redirected
+                    // stdin (`< /dev/null`) never cancels a manual invocation.
+                    Ok(0) => {
+                        if started.load(Ordering::SeqCst) {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                        break;
+                    }
+                    Ok(_) => { /* 保留字节读取以便未来握手；当前父进程只保持管道打开 */ }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     let progress: ProgressFn = Arc::new(move |value: f32, msg: String| {
         sink_progress.progress(value, &msg);
     });
@@ -959,7 +1291,7 @@ fn run_helper(
         dry_run: false,
         allow_kernel_mismatch,
         allow_arch_mismatch,
-        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
+        no_auto_rollback_on_post: false, // helper 不暴露该逃生口（仅 CLI `--no-auto-rollback-on-post`）
         with_firmware,
         root: root.as_deref().map(expand_tilde),
         strategy,
@@ -971,33 +1303,25 @@ fn run_helper(
         strict_links,
         no_sign,
         chroot_exec,
-        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
+        keep_rollback: keep_rollback.unwrap_or(restore::DEFAULT_KEEP_ROLLBACK),
         progress,
-        cancel: Arc::new(AtomicBool::new(false)),
+        cancel: Arc::clone(&cancel), // C-04：与 EOF 监听共享
     };
 
+    restore_started.store(true, Ordering::SeqCst);
     match restore::run_restore(request) {
         Ok(report) => {
-            let message = format!(
-                "还原完成：写入 {} 个文件 + {} 个链接，跳过 {} 个；重建 {}，重装 {}，签名 {}（未签名 {}）；depmod={}，initramfs={}",
-                report.written,
-                report.links_written,
-                report.skipped,
-                report.rebuilt,
-                report.reinstalled,
-                report.signed,
-                report.unsigned_left,
-                report.depmod_done,
-                match report.initramfs_done {
-                    Some(true) => "已更新",
-                    Some(false) => "失败",
-                    None => "已跳过（未知发行版）",
-                }
-            );
+            let message = format_restore_summary(&report);
             for note in &report.notes {
                 sink_result.note(note);
             }
             sink_result.result(true, &message);
+            0
+        }
+        Err(AppError::Cancelled) => {
+            // §5.3 行协议：取消以 RESULT FAIL 已取消 回传，退出码 0（用户主动取消）。
+            // Protocol: cancellation reports `RESULT FAIL\t已取消`, exit 0 (W0-C33).
+            sink_result.result(false, "已取消");
             0
         }
         Err(err) => {
@@ -1005,6 +1329,12 @@ fn run_helper(
             1
         }
     }
+}
+
+// helper 自证所需的 `geteuid(2)`（裸 extern，避免为单个符号引入 libc 依赖）。
+// `geteuid(2)` for helper self-attestation (bare extern; no libc dependency).
+extern "C" {
+    fn geteuid() -> u32;
 }
 
 // ===========================================================================
@@ -1019,6 +1349,9 @@ fn run_gui() -> AppResult<()> {
             "无法初始化图形界面（缺少显示服务器或窗口系统库？）：{err}"
         ))
     })?;
+
+    // W7：GUI 读取配置补全固件策略 / 回滚代数（GUI 没有 CLI 旗标，配置即默认）。
+    let gui_cfg = config::Config::load(None).unwrap_or_default();
 
     // ---- 启动时的静态信息 ----
     let kver = distro::kernel_release();
@@ -1127,6 +1460,7 @@ fn run_gui() -> AppResult<()> {
         let weak = app.as_weak();
         let running = Arc::clone(&running);
         let cancel = Arc::clone(&cancel);
+        let gui_firmware = gui_cfg.firmware.clone();
         app.on_start_backup(move || {
             let Some(ui) = weak.upgrade() else { return };
             let out = ui.get_out_path().to_string();
@@ -1149,6 +1483,8 @@ fn run_gui() -> AppResult<()> {
             let weak_thread = weak.clone();
             let running_thread = Arc::clone(&running);
             let cancel_thread = Arc::clone(&cancel);
+            // 内层线程 move 捕获，先克隆避免把 FnMut 闭包捕获的变量移走。
+            let gui_firmware = gui_firmware.clone();
             std::thread::spawn(move || {
                 let request = backup::BackupRequest {
                     out_file: out_path,
@@ -1156,18 +1492,12 @@ fn run_gui() -> AppResult<()> {
                     distro: DistroInfo::detect(),
                     mode,
                     progress,
-                    firmware_policy: None, // 预置字段：W5 接线 --firmware
+                    firmware_policy: gui_firmware.clone(),
                     cancel: Arc::clone(&cancel_thread),
                 };
                 match backup::run_backup(request) {
                     Ok(report) => {
-                        let message = format!(
-                            "备份成功：{}（{} 个条目，{}，耗时 {:.1}s）",
-                            report.out_file.display(),
-                            report.entry_count,
-                            human_size(report.bytes_written),
-                            report.duration_ms as f64 / 1000.0
-                        );
+                        let message = format_backup_summary(&report);
                         let archive = report.out_file.to_string_lossy().to_string();
                         let running_finish = Arc::clone(&running_thread);
                         let _ = weak_thread.upgrade_in_event_loop(move |ui| {
@@ -1199,6 +1529,9 @@ fn run_gui() -> AppResult<()> {
         let weak = app.as_weak();
         let running = Arc::clone(&running);
         let cancel = Arc::clone(&cancel);
+        let gui_keep_rollback = gui_cfg
+            .keep_rollback
+            .unwrap_or(restore::DEFAULT_KEEP_ROLLBACK);
         app.on_start_restore(move || {
             let Some(ui) = weak.upgrade() else { return };
             let archive = ui.get_archive_path().to_string().trim().to_string();
@@ -1317,7 +1650,7 @@ fn run_gui() -> AppResult<()> {
                         dry_run: true,
                         // 预演无副作用：允许跨内核/跨架构预览，附带提示信息。
                         allow_kernel_mismatch: true,
-                        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
+                        no_auto_rollback_on_post: false, // GUI 不暴露该逃生口（仅 CLI）
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
@@ -1326,7 +1659,7 @@ fn run_gui() -> AppResult<()> {
                         strict_links: false,
                         no_sign: true,
                         chroot_exec: false,
-                        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
+                        keep_rollback: gui_keep_rollback,
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
@@ -1369,7 +1702,7 @@ fn run_gui() -> AppResult<()> {
                         allow_kernel_mismatch: false,
                         // 能走到这里说明用户已在确认框点"确认还原"（C-35），
                         // 架构不一致的警告已列在确认框详情里，视为已确认（C-32）。
-                        no_auto_rollback_on_post: false, // TODO(W7): 由 --no-auto-rollback-on-post 接线
+                        no_auto_rollback_on_post: false, // GUI 不暴露该逃生口（仅 CLI）
                         allow_arch_mismatch: true,
                         with_firmware: true,
                         root: None,
@@ -1378,7 +1711,7 @@ fn run_gui() -> AppResult<()> {
                         strict_links: false,
                         no_sign: false,
                         chroot_exec: false,
-                        keep_rollback: restore::DEFAULT_KEEP_ROLLBACK,
+                        keep_rollback: gui_keep_rollback,
                         progress,
                         cancel: Arc::clone(&cancel_thread),
                     };
@@ -1416,6 +1749,8 @@ fn run_gui() -> AppResult<()> {
                         "--with-firmware".to_string(),
                         // 确认框已展示架构差异并获得用户确认（C-32/C-35）。
                         "--allow-arch-mismatch".to_string(),
+                        "--keep-rollback".to_string(),
+                        gui_keep_rollback.to_string(),
                     ];
                     privilege::run_helper_via_pkexec(
                         &args,
@@ -1503,8 +1838,14 @@ fn main() {
             println!("linux-driver-backup {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Cmd::Scan { mode, json } => run_cli_scan(mode, json),
-        Cmd::Backup { out, mode, kver } => run_cli_backup(&out, mode, kver),
+        Cmd::Scan { mode, json, config } => run_cli_scan(mode, json, config),
+        Cmd::Backup {
+            out,
+            mode,
+            kver,
+            firmware,
+            config,
+        } => run_cli_backup(out, mode, kver, firmware, config),
         Cmd::Restore {
             archive,
             dry_run,
@@ -1518,6 +1859,10 @@ fn main() {
             strict_links,
             no_sign,
             chroot_exec,
+            require_verify,
+            no_auto_rollback_on_post,
+            keep_rollback,
+            config,
         } => run_cli_restore(RestoreCli {
             archive,
             dry_run,
@@ -1531,6 +1876,10 @@ fn main() {
             strict_links,
             no_sign,
             chroot_exec,
+            require_verify,
+            no_auto_rollback_on_post,
+            keep_rollback,
+            config,
         }),
         Cmd::Rollback { journal, root } => run_cli_rollback(journal, root),
         Cmd::Helper {
@@ -1545,6 +1894,7 @@ fn main() {
             strict_links,
             no_sign,
             chroot_exec,
+            keep_rollback,
         } => run_helper(
             archive,
             kver,
@@ -1557,7 +1907,10 @@ fn main() {
             strict_links,
             no_sign,
             chroot_exec,
+            keep_rollback,
         ),
+        Cmd::Verify { archive, json } => run_cli_verify(archive, json),
+        Cmd::Diagnose { out } => run_cli_diagnose(out),
         Cmd::Gui => match run_gui() {
             Ok(()) => 0,
             Err(err) => {
@@ -1600,35 +1953,50 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["--scan"])).unwrap(),
             Cmd::Scan {
-                mode: BackupMode::Standard,
-                json: false
+                mode: None,
+                json: false,
+                config: None,
             }
         );
         assert_eq!(
             parse_args(&args(&["--scan", "--mode", "full", "--json"])).unwrap(),
             Cmd::Scan {
-                mode: BackupMode::Full,
-                json: true
+                mode: Some(BackupMode::Full),
+                json: true,
+                config: None,
             }
         );
         assert_eq!(
             parse_args(&args(&["--scan", "--mode=minimal"])).unwrap(),
             Cmd::Scan {
-                mode: BackupMode::Minimal,
-                json: false
+                mode: Some(BackupMode::Minimal),
+                json: false,
+                config: None,
             }
         );
     }
 
     #[test]
-    fn backup_requires_out_and_parses_options() {
-        assert!(parse_args(&args(&["--backup"])).is_err());
+    fn backup_parses_options_and_allows_out_from_config() {
+        // W7：`--backup` 不再在解析期要求 `--out`（可由配置 out_dir 补全），执行期才判空。
+        assert_eq!(
+            parse_args(&args(&["--backup"])).unwrap(),
+            Cmd::Backup {
+                out: None,
+                mode: None,
+                kver: None,
+                firmware: None,
+                config: None,
+            }
+        );
         assert_eq!(
             parse_args(&args(&["--backup", "--out", "/tmp/a.tar.gz"])).unwrap(),
             Cmd::Backup {
-                out: "/tmp/a.tar.gz".to_string(),
-                mode: BackupMode::Standard,
-                kver: None
+                out: Some("/tmp/a.tar.gz".to_string()),
+                mode: None,
+                kver: None,
+                firmware: None,
+                config: None,
             }
         );
         assert_eq!(
@@ -1638,15 +2006,22 @@ mod tests {
                 "--mode",
                 "minimal",
                 "--kver",
-                "6.8.0-45-generic"
+                "6.8.0-45-generic",
+                "--firmware",
+                "needed",
+                "--config",
+                "/etc/ldb.toml"
             ]))
             .unwrap(),
             Cmd::Backup {
-                out: "/tmp/b.tar.gz".to_string(),
-                mode: BackupMode::Minimal,
-                kver: Some("6.8.0-45-generic".to_string())
+                out: Some("/tmp/b.tar.gz".to_string()),
+                mode: Some(BackupMode::Minimal),
+                kver: Some("6.8.0-45-generic".to_string()),
+                firmware: Some("needed".to_string()),
+                config: Some("/etc/ldb.toml".to_string()),
             }
         );
+        assert!(parse_args(&args(&["--backup", "--firmware", "yes"])).is_err());
     }
 
     #[test]
@@ -1675,7 +2050,11 @@ mod tests {
                 on_immutable: false,
                 strict_links: false,
                 no_sign: false,
-                chroot_exec: false
+                chroot_exec: false,
+                require_verify: false,
+                no_auto_rollback_on_post: false,
+                keep_rollback: None,
+                config: None
             }
         );
     }
@@ -1710,7 +2089,11 @@ mod tests {
                 on_immutable: true,
                 strict_links: true,
                 no_sign: true,
-                chroot_exec: true
+                chroot_exec: true,
+                require_verify: false,
+                no_auto_rollback_on_post: false,
+                keep_rollback: None,
+                config: None
             }
         );
         // `--strategy auto` 等价于自动决策（None）
@@ -1728,13 +2111,85 @@ mod tests {
                 on_immutable: false,
                 strict_links: false,
                 no_sign: false,
-                chroot_exec: false
+                chroot_exec: false,
+                require_verify: false,
+                no_auto_rollback_on_post: false,
+                keep_rollback: None,
+                config: None
             }
         );
         assert!(parse_args(&args(&["--restore", "--archive", "a", "--strategy", "magic"])).is_err());
         assert!(
             parse_args(&args(&["--restore", "--archive", "a", "--on-immutable", "maybe"])).is_err()
         );
+    }
+
+    #[test]
+    fn restore_w7_flags_are_parsed() {
+        assert_eq!(
+            parse_args(&args(&[
+                "--restore",
+                "--archive",
+                "a",
+                "--require-verify",
+                "--no-auto-rollback-on-post",
+                "--keep-rollback",
+                "7",
+                "--config",
+                "/etc/ldb.toml"
+            ]))
+            .unwrap(),
+            Cmd::Restore {
+                archive: "a".to_string(),
+                dry_run: false,
+                yes: false,
+                with_firmware: false,
+                allow_kernel_mismatch: false,
+                allow_arch_mismatch: false,
+                root: None,
+                strategy: None,
+                on_immutable: false,
+                strict_links: false,
+                no_sign: false,
+                chroot_exec: false,
+                require_verify: true,
+                no_auto_rollback_on_post: true,
+                keep_rollback: Some(7),
+                config: Some("/etc/ldb.toml".to_string())
+            }
+        );
+        assert!(parse_args(&args(&["--restore", "--archive", "a", "--keep-rollback", "-1"])).is_err());
+    }
+
+    #[test]
+    fn verify_and_diagnose_are_parsed() {
+        assert_eq!(
+            parse_args(&args(&["--verify", "--archive", "/tmp/a.tar.gz", "--json"])).unwrap(),
+            Cmd::Verify {
+                archive: "/tmp/a.tar.gz".to_string(),
+                json: true
+            }
+        );
+        // 位置参数写法
+        assert_eq!(
+            parse_args(&args(&["--verify", "/tmp/b.tar.gz"])).unwrap(),
+            Cmd::Verify {
+                archive: "/tmp/b.tar.gz".to_string(),
+                json: false
+            }
+        );
+        assert!(parse_args(&args(&["--verify"])).is_err());
+        assert_eq!(
+            parse_args(&args(&["--diagnose"])).unwrap(),
+            Cmd::Diagnose { out: None }
+        );
+        assert_eq!(
+            parse_args(&args(&["--diagnose", "--out", "/tmp/d.tar.gz"])).unwrap(),
+            Cmd::Diagnose {
+                out: Some("/tmp/d.tar.gz".to_string())
+            }
+        );
+        assert!(parse_args(&args(&["--diagnose", "--wat"])).is_err());
     }
 
     #[test]
@@ -1802,7 +2257,8 @@ mod tests {
                 on_immutable: false,
                 strict_links: false,
                 no_sign: false,
-                chroot_exec: false
+                chroot_exec: false,
+                keep_rollback: None
             }
         );
         assert!(parse_args(&args(&["--helper-restore"])).is_err());
