@@ -3,13 +3,31 @@
 **Linux Driver Backup & Restore Tool — a Rust + Slint desktop application**
 
 一行简介 / One-line intro:
-**中文**：一个发行版自适应的 Linux 外置（out-of-tree）驱动备份与还原工具，提供 GUI 与 CLI 双模式，产出可校验、可跨机还原的 `tar.gz` 归档。
-**English**: A distro-adaptive backup & restore tool for Linux out-of-tree drivers, with both GUI and CLI front-ends, producing checksummed `tar.gz` archives that can be restored across machines.
+**中文**：一个发行版自适应的 Linux 外置（out-of-tree）驱动备份与还原工具，提供 GUI 与 CLI 双模式，产出可校验、可跨机还原的归档（默认 zstd，可选 gzip 或无压缩）。
+**English**: A distro-adaptive backup & restore tool for Linux out-of-tree drivers, with both GUI and CLI front-ends, producing checksummed archives (zstd by default, gzip or uncompressed optional) that can be restored across machines.
 
 <!-- 徽章 / Badges -->
 [![CI](https://github.com/ltbkq/linux-driver-backup/actions/workflows/build/badge.svg)](https://github.com/ltbkq/linux-driver-backup/actions/workflows/build.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
 [![Rust: 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/tools/install)
+
+---
+
+## v0.4.0 更新 / What's new in v0.4.0
+
+> 对应 [docs/ITERATION-v0.4.0.md](docs/ITERATION-v0.4.0.md) 的 **W10（性能）** 与 **W12（分发）起步**。
+> **归档格式仍为 v2**；内容寻址/去重/加密/远程与 manifest 前置（W11）顺延至 **v0.4.1**。
+> W10 (performance) and the start of W12 (distribution). **Archive format stays v2**; dedup/encryption/remote (W11) move to v0.4.1.
+
+- **压缩算法可选（W10 / P2-1）**：`--backup --compress zstd|gzip|none`，默认 **zstd**（`zstdmt` 多线程）；压缩算法写入 `manifest.json`，还原端据此解码。
+- **读取端按魔数识别**：`--restore` 与 `--verify` 共用同一读取路径，自动识别 gzip / zstd / 裸 tar，无需用户指定压缩方式；修复 `--verify` 将**默认 zstd** 归档误判为「归档条目损坏」的缺陷。
+- **扩展名跟随算法**：自动生成的默认文件名与内容保持一致——`zstd → .tar.zst`、`gzip → .tar.gz`、`none → .tar`；CLI 与 GUI 文件对话框/过滤器同步。
+- **分发渠道起步（W12）**：新增 [`packaging/copr`](packaging/copr/)（Fedora / RHEL）与 [`packaging/obs`](packaging/obs/)（openSUSE / SLE）的 RPM spec、`_service` 与发布说明。
+- **推迟项（W11 → v0.4.1）**：内容寻址块存储/增量去重、`--encrypt age|gpg`、`--remote sftp|s3`、manifest 前置 + 索引页脚。Manifest 保留 `encryption` / `block` 字段（当前恒为 `None`），v1/v2 归档继续可读。
+
+**质量门 / Gates**：`cargo test --locked` → **199 通过 / 0 失败**（187 单元 + 8 退出码 + 4 集成）；`cargo clippy --all-targets -- -D warnings` 零告警；`cargo fmt --check` 通过。
+
+> 阶段快照与详细现状见 [docs/STATUS-v0.4.0.md](docs/STATUS-v0.4.0.md)。
 
 ---
 
@@ -53,7 +71,7 @@
 
 - **发行版自适应 / Distro-adaptive**：自动探测 Debian 系（Ubuntu、Linux Mint、Debian…）、RHEL 系（Fedora、Rocky、AlmaLinux、CentOS…）、Arch 系（Arch、Manjaro、EndeavourOS…）与未知发行版；按发行版选择 `depmod` 之后的 initramfs 更新命令（`update-initramfs` / `dracut` / `mkinitcpio`），未知发行版则明确跳过而不谎报成功。*Detects the distro family and picks the right initramfs tool.*
 - **三级备份模式 / Three-tier backup modes**：外置（out-of-tree）模块 + DKMS 源码 + 配置文件 + 可选固件，分为 `minimal` / `standard`（默认）/ `full` 三档，按需在体积与完整性之间取舍。*Choose between minimal, standard and full scope.*
-- **可校验归档 / Verifiable archive**：`tar.gz` 内含 `manifest.json`，记录格式版本、工具版本、内核版本、架构、发行版、备份模式，以及**逐文件 SHA-256**；还原前先读清单校验，支持跨机还原。*Every file is hashed with SHA-256 and listed in `manifest.json`.*
+- **可校验归档 / Verifiable archive**：归档（默认 zstd，可选 gzip/无压缩）内含 `manifest.json`，记录格式版本、工具版本、内核版本、架构、发行版、备份模式、压缩算法，以及**逐文件 SHA-256**；还原前先读清单校验，支持跨机还原。*Every file is hashed with SHA-256 and listed in `manifest.json`.*
 - **GUI + CLI 双模 / Dual front-ends**：桌面环境用 Slint 图形界面；无显示环境、自动化脚本与 CI 冒烟测试用同一二进制的命令行参数完成扫描、备份与还原。*One binary, both a Slint GUI and a scriptable CLI.*
 - **单文件分发 / Single-file delivery**：`cargo build --release` 产出一个可执行文件，无需 Python / Qt / C++ 运行时；Slint 采用 `default-features = false` 裁剪特性并使用软件渲染，避免 OpenGL/EGL 依赖。*One stripped binary, no runtime toolchain required.*
 - **非破坏性还原 / Non-destructive restore**：还原前可先 `--dry-run` 预演（只打印计划、不写盘）；目标位置已存在同名文件时先备份为 `*.ldbak` 再覆盖；写入完成后强制执行 `depmod -a <kver>`（RHEL 系并补 `restorecon`），最后按发行版自适应更新 initramfs——没有 `depmod` 就不会有 `modules.dep`/`modules.alias`，还原等于无效。*Dry-run preview, `.ldbak` safety copies, mandatory `depmod`, then distro-adaptive initramfs update.*
