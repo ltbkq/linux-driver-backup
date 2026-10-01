@@ -11,9 +11,10 @@
 #
 # 安装内容 / What gets installed:
 #   $prefix/bin/linux-driver-backup                              可执行文件
-#   $prefix/share/applications/linux-driver-backup.desktop       桌面入口
+#   $prefix/share/applications/linux-driver-backup.desktop       桌面入口（Exec/TryExec 已改写为绝对路径，C-55）
 #   $prefix/share/icons/hicolor/scalable/apps/linux-driver-backup.svg  图标
 #   $prefix/share/doc/linux-driver-backup/LICENSE                GPL-3.0 全文
+#   /usr/share/polkit-1/actions/linux-driver-backup.policy       polkit policy（C-51，可用 --polkit-dir/--no-polkit 调整）
 #
 # 二进制来源 / Where the binary comes from:
 #   1) 优先 target/release/linux-driver-backup（仓库内 cargo build --release 的产物）
@@ -25,9 +26,14 @@ set -euo pipefail
 PROG="install.sh"
 PREFIX="/usr/local"
 MODE="install"
+# polkit policy 固定落到系统目录，pkexec 才能按 exec.path 匹配到本程序；
+# 非 root 安装到用户前缀时该步骤会失败，此时仅告警并跳过（不影响程序运行）。
+POLKIT_DIR="/usr/share/polkit-1/actions"
+INSTALL_POLKIT=1
 
 info() { printf '[%s] %s\n' "$PROG" "$*"; }
 err()  { printf '[%s][错误/ERROR] %s\n' "$PROG" "$*" >&2; }
+warn() { printf '[%s][警告/WARNING] %s\n' "$PROG" "$*" >&2; }
 
 usage() {
   cat <<'EOF'
@@ -39,9 +45,11 @@ linux-driver-backup 安装脚本 / installer
   ./install.sh --help                  显示本帮助
 
 选项 / Options:
-  --prefix DIR, --prefix=DIR   安装前缀 / installation prefix（默认 /usr/local）
-  --uninstall                  卸载模式：只删除本脚本安装过的四个文件
-  -h, --help                   显示帮助并退出
+  --prefix DIR, --prefix=DIR      安装前缀 / installation prefix（默认 /usr/local）
+  --polkit-dir DIR                 polkit policy 安装目录（默认 /usr/share/polkit-1/actions）
+  --no-polkit                      跳过 polkit policy 安装 / skip the polkit policy
+  --uninstall                      卸载模式：只删除本脚本安装过的文件
+  -h, --help                       显示帮助并退出
 
 说明 / Notes:
   · 需要写入系统目录时请加 sudo：sudo ./install.sh
@@ -58,6 +66,13 @@ while [[ $# -gt 0 ]]; do
       PREFIX="$2"; shift 2 ;;
     --prefix=*)
       PREFIX="${1#--prefix=}"; shift ;;
+    --polkit-dir)
+      [[ $# -ge 2 ]] || { err "--polkit-dir 缺少取值 / missing value"; exit 2; }
+      POLKIT_DIR="$2"; shift 2 ;;
+    --polkit-dir=*)
+      POLKIT_DIR="${1#--polkit-dir=}"; shift ;;
+    --no-polkit)
+      INSTALL_POLKIT=0; shift ;;
     --uninstall)
       MODE="uninstall"; shift ;;
     -h|--help)
@@ -115,17 +130,42 @@ ICON_SRC="$(resolve \
 LICENSE_SRC="$(resolve "$SCRIPT_DIR/LICENSE" "$SCRIPT_DIR/../LICENSE")" \
   || { err "未找到 LICENSE"; exit 1; }
 
+# polkit policy 可选：仓库 packaging/polkit/ 或 tar 包根目录
+POLICY_SRC="$(resolve \
+  "$SCRIPT_DIR/linux-driver-backup.policy" \
+  "$SCRIPT_DIR/polkit/linux-driver-backup.policy" \
+  "$SCRIPT_DIR/../packaging/polkit/linux-driver-backup.policy")" \
+  || POLICY_SRC=""
+
 # ---- 安装目标 / install targets ---------------------------
 BIN_DST="$PREFIX/bin/linux-driver-backup"
 DESKTOP_DST="$PREFIX/share/applications/linux-driver-backup.desktop"
 ICON_DST="$PREFIX/share/icons/hicolor/scalable/apps/linux-driver-backup.svg"
 DOC_DIR="$PREFIX/share/doc/linux-driver-backup"
 LICENSE_DST="$DOC_DIR/LICENSE"
+POLICY_DST="$POLKIT_DIR/linux-driver-backup.policy"
+
+# 渲染桌面入口：把 Exec/TryExec 改写为绝对路径（C-55）
+render_desktop() {
+  local src="$1" dst="$2"
+  sed -e "s|^Exec=.*|Exec=$BIN_DST|" \
+      -e "s|^TryExec=.*|TryExec=$BIN_DST|" "$src" > "$dst"
+}
+
+# 渲染 polkit policy：把 exec.path 指向实际安装的二进制
+render_policy() {
+  local src="$1" dst="$2"
+  sed -e "s#\(org\.freedesktop\.policykit\.exec\.path\">\)[^<]*#\1$BIN_DST#" "$src" > "$dst"
+}
 
 # ---- 卸载模式 / uninstall mode ----------------------------
 if [[ "$MODE" == "uninstall" ]]; then
   removed=0
-  for f in "$BIN_DST" "$DESKTOP_DST" "$ICON_DST" "$LICENSE_DST"; do
+  targets=("$BIN_DST" "$DESKTOP_DST" "$ICON_DST" "$LICENSE_DST")
+  if [[ -n "$POLICY_SRC" ]]; then
+    targets+=("$POLICY_DST")
+  fi
+  for f in "${targets[@]}"; do
     if [[ -e "$f" ]]; then
       rm -f "$f"
       info "已删除 / removed: $f"
@@ -158,16 +198,35 @@ for f in "$BIN_DST" "$DESKTOP_DST" "$ICON_DST" "$LICENSE_DST"; do
 done
 
 install -m 0755 "$BIN_SRC"     "$BIN_DST"
-install -m 0644 "$DESKTOP_SRC" "$DESKTOP_DST"
+render_desktop "$DESKTOP_SRC"  "$DESKTOP_DST"
+chmod 0644 "$DESKTOP_DST"
 install -m 0644 "$ICON_SRC"    "$ICON_DST"
 install -m 0644 "$LICENSE_SRC" "$LICENSE_DST"
 
+# polkit policy（C-51）：失败不致命（例如无 root 或用户前缀安装）
+POLICY_INSTALLED=0
+if [[ "$INSTALL_POLKIT" -eq 1 && -n "$POLICY_SRC" ]]; then
+  if mkdir -p "$POLKIT_DIR" 2>/dev/null && render_policy "$POLICY_SRC" "$POLICY_DST" 2>/dev/null; then
+    chmod 0644 "$POLICY_DST"
+    POLICY_INSTALLED=1
+    info "polkit policy 已安装 / installed: $POLICY_DST"
+  else
+    warn "polkit policy 安装失败（$POLKIT_DIR 不可写？）；图形还原将使用通用认证对话框。"
+    warn "Failed to install polkit policy — GUI restore will fall back to the generic prompt."
+  fi
+elif [[ "$INSTALL_POLKIT" -eq 1 ]]; then
+  warn "未找到 polkit policy 文件，跳过 / policy source not found, skipping."
+fi
+
 info "安装完成 / installed:"
 info "  可执行文件 / binary     : $BIN_DST"
-info "  桌面入口   / desktop    : $DESKTOP_DST"
+info "  桌面入口   / desktop    : $DESKTOP_DST （Exec/TryExec → $BIN_DST）"
 info "  图标       / icon       : $ICON_DST"
 info "  许可       / license    : $LICENSE_DST"
+if [[ "$POLICY_INSTALLED" -eq 1 ]]; then
+  info "  polkit     / policy     : $POLICY_DST"
+fi
 info "运行 / run  : $BIN_DST  （或直接执行 linux-driver-backup，若 \$PATH 含 $PREFIX/bin）"
-info "验证 / check: linux-driver-backup --version"
+info "验证 / check: $BIN_DST --version"
 info "卸载 / remove: sudo $SCRIPT_DIR/$PROG --uninstall --prefix=$PREFIX"
 info "（若是 root/普通用户直接安装，去掉 sudo 即可。）"

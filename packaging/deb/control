@@ -20,6 +20,10 @@
 #   RPM 侧对应 Requires 同步为同一组。
 #   Verified with `ldd` in W3: hard (DT_NEEDED) deps are libc6, libfontconfig1 and
 #   libfreetype6; libxkbcommon0 / libwayland-client0 are dlopen'ed at runtime.
+#
+# 关于 Recommends（C-50）：GUI 还原通过 pkexec 提权，pkexec 随 polkit 提供，
+# 但缺失时 CLI 仍可用 sudo，故用 Recommends 而非 Depends。
+# Recommends (not Depends): pkexec ships with polkit; without it the CLI still works via sudo.
 Package: linux-driver-backup
 Version: @VERSION@
 Section: utils
@@ -28,6 +32,7 @@ Architecture: amd64
 Installed-Size: @SIZE_KB@
 Maintainer: ltbkq <ltbkqq@gmail.com>
 Depends: libc6 (>= 2.35), libfontconfig1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
+Recommends: polkit | pkexec
 Homepage: https://github.com/ltbkq/linux-driver-backup
 Description: Backup and restore out-of-tree Linux kernel drivers
  备份与还原 Linux 外置（out-of-tree）驱动模块的桌面 + 命令行工具。

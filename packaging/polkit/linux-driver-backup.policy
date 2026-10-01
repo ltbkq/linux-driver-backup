@@ -16,11 +16,11 @@
     pkexec matches this action via the exec.path annotation; if the path does not
     match the installed binary, pkexec falls back to the generic action.
   · packaging/install.sh 在安装时会把下面的路径改写成 $prefix/bin/…
-    （C-55：--prefix=/opt/ldb 等非 /usr 前缀也要拿到品牌化对话框）。
+    （C-55：诸如「prefix=/opt/ldb」的非 /usr 前缀也要拿到品牌化对话框）。
   · vendor 元素按任务约定省略 / the <vendor> element is intentionally omitted.
-  · 校验 / validate:
-      xmllint --noout --valid packaging/polkit/linux-driver-backup.policy
-      pkaction | grep io.github.ltbkq     # 安装后 / after installation
+  · 校验 / validate after install:
+      pkaction | grep io.github.ltbkq        # 安装后 / after installation
+      xmllint（若已安装）可做良构性检查 / use xmllint if available for well-formedness.
 -->
 <policyconfig>
   <vendor_url>https://github.com/ltbkq/linux-driver-backup</vendor_url>

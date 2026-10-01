@@ -37,7 +37,10 @@ packaging/appimage/
 3. **免 FUSE**：CI 容器里通常没有 `/dev/fuse`，因此统一用
    `APPIMAGE_EXTRACT_AND_RUN=1 appimagetool …`，让 appimagetool 自解压运行，
    不需要 FUSE，也不需要 `--appimage-extract-and-run` 参数。
-4. **网络失败不阻断 CI**：`build-appimage.sh` 下载 `appimagetool` 失败时打印中文
+4. **供应链（C-08）**：appimagetool 固定到 `1.9.1` 并校验官方 SHA-256（见
+   `build-appimage.sh` 顶部的 `APPIMAGETOOL_VERSION`/`AI_SHA`）；下载失败按
+   DESIGN.md §11.4 降级（warning + exit 0），**校验和不符则硬失败**（exit 1）。
+5. **网络失败不阻断 CI**：`build-appimage.sh` 下载 `appimagetool` 失败时打印中文
    warning 并 `exit 0`（DESIGN.md §11.4：AppImage 失败降级为只发 deb/rpm/tar）。
 
 ## 2. 手动运行 / Run manually

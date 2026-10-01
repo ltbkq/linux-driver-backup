@@ -16,10 +16,13 @@
 #      mkdir -p "$topdir"/{SPECS,SOURCES,RPMS,SRPMS,BUILD,BUILDROOT}
 #      sed "s/@VERSION@/$VER/" packaging/linux-driver-backup.spec > "$topdir/SPECS/…"
 #      cp target/release/linux-driver-backup packaging/linux-driver-backup.desktop \
-#         packaging/icon.svg LICENSE "$topdir/SOURCES/"
-#      rpmbuild -bb --define "_topdir $topdir" "$topdir/SPECS/linux-driver-backup.spec"
+#         packaging/icon.svg packaging/polkit/linux-driver-backup.policy LICENSE \
+#         "$topdir/SOURCES/"
+#      rpmbuild -bb --define "_topdir $topdir" --define "ldb_target fedora" \
+#         "$topdir/SPECS/linux-driver-backup.spec"
 #      cp "$topdir"/RPMS/*/linux-driver-backup-*.rpm dist/
-#    以上流程已由 packaging/build-packages.sh 的 `rpm` 子命令封装。
+#    以上流程已由 packaging/build-packages.sh 的 `rpm` 子命令封装，
+#    并由其 `--rpm-target fedora|suse|both|auto` 选择依赖分支（C-53）。
 # 3) 本机无 rpmbuild 时脚本打印 [跳过]，产物交由 CI 产出（DESIGN.md §11.4）。
 # ============================================================
 
@@ -50,16 +53,21 @@ URL:            https://github.com/ltbkq/linux-driver-backup
 #   「wayland 被 linux-driver-backup 需要」而无法安装；
 # Fedora/RHEL 上正确的包名是 `libwayland-client`（见下方条件分支）。
 #
+# 双目标 / Dual target（C-53）：依赖分支由构建参数 `ldb_target` 显式选择，
+# **不再强制 fedora**。CI 在 Ubuntu 上构建时 `%{?fedora}`/`%{?rhel}` 均未定义，
+# 若不传 `ldb_target` 则走通用 SoName 分支（openSUSE 等正确）；
+# 传 `--define "ldb_target fedora"` 才产出 Fedora/RHEL 包名依赖。
+# build-packages.sh `--rpm-target fedora|suse|both|auto` 封装了该参数。
+#
 # Verification: `rpm -qpR <包>` 可查看最终生效的 Requires（CI 中有断言防止回退）。
 # ---------------------------------------------------------------------------
 AutoReqProv:    yes
 
-%if 0%{?fedora} || 0%{?rhel} || 0%{?ldb_target_fedora}
+# 可选依赖：pkexec 图形提权（C-50）。Fedora/RHEL 及 openSUSE 的包名均为 polkit。
+Recommends:     polkit
+
+%if 0%{?fedora} || 0%{?rhel} || "%{?ldb_target}" == "fedora"
 # Fedora / RHEL / Rocky / AlmaLinux / CentOS Stream / openEuler 的真实包名。
-# 注：CI 在 Ubuntu runner 上构建，因此 build-packages.sh 会显式传入
-# `--define "ldb_target_fedora 1"`，让产物带上 Fedora/RHEL 的包名依赖。
-# fontconfig / freetype / glibc 无需手写 —— 它们由上面的 AutoReqProv
-# 自动生成为 soname 依赖（libfontconfig.so.1()(64bit) 等）。
 Requires:       libwayland-client
 Requires:       libxkbcommon
 Requires:       libxkbcommon-x11
@@ -98,6 +106,7 @@ rm -rf %{buildroot}
 install -d %{buildroot}%{_bindir}
 install -d %{buildroot}%{_datadir}/applications
 install -d %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
+install -d %{buildroot}%{_datadir}/polkit-1/actions
 install -d %{buildroot}%{_docdir}/%{name}
 
 # 二进制 / the pre-built binary (copied in by packaging/build-packages.sh)
@@ -112,6 +121,10 @@ install -m 0644 %{_sourcedir}/linux-driver-backup.desktop \
 install -m 0644 %{_sourcedir}/icon.svg \
         %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/linux-driver-backup.svg
 
+# polkit policy（C-51）：exec.path 与 %{_bindir}/linux-driver-backup 一致
+install -m 0644 %{_sourcedir}/linux-driver-backup.policy \
+        %{buildroot}%{_datadir}/polkit-1/actions/linux-driver-backup.policy
+
 # 许可全文 / full GPL-3.0 text（与 deb 的 copyright 同源：/usr/share/common-licenses/GPL-3）
 install -m 0644 %{_sourcedir}/LICENSE \
         %{buildroot}%{_docdir}/%{name}/LICENSE
@@ -120,6 +133,7 @@ install -m 0644 %{_sourcedir}/LICENSE \
 %{_bindir}/linux-driver-backup
 %{_datadir}/applications/linux-driver-backup.desktop
 %{_datadir}/icons/hicolor/scalable/apps/linux-driver-backup.svg
+%{_datadir}/polkit-1/actions/linux-driver-backup.policy
 %{_docdir}/%{name}/LICENSE
 
 %changelog

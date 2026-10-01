@@ -259,11 +259,19 @@ pub fn is_root() -> bool {
 ///
 /// 只返回实际存在的目录；usr-merge 系统（`/lib → /usr/lib`）下二者规范化路径相同，
 /// 只保留先出现的 `/lib/modules`，避免重复扫描同一棵树。
+///
+/// 语义等价于 [`module_roots_at`]`(Path::new("/"))`（W4/C-20 起为薄包装）。
 pub fn module_roots() -> Vec<PathBuf> {
-    module_roots_from(&[
-        PathBuf::from("/lib/modules"),
-        PathBuf::from("/usr/lib/modules"),
-    ])
+    module_roots_at(Path::new("/"))
+}
+
+/// Module roots of an (offline) target root — `<root>/lib/modules` +
+/// `<root>/usr/lib/modules`, deduplicated by canonical path.
+///
+/// `--root` 离线模式的目标根模块目录（W4/C-20）：读 **目标根** 而非宿主；
+/// `root = "/"` 时与 [`module_roots`] 完全一致。缺失项静默丢弃。
+pub fn module_roots_at(root: &Path) -> Vec<PathBuf> {
+    module_roots_from(&[root.join("lib/modules"), root.join("usr/lib/modules")])
 }
 
 /// [`module_roots`] 的可测试实现：过滤不存在项并按规范化路径去重。
@@ -596,14 +604,27 @@ impl Immutability {
 
 /// 探测目标系统是否不可变：先看 OSTree/Nix 标志文件，再看 `/usr` 挂载选项。
 /// Detect immutability: OSTree/Nix markers first, then the `/usr` mount options.
+///
+/// 语义等价于 [`immutability_at`]`(Path::new("/"))`（W4/C-20 起为薄包装）。
 pub fn immutability() -> Immutability {
-    if Path::new("/run/ostree-booted").exists() {
+    immutability_at(Path::new("/"))
+}
+
+/// Detect immutability of an (offline) target root (W4/C-20).
+///
+/// `--root` 离线模式只读 **目标根** 下的标志文件：`<root>/run/ostree-booted`、
+/// `<root>/run/current-system`；`/usr` 挂载选项只对真实根 `/` 有意义，故
+/// `root != "/"` 时不做只读挂载判定（离线目录通常只是普通挂载点）。
+/// `root = "/"` 时与 [`immutability`] 完全一致。
+pub fn immutability_at(root: &Path) -> Immutability {
+    if root.join("run/ostree-booted").exists() {
         return Immutability::Ostree;
     }
-    if Path::new("/run/current-system").exists() {
+    if root.join("run/current-system").exists() {
         return Immutability::Nix;
     }
-    if usr_is_read_only() {
+    // 只读 `/usr` 的挂载语义只对真实根成立（离线目录自身的挂载选项无意义）。
+    if root == Path::new("/") && usr_is_read_only() {
         return Immutability::ReadOnlyUsr;
     }
     Immutability::Mutable
@@ -659,15 +680,37 @@ impl SecureBootState {
 
 /// 探测 Secure Boot 与签名强制状态；任何一步失败都退化为"未开启/未强制"。
 /// Probe Secure Boot and signature enforcement; failures degrade to "off".
+///
+/// 语义等价于 [`secure_boot_state_at`]`(Path::new("/"))`（W4/C-20 起为薄包装）。
 pub fn secure_boot_state() -> SecureBootState {
+    secure_boot_state_at(Path::new("/"))
+}
+
+/// Probe Secure Boot / signature enforcement of an (offline) target root (W4/C-20).
+///
+/// `--root` 离线模式**不读宿主**的 Secure Boot：改为读 `<root>/sys/firmware/efi/efivars`
+/// 下的 `SecureBoot-*` 变量；读不到则保守返回"关闭"（调用方应优先采用 manifest 中
+/// 备份机记录的 `secure_boot`）。`root = "/"` 时与 [`secure_boot_state`] 完全一致。
+pub fn secure_boot_state_at(root: &Path) -> SecureBootState {
     SecureBootState {
-        enabled: secure_boot_enabled(),
-        sig_enforce: module_sig_enforced(),
+        enabled: secure_boot_enabled_at(root),
+        sig_enforce: module_sig_enforced_at(root),
     }
 }
 
 /// 通过 `mokutil --sb-state` 判断 Secure Boot；无 EFI 变量时直接判定为关闭。
-/// Query Secure Boot through `mokutil --sb-state`; without EFI variables it is off.
+///
+/// `root = "/"` 保持既有宿主行为不变；`--root` 离线时改读目标根下的 efivars
+/// （不运行宿主 `mokutil`，否则会误报宿主的 Secure Boot 状态）。
+fn secure_boot_enabled_at(root: &Path) -> bool {
+    if root == Path::new("/") {
+        return secure_boot_enabled();
+    }
+    read_efivar_secure_boot(root).unwrap_or(false)
+}
+
+/// Host Secure Boot probe (unchanged pre-W4 behaviour).
+/// 宿主 Secure Boot 探测（W4 前的既有行为，保持不变）。
 fn secure_boot_enabled() -> bool {
     if !Path::new("/sys/firmware/efi").exists() {
         return false;
@@ -682,9 +725,51 @@ fn secure_boot_enabled() -> bool {
     text.contains("secureboot enabled") || text.contains("secure boot enabled")
 }
 
+/// Read `SecureBoot-*` from `<root>/sys/firmware/efi/efivars` (last byte != 0 = on).
+///
+/// 直接读 efivars（无需 root，见 ITERATION §3.1-6）：变量值前 4 字节是属性，
+/// 其后 1 字节为 `1`（开启）/ `0`（关闭）。变量缺失或读取失败返回 `None`。
+fn read_efivar_secure_boot(root: &Path) -> Option<bool> {
+    let dir = root.join("sys/firmware/efi/efivars");
+    let entries = fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("SecureBoot-") {
+            continue;
+        }
+        let bytes = fs::read(entry.path()).ok()?;
+        let value = bytes.get(4).copied()?; // 跳过 4 字节属性
+        return Some(value != 0);
+    }
+    None
+}
+
 /// 判断内核是否强制要求模块签名：先看 `/sys/module/module/parameters/sig_enforce`，
 /// 再看 `/proc/cmdline` 的 `module.sig_enforce=1`。
-/// Whether module signing is enforced: sysfs parameter first, then the kernel cmdline.
+///
+/// `root = "/"` 保持既有宿主行为不变；`--root` 离线时只读目标根下同名路径
+/// （通常不存在 → 保守返回 false，由 manifest 记录兜底）。
+fn module_sig_enforced_at(root: &Path) -> bool {
+    if root == Path::new("/") {
+        return module_sig_enforced();
+    }
+    if let Ok(value) = fs::read_to_string(root.join("sys/module/module/parameters/sig_enforce"))
+    {
+        if value.trim() == "Y" || value.trim() == "1" {
+            return true;
+        }
+    }
+    fs::read_to_string(root.join("proc/cmdline"))
+        .map(|c| {
+            c.split_whitespace()
+                .any(|a| a == "module.sig_enforce=1" || a == "module.sig_enforce")
+        })
+        .unwrap_or(false)
+}
+
+/// Host signature-enforcement probe (unchanged pre-W4 behaviour).
+/// 宿主签名强制探测（W4 前的既有行为，保持不变）。
 fn module_sig_enforced() -> bool {
     if let Ok(value) = fs::read_to_string("/sys/module/module/parameters/sig_enforce") {
         if value.trim() == "Y" || value.trim() == "1" {
@@ -771,11 +856,23 @@ pub fn sign_tool(kernel_release: &str) -> Option<(String, Vec<String>)> {
 
 /// 取目标内核的参考 `vermagic`（借用该内核任一 in-tree 模块的元数据）。
 /// Reference `vermagic` for the target kernel, borrowed from any in-tree module.
+///
+/// 语义等价于 [`reference_vermagic_at`]`(Path::new("/"), kernel_release)`（W4/C-20）。
 pub fn reference_vermagic(kernel_release: &str) -> Option<String> {
-    for root in module_roots() {
-        let kernel_dir = root.join(kernel_release).join("kernel");
+    reference_vermagic_at(Path::new("/"), kernel_release)
+}
+
+/// Reference `vermagic` for a kernel of an (offline) target root (W4/C-20).
+///
+/// `--root` 离线模式只借用 **目标根** 内 `<root>/lib/modules/<kver>/kernel/**`（或
+/// `usr/lib/modules`）的 in-tree 模块元数据；`root = "/"` 时与 [`reference_vermagic`]
+/// 完全一致。找不到任何模块返回 `None`。
+pub fn reference_vermagic_at(root: &Path, kernel_release: &str) -> Option<String> {
+    for mroot in module_roots_at(root) {
+        let kernel_dir = mroot.join(kernel_release).join("kernel");
         if let Some(module) = first_file_with_prefix(&kernel_dir) {
-            return module_vermagic(&module);        }
+            return module_vermagic(&module);
+        }
     }
     None
 }
@@ -1167,5 +1264,80 @@ HOME_URL=\"https://www.ubuntu.com/\"
         reset_has_cmd_cache();
         assert_eq!(first, has_cmd("sh"), "缓存清空不改变 PATH 查询结果");
         assert!(!has_cmd("ldb-no-such-binary-xyzzy"), "不存在的命令应为 false");
+    }
+
+    // ---- W4/C-20：目标根感知探测 API ----
+
+    /// W4/C-20：`module_roots_at` 只读 `<root>` 下的模块目录（含 usr-merge 去重）。
+    #[test]
+    fn module_roots_at_reads_target_root_w4() {
+        let base = temp_dir("roots-at");
+        fs::create_dir_all(base.join("usr/lib/modules")).unwrap();
+        // usr-merge：root/lib -> root/usr/lib，两者规范化后等价 → 只保留首个
+        std::os::unix::fs::symlink("usr/lib", base.join("lib")).unwrap();
+        let roots = module_roots_at(&base);
+        assert_eq!(roots.len(), 1, "符号链接等价项应去重：{roots:?}");
+        assert!(roots[0].starts_with(&base), "必须落在目标根下：{roots:?}");
+
+        // root="/" 时与既有 module_roots 一致
+        assert_eq!(module_roots_at(Path::new("/")), module_roots());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// W4/C-20：`reference_vermagic_at` 只借用目标根下册内核目录（缺失返回 None）。
+    #[test]
+    fn reference_vermagic_at_reads_target_root_w4() {
+        let base = temp_dir("vermagic-at");
+        // 目标根下没有内核模块 → None（且绝不回退宿主）
+        assert_eq!(reference_vermagic_at(&base, "0.0.0-nonexistent"), None);
+        // root="/" 时与既有行为一致（同入参结果相同）
+        assert_eq!(
+            reference_vermagic_at(Path::new("/"), "0.0.0-nonexistent"),
+            reference_vermagic("0.0.0-nonexistent")
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// W4/C-20：`immutability_at` 读目标根下的 OSTree/Nix 标志文件。
+    #[test]
+    fn immutability_at_reads_target_root_w4() {
+        let base = temp_dir("immut-at");
+        assert_eq!(immutability_at(&base), Immutability::Mutable);
+        fs::create_dir_all(base.join("run")).unwrap();
+        fs::write(base.join("run/ostree-booted"), b"").unwrap();
+        assert_eq!(immutability_at(&base), Immutability::Ostree);
+        fs::remove_file(base.join("run/ostree-booted")).unwrap();
+        fs::write(base.join("run/current-system"), b"").unwrap();
+        assert_eq!(immutability_at(&base), Immutability::Nix);
+        // root="/" 与既有薄包装一致（本机可变）
+        assert_eq!(immutability_at(Path::new("/")), immutability());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// W4/C-20：`secure_boot_state_at` 离线时只读目标根的 efivars，不跑宿主 mokutil。
+    #[test]
+    fn secure_boot_state_at_reads_target_root_w4() {
+        let base = temp_dir("sb-at");
+        // 无 efivars → 关闭
+        assert!(!secure_boot_state_at(&base).enabled);
+        let efivars = base.join("sys/firmware/efi/efivars");
+        fs::create_dir_all(&efivars).unwrap();
+        // 属性 4 字节 + 值 1 字节（1 = 开启）
+        fs::write(efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"), [
+            0u8, 0, 0, 0, 1,
+        ])
+        .unwrap();
+        assert!(secure_boot_state_at(&base).enabled, "efivars 值为 1 → 开启");
+        fs::write(efivars.join("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"), [
+            0u8, 0, 0, 0, 0,
+        ])
+        .unwrap();
+        assert!(!secure_boot_state_at(&base).enabled, "efivars 值为 0 → 关闭");
+        // root="/" 与既有薄包装一致
+        let a = secure_boot_state_at(Path::new("/"));
+        let b = secure_boot_state();
+        assert_eq!(a.enabled, b.enabled);
+        assert_eq!(a.sig_enforce, b.sig_enforce);
+        let _ = fs::remove_dir_all(&base);
     }
 }

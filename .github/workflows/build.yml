@@ -3,16 +3,23 @@
 # Linux driver backup & restore tool — CI pipeline
 #
 # 结构 / Layout:
-#   1) test    —— 轻量单元测试（cargo test --no-fail-fast），失败则整体失败
-#   2) build   —— 矩阵编译 release 产物（x86_64 / aarch64）+ sha256 清单 + 上传
-#   3) package —— 复用 x86_64 二进制，产出 deb / tar.gz / rpm / AppImage（DESIGN.md §11）
-#   4) release —— 仅在推送到 v* 标签时，汇总全部产物（含 package）并创建 GitHub Release
+#   1) test    —— 单元测试（cargo test --locked --no-fail-fast）
+#   2) lint    —— 门禁：fmt --check / clippy -D warnings / shellcheck / desktop-file-validate（W9-C54）
+#   3) audit   —— cargo audit 依赖漏洞扫描（W9-C54）
+#   4) msrv    —— MSRV 1.83 编译（W9-C54）
+#   5) build   —— 矩阵编译（x86_64 / aarch64）+ sha256 清单 + aarch64 qemu 运行冒烟
+#   6) package —— 复用二进制产出 deb / tar.gz / rpm（fedora+suse 双目标）/ AppImage 并做安装冒烟
+#   7) aur     —— 打 tag 时渲染 AUR PKGBUILD + .SRCINFO（W8-C52）
+#   8) release —— 仅在 v* 标签时，先断言 tag==Cargo.toml 版本，再汇总产物并创建 Release
 #
-# 环境事实（来自 DESIGN.md §2 / §7，勿臆造）：
+# 供应链 / Supply chain（W9-C09）：
+#   全部第三方 action 一律 pin 到 commit SHA，禁止可变 tag。
+#   appimagetool 固定版本并校验 SHA-256（W9-C08）。
+#
+# 环境事实（DESIGN.md §2 / §7，勿臆造）：
 #   - Slint 使用 default-features = false + backend-winit-x11 / backend-winit-wayland
-#     + renderer-winit-software（软件渲染），因此编译期需要 pkg-config 以及
-#     X11 / Wayland / xkbcommon 的开发头文件；
-#   - 运行期 winit 会 dlopen libxkbcommon.so.0 与 libwayland-client（见 §9 风险表）；
+#     + renderer-winit-software（软件渲染），编译期需要 pkg-config 与 X11/Wayland/
+#     xkbcommon 开发头文件，并硬链接 fontconfig/freetype；
 #   - [profile.release] 已设 strip = true（DESIGN.md §2.1），产物为单个可执行文件。
 # ============================================================
 
@@ -42,46 +49,152 @@ env:
 jobs:
   # ----------------------------------------------------------
   # 1) 单元测试 / unit tests
-  #    独立 runner、体量轻；任何失败都会使整个 workflow 失败（后续作业被跳过）
   # ----------------------------------------------------------
   test:
     name: test
     runs-on: ubuntu-22.04
     steps:
       - name: 检出源码 / Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
 
       - name: 安装 Rust 稳定版 / Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (pinned)
+        with:
+          toolchain: stable
 
       - name: 安装编译期系统依赖 / Install build-time system deps
-        # Slint（winit 后端 + 软件渲染）在编译期需要 pkg-config 与各窗口系统头文件
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libxkbcommon-dev \
             libwayland-dev \
-            libx11-dev
+            libx11-dev \
+            libfontconfig1-dev \
+            libfreetype-dev
 
       - name: 缓存 cargo / Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
         with:
           key: test
 
       - name: 运行测试 / Run tests
-        # --no-fail-fast：尽量跑完全部测试再报告，便于一次看全问题
-        run: cargo test --no-fail-fast
+        # --locked：严格按 Cargo.lock 构建/测试；--no-fail-fast：尽量跑完全部测试再报告
+        run: cargo test --locked --no-fail-fast
 
   # ----------------------------------------------------------
-  # 2) 矩阵编译 / matrix build
-  #    - x86_64：本机编译，runner 固定 ubuntu-22.04（glibc 2.35），
-  #      保证产物能在较旧的 glibc 发行版上运行（兼容面更广）
-  #    - aarch64：交叉编译，工具链选择见下方「交叉方案选型理由」
+  # 2) lint 门禁 / lint gates（W9-C54）
+  #    README:389 已承诺 clippy 零告警，此处正式纳入 CI。
+  # ----------------------------------------------------------
+  lint:
+    name: lint (fmt / clippy / shellcheck / desktop)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
+
+      - name: 安装 Rust + rustfmt/clippy / Install Rust with components
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (pinned)
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: 安装 lint 依赖 / Install lint tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            shellcheck \
+            desktop-file-utils
+
+      - name: 缓存 cargo / Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
+        with:
+          key: lint
+
+      - name: 格式检查 / cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（零告警）/ clippy -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: ShellCheck 打包脚本 / shellcheck packaging scripts
+        run: |
+          shellcheck -x \
+            packaging/install.sh \
+            packaging/build-packages.sh \
+            packaging/build-appimage.sh \
+            packaging/lib/common.sh \
+            packaging/appimage/AppDir/AppRun
+
+      - name: 校验 desktop 文件 / desktop-file-validate
+        run: desktop-file-validate packaging/linux-driver-backup.desktop
+
+  # ----------------------------------------------------------
+  # 3) 依赖漏洞扫描 / dependency audit（W9-C54）
+  # ----------------------------------------------------------
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      checks: write   # rustsec/audit-check 需要创建 check run
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
+
+      - name: 审计 Cargo.lock / audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2 (pinned)
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------
+  # 4) MSRV 编译 / MSRV build（W9-C54，Cargo.toml rust-version = 1.83）
+  # ----------------------------------------------------------
+  msrv:
+    name: MSRV 1.83
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
+
+      - name: 安装 Rust 1.83 / Install Rust 1.83
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (pinned)
+        with:
+          toolchain: 1.83.0
+
+      - name: 安装编译期系统依赖 / Install build-time system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libfontconfig1-dev \
+            libfreetype-dev
+
+      - name: 缓存 cargo / Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
+        with:
+          key: msrv
+
+      - name: MSRV 检查编译 / cargo check --locked
+        run: cargo check --locked
+
+  # ----------------------------------------------------------
+  # 5) 矩阵编译 / matrix build
+  #    - x86_64：本机编译，runner 固定 ubuntu-22.04（glibc 2.35）
+  #    - aarch64：交叉编译（taiki-e 交叉工具链），并在 qemu 下做运行冒烟（W9-C57）
   # ----------------------------------------------------------
   build:
     name: build (${{ matrix.target }})
-    needs: test
+    needs: [test, lint, audit, msrv]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -95,58 +208,34 @@ jobs:
             cross: true
     steps:
       - name: 检出源码 / Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
 
       - name: 安装 Rust 稳定版与目标 / Install Rust stable + target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (pinned)
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: 安装编译期系统依赖 / Install build-time system deps
-        # pkg-config + X11/Wayland/xkbcommon 头文件：winit 后端编译所必需
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libxkbcommon-dev \
             libwayland-dev \
-            libx11-dev
+            libx11-dev \
+            libfontconfig1-dev \
+            libfreetype-dev
 
-      # --------------------------------------------------------
-      # 交叉方案选型理由 / Why this cross-compilation approach
-      #
-      # 可选方案有二：
-      #   A. taiki-e/setup-cross-toolchain-action（或 docker + `cargo install cross`
-      #      后用 `cross build --release --target ...`）
-      #   B. apt 安装 gcc-aarch64-linux-gnu + 手动设置
-      #      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
-      #
-      # 本项目选 A（taiki-e/setup-cross-toolchain-action@v1），原因：
-      #   1) DESIGN.md §7 明确将 aarch64 标注为「cross」方案，本 action 即该方案的
-      #      最小实现：一条步骤装好 gcc-aarch64-linux-gnu 等交叉工具链，并自动设置
-      #      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER，无需在 YAML 里手写环境变量；
-      #   2) 相比 docker + `cargo install cross`：省去每次冷启动编译 cross（约数分钟）
-      #      或拉取 cross 容器镜像的开销，也无需给 runner 额外的 docker 权限；
-      #   3) 相比纯 apt 方案：不依赖维护者记住 linker 环境变量的正确拼写，
-      #      换 target 时只需改 matrix.target。
-      #
-      # 说明：aarch64 同样在宿主（x86_64）安装上述 -dev 包，用于提供头文件与
-      # .pc 元数据；本项目 Slint 关闭默认特性且走运行时 dlopen，交叉构建无需在
-      # 目标 sysroot 内链接 X11/Wayland 动态库。若将来引入必须 pkg-config 链接的
-      # -sys crate，再切换为 cross 容器方案（届时可直接沿用 matrix 结构）。
-      # --------------------------------------------------------
       - name: 配置 aarch64 交叉工具链 / Set up aarch64 cross toolchain
         if: matrix.cross
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1 (pinned)
         with:
           target: aarch64-unknown-linux-gnu
 
       - name: 安装 aarch64 系统库（fontconfig/freetype）/ Install arm64 sysroot libs
-        # Slint 的软件渲染会**硬链接** libfontconfig 与 libfreetype（本机 ldd 实测，
-        # DESIGN.md §11.4）。交叉到 aarch64 时链接器需要目标架构的开发包，否则报：
-        #   ld: cannot find -lfontconfig / -lfreetype
-        # 这里用 Debian 多架构（multiarch）在同一 runner 上装 arm64 的开发库。
-        # winit 用的 X11/Wayland 是运行期 dlopen，不参与链接，因此无需 arm64 版本。
+        # Slint 的软件渲染会**硬链接** libfontconfig 与 libfreetype（DESIGN.md §11.4）。
+        # 用 Debian 多架构在同一 runner 上装 arm64 开发库，并提供 arm64 运行库供 qemu 冒烟。
         if: matrix.cross
         run: |
           set -euo pipefail
@@ -165,21 +254,15 @@ jobs:
             libfontconfig1-dev:arm64 \
             libfreetype-dev:arm64 \
             libexpat1-dev:arm64
-          # 自检：确认目标架构的 .pc 与静态库确实到位
           ls -l /usr/lib/aarch64-linux-gnu/libfontconfig* /usr/lib/aarch64-linux-gnu/libfreetype*
           ls -l /usr/lib/aarch64-linux-gnu/pkgconfig/fontconfig.pc
 
       - name: 缓存 cargo / Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned)
         with:
-          # 按 target 区分缓存键，避免 x86_64/aarch64 互相污染
           key: ${{ matrix.target }}
 
       - name: 编译 release / Build release
-        # 统一使用 --target：产物路径固定为 target/<target>/release/…，
-        # 两个矩阵项的后续步骤（strip、校验、上传）因此可以完全一致。
-        # 交叉时需要把 pkg-config 指向 arm64 的 .pc，否则 fontconfig-sys 会拿到
-        # 宿主 x86_64 的链接参数（PKG_CONFIG_ALLOW_CROSS 允许交叉查询）。
         run: |
           set -euo pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
@@ -188,12 +271,9 @@ jobs:
             export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
             export PKG_CONFIG_SYSROOT_DIR=/
           fi
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: strip 二进制 / Strip the binary
-        # Cargo.toml 的 [profile.release] 已设 strip = true（DESIGN.md §2.1），
-        # 此步骤是幂等的「兜底」：对已 strip 的文件再次执行为 no-op；
-        # 若交叉工具链未提供对应 strip，也不阻断产物交付。
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/linux-driver-backup"
@@ -203,8 +283,18 @@ jobs:
             *)                     echo "unknown target: ${{ matrix.target }}"; exit 1 ;;
           esac
 
+      - name: aarch64 运行冒烟 / run arm64 binary under qemu (W9-C57)
+        if: matrix.cross
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          bin="target/${{ matrix.target }}/release/linux-driver-backup"
+          # 多架构 libc 的 loader 位于 /lib，交叉 sysroot 位于 /usr/aarch64-linux-gnu；
+          # 两种前缀各试一次，任一成功即视为通过。
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$bin" --version \
+            || qemu-aarch64-static "$bin" --version
+
       - name: 打包产物并生成 SHA-256 清单 / Stage artifacts + checksums
-        # 产物与清单的文件名都包含 target，避免多架构上传时互相覆盖
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -213,27 +303,21 @@ jobs:
           test -f "$src"
           cp "$src" "dist/$name"
           chmod +x "dist/$name"
-          # sha256sum 清单内记录的是 dist 内的相对文件名，便于 release 后校验：
-          #   sha256sum -c linux-driver-backup-<target>.sha256
           (cd dist && sha256sum "$name" > "$name.sha256")
           echo "=== SHA-256 清单 / checksum manifest ==="
           cat "dist/$name.sha256"
 
       - name: 上传构建产物 / Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (pinned)
         with:
           name: linux-driver-backup-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
   # ----------------------------------------------------------
-  # 3) 打包 / package
-  #    依赖 build 作业的 x86_64 二进制，产出「下载即装」的四种格式（DESIGN.md §11）：
-  #      .deb  —— Debian / Ubuntu / Mint / Kali …（dpkg-deb，runner 自带）
-  #      .tar.gz + install.sh —— 通用兜底（任意发行版）
-  #      .rpm  —— Fedora / RHEL / Rocky / openEuler（需 apt 安装 rpm 提供 rpmbuild）
-  #      AppImage —— 任意发行版免安装（需网络下载 appimagetool，失败不阻断）
-  #    本机（开发机）没有 rpmbuild/appimagetool 时由本 job 统一补齐（§11.4）。
+  # 6) 打包 / package
+  #    复用 x86_64/aarch64 二进制，产出四种格式（DESIGN.md §11）：
+  #      .deb / .tar.gz + install.sh / .rpm（fedora+suse 双目标，W8-C53）/ AppImage
   # ----------------------------------------------------------
   package:
     name: package
@@ -243,28 +327,22 @@ jobs:
       contents: read
     steps:
       - name: 检出源码 / Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
 
       - name: 下载两个架构的二进制产物 / Download both arch artifacts
-        # 同时打包 amd64 与 arm64：dpkg-deb 与 rpmbuild 都只做「元数据 + 文件」组装，
-        # 不校验机器码，因此可在 x86_64 runner 上直接为 aarch64 二进制出包
-        # （DESIGN.md §11.1）。AppImage 仅 x86_64（见下一步）。
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 (pinned)
         with:
           pattern: linux-driver-backup-*-unknown-linux-gnu
           merge-multiple: true
           path: artifacts
 
-      - name: 安装 rpmbuild / Install rpm tooling
-        # `rpm` 包同时提供 rpmbuild 与 rpm 查询工具
+      - name: 安装打包工具 / Install packaging tooling
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends rpm
 
       - name: 还原二进制 / Unpack binaries
-        # packaging/build-packages.sh 通过 --bin 指定要打包的二进制，
-        # 这里把两个架构的 artifact 分别还原并做 ELF 冒烟
         run: |
           set -euo pipefail
           mkdir -p target/release
@@ -275,99 +353,166 @@ jobs:
           if command -v file >/dev/null 2>&1; then
             file target/release/linux-driver-backup-x86_64 target/release/linux-driver-backup-aarch64
           fi
-          # 冒烟：x86_64 可直接在 runner 上跑；aarch64 用 qemu-user 可选执行
-          timeout 15 ./target/release/linux-driver-backup-x86_64 --version \
-            || echo "::warning::--version 冒烟未通过（不阻断打包）"
 
       - name: 构建 amd64 包（deb/tar/rpm）/ Build amd64 packages
         run: |
           set -euo pipefail
-          bash packaging/build-packages.sh deb tar rpm \
-            --arch amd64 --bin target/release/linux-driver-backup-x86_64
+          bash packaging/build-packages.sh deb tar --arch amd64 \
+            --bin target/release/linux-driver-backup-x86_64
+          bash packaging/build-packages.sh rpm --arch amd64 --rpm-target both \
+            --bin target/release/linux-driver-backup-x86_64
 
-      - name: 构建 arm64 包（deb/tar/rpm）+ rpm 交叉 / Build arm64 packages
-        # rpm 的 aarch64 目标在 x86_64 上由 rpmbuild --target aarch64 直接产出
+      - name: 构建 arm64 包（deb/tar/rpm）/ Build arm64 packages
         run: |
           set -euo pipefail
-          bash packaging/build-packages.sh deb tar rpm \
-            --arch arm64 --bin target/release/linux-driver-backup-aarch64
+          bash packaging/build-packages.sh deb tar --arch arm64 \
+            --bin target/release/linux-driver-backup-aarch64
+          bash packaging/build-packages.sh rpm --arch arm64 --rpm-target both \
+            --bin target/release/linux-driver-backup-aarch64
 
       - name: 构建 AppImage / Build AppImage
-        # 单独一步 + continue-on-error：需联网下载 appimagetool，失败时
-        # build-appimage.sh 打印中文 warning 并 exit 0（DESIGN.md §11.4 降级策略）
-        continue-on-error: true
+        # appimagetool 固定版本并校验 SHA-256（W9-C08）；脚本内下载失败按 DESIGN
+        # §11.4 降级（exit 0），不再叠加 continue-on-error。
         run: |
           set -euo pipefail
-          cp target/release/linux-driver-backup-x86_64 target/release/linux-driver-backup
-          bash packaging/build-appimage.sh
+          bash packaging/build-appimage.sh \
+            --bin target/release/linux-driver-backup-x86_64 --arch amd64
 
       - name: 检查打包产物 / Verify package outputs
         run: |
           set -euo pipefail
           echo "=== 打包产物 / package outputs ==="
           ls -l dist
-          # deb 与 tar 必须同时覆盖 amd64 + arm64（下面每条 ls 找不到文件即失败）
           ls dist/*_amd64.deb
           ls dist/*_arm64.deb
           ls dist/*linux-x86_64.tar.gz
           ls dist/*linux-aarch64.tar.gz
-          # 每个产物都应有同名 .sha256，供 release 阶段 sha256sum -c 复验
           for f in dist/*.deb dist/*.tar.gz dist/*.rpm dist/*.AppImage; do
             [ -e "$f" ] || continue
             test -f "$f.sha256"
           done
-          # 报告 rpm 是否产出（rpmbuild 若失败，前面步骤已失败；这里只做清单展示）
           ls dist/*.rpm 2>/dev/null || echo "::warning::未产出 rpm（检查 rpmbuild 步骤日志）"
 
           # --- RPM 依赖回归断言 / RPM dependency regression guard ---
-          # 历史故障：spec 把 `wayland` 当包名写死 → Fedora 上 rpm -ivh 报
-          #   「wayland 被 linux-driver-backup 需要」而拒绝安装（Fedora 无此包，
-          #   提供 libwayland-client.so.0 的包名是 libwayland-client）。
-          # 这里断言最终 Requires 里不出现裸 `wayland`，且硬链接依赖已由 rpmbuild
-          # 自动生成为 soname（libfontconfig.so.1 / libfreetype.so.6）。
+          # 断言 Requires 里不出现裸 `wayland`，且硬链接依赖已由 rpmbuild
+          # 自动生成为 soname（libfontconfig.so.1）；fedora 目标应含 libwayland-client。
           for f in dist/*.rpm; do
             [ -e "$f" ] || continue
             echo "--- $(basename "$f") 的 Requires / requires ---"
             reqs="$(rpm -qpR "$f")"
             printf '%s\n' "$reqs"
             if printf '%s\n' "$reqs" | awk '{print $1}' | grep -qx 'wayland'; then
-              echo "::error::$(basename "$f") 的 Requires 含非法包名 wayland（Fedora 不存在该包，应为 libwayland-client）"
+              echo "::error::$(basename "$f") 的 Requires 含非法包名 wayland（应为 libwayland-client）"
               exit 1
             fi
             if ! printf '%s\n' "$reqs" | grep -q 'libfontconfig\.so\.1'; then
-              echo "::error::$(basename "$f") 缺少自动生成的 libfontconfig.so.1 依赖（检查 AutoReqProv / rpmdeps）"
+              echo "::error::$(basename "$f") 缺少自动生成的 libfontconfig.so.1 依赖"
               exit 1
             fi
           done
 
+      - name: 安装冒烟 / install smoke tests (W9-C57)
+        run: |
+          set -euo pipefail
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          # 预装 deb 运行依赖，避免 dpkg 因缺少 Recommends/Depends 报错
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1 libfreetype6 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0
+
+          echo "--- deb 安装冒烟 / dpkg -i ---"
+          sudo dpkg -i "dist/linux-driver-backup_${ver}_amd64.deb"
+          /usr/bin/linux-driver-backup --version
+          /usr/bin/linux-driver-backup --scan --mode minimal --json >/dev/null \
+            || echo "::warning::--scan 冒烟返回非零（不阻断，仅提示）"
+          sudo dpkg -r linux-driver-backup
+
+          echo "--- rpm 安装冒烟 / rpm -ivh（fedora 目标） ---"
+          sudo rpm -ivh --nodeps --noscripts "dist/linux-driver-backup-${ver}-1.fedora.x86_64.rpm"
+          /usr/bin/linux-driver-backup --version
+          sudo rpm -e --nodeps linux-driver-backup
+
+          echo "--- tar + install.sh 冒烟 ---"
+          tmp="$(mktemp -d)"
+          tar -xzf "dist/linux-driver-backup-${ver}-linux-x86_64.tar.gz" -C "$tmp"
+          "$tmp/linux-driver-backup-${ver}-linux-x86_64/install.sh" \
+            --prefix="$tmp/prefix" --no-polkit
+          "$tmp/prefix/bin/linux-driver-backup" --version
+          rm -rf "$tmp"
+
       - name: 上传打包产物 / Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (pinned)
         with:
-          # 命名必须落在 linux-driver-backup-* 之下，release 作业按该 pattern 下载
           name: linux-driver-backup-packages
           path: dist/*
           if-no-files-found: error
 
   # ----------------------------------------------------------
-  # 4) 发布 / release
-  #    仅在推送 v* 标签（refs/tags/）时运行；下载全部矩阵产物 **与打包产物**，
-  #    逐份 sha256sum -c 复验后，用 softprops/action-gh-release@v2 创建 Release
+  # 7) AUR 元数据 / AUR metadata（W8-C52）
+  #    仅在打 tag 时运行（tag 归档已可下载，才能算真实 sha256）。
+  # ----------------------------------------------------------
+  aur:
+    name: aur (PKGBUILD + .SRCINFO)
+    needs: [test, lint]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
+
+      - name: 渲染 PKGBUILD 并生成 .SRCINFO / render + generate
+        run: |
+          set -euo pipefail
+          bash packaging/build-packages.sh arch
+          test -f dist/aur/PKGBUILD
+          test -f dist/aur/.SRCINFO
+          echo "=== .SRCINFO ==="
+          cat dist/aur/.SRCINFO
+          if grep -q 'SKIP' dist/aur/.SRCINFO; then
+            echo "::error::.SRCINFO 的 sha256sums 仍为 SKIP，AUR 不接受"
+            exit 1
+          fi
+
+      - name: 上传 AUR 产物 / Upload AUR files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (pinned)
+        with:
+          name: ldb-aur-package
+          path: |
+            dist/aur/PKGBUILD
+            dist/aur/.SRCINFO
+          if-no-files-found: error
+
+  # ----------------------------------------------------------
+  # 8) 发布 / release
+  #    仅在 v* 标签时运行；先断言 tag == Cargo.toml 版本（W9-C54），
+  #    再下载全部产物、逐份 sha256sum -c 复验后创建 Release。
   # ----------------------------------------------------------
   release:
     name: release
-    needs: [test, build, package]
+    needs: [test, lint, audit, msrv, build, package, aur]
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write   # 创建 Release / 上传资产需要写权限
     steps:
+      - name: 检出源码 / Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned)
+
+      - name: 断言 tag 与 Cargo.toml 版本一致 / tag == Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "tag=$tag version=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag 与 Cargo.toml version $ver 不一致，拒绝发布"
+            exit 1
+          fi
+
       - name: 下载全部产物 / Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 (pinned)
         with:
           path: dist
           merge-multiple: true   # 把矩阵产物与打包产物合并到同一目录
-          # pattern 同时命中 build 作业的 linux-driver-backup-<triple> 与
-          # package 作业的 linux-driver-backup-packages（deb/tar/rpm/AppImage）
           pattern: linux-driver-backup-*
 
       - name: 校对产物 / Verify checksums
@@ -376,8 +521,6 @@ jobs:
           echo "=== 待发布文件 / files to release ==="
           ls -l dist
 
-          # 1) 逐份复验 sha256 清单（覆盖 build 的二进制与 package 的 deb/tar/rpm/AppImage）
-          #    清单内记录的是 dist 内的相对文件名，因此在 dist 目录内执行 -c
           count=0
           for f in dist/*.sha256; do
             [ -e "$f" ] || continue
@@ -390,7 +533,6 @@ jobs:
             exit 1
           fi
 
-          # 2) 覆盖性检查：每个待发布文件都必须出现在某份清单里，防止漏校验
           for f in dist/*; do
             [ -e "$f" ] || continue
             case "$f" in *.sha256) continue ;; esac
@@ -403,10 +545,8 @@ jobs:
           echo "=== 全部校验通过 / all checksums OK ==="
 
       - name: 创建 GitHub Release / Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (pinned)
         with:
-          # 附带：两个架构的单文件二进制 + 各自 .sha256
-          #       + deb / tar.gz / rpm / AppImage（若产出）及其 .sha256
           files: |
             dist/*
           generate_release_notes: true

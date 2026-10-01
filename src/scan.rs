@@ -30,15 +30,34 @@
 //! - **固件内容标记**：Full 模式下若固件文件属于系统包（由 `owner` 判断），
 //!   标记 [`ScanEntry::content_stored`]`= false`（由包提供，不重复存内容）。
 //!
+//! ## v0.3.0 W3（扫描正确性/性能）
+//! v0.3.0 W3 scan fixes:
+//!
+//! - **C-24**：`rpm -qf` 改为批量（每 [`QUERY_CHUNK`] 路径一次 fork，30s 超时，
+//!   只取包名+版本，不再输出 `%{FILENAMES}`）；
+//! - **C-25**：先判 in-tree 再处理符号链接，`kernel/` 内的链接不再被当成外置模块；
+//! - **C-26**：静默跳过 `build`/`source` 头文件链接；[`push_warning`] 全局去重 +
+//!   [`MAX_WARNINGS`] 上限 + 溢出计数；
+//! - **C-27**：配置路径扩展覆盖 initramfs 控制文件/目录（[`CONFIG_PATHS`]）；
+//! - **C-28**：固件目录在真实目录间回退（usr-merge 下 `/lib/firmware` 是链接）；
+//!   [`ScanReport::firmware_bytes`] 只累计 `content_stored` 的固件；
+//! - **C-29**：`/usr/src` 匹配读取 `dkms.conf` 的 `PACKAGE_NAME`，并与 manifest
+//!   复用同一次 `/var/lib/dkms` 枚举；
+//! - **C-43**：`modinfo` 批量调用，第 5 阶段（元数据+归属）接入取消检查；
+//! - **C-37**：单文件不可读只记 warning，不中止扫描。
+//!
 //! 路径约定：[`ScanEntry::rel_path`] 是"去掉前导 `/` 的相对路径"
 //! （如 `lib/modules/6.8.0-45-generic/updates/dkms/foo.ko`），归档直接按它落盘（DESIGN.md §4.3）。
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use walkdir::WalkDir;
 
@@ -48,12 +67,28 @@ use crate::model::{
     ScanReport,
 };
 
-/// 所有模式都会扫描的配置目录 / Configuration dirs scanned in every mode.
-const CONFIG_DIRS: &[&str] = &[
-    "/etc/modprobe.d",
-    "/etc/udev/rules.d",
-    "/etc/depmod.d",
-    "/etc/modules-load.d",
+/// 所有模式都会扫描的配置路径（C-27：补齐控制还原期 initramfs 行为的文件/目录）。
+/// Configuration paths scanned in every mode (C-27). The `bool` says whether an
+/// absent path is worth a warning: the four core dirs are, the distro-specific
+/// extras are not (avoids warning spam on systems that do not have them).
+///
+/// `/etc/modules`、`/etc/dracut.conf`、`/etc/mkinitcpio.conf` 是**文件**，
+/// 其余是**目录**；[`scan`] 按路径实际类型分派（目录走 [`walk_files`]，文件走
+/// [`push_file`]，符号链接走 [`handle_symlink`]）。
+const CONFIG_PATHS: &[(&str, bool)] = &[
+    // 核心四目录：缺失时告警（旧行为）
+    ("/etc/modprobe.d", true),
+    ("/etc/udev/rules.d", true),
+    ("/etc/depmod.d", true),
+    ("/etc/modules-load.d", true),
+    // C-27 扩展：控制还原期 initramfs 行为的配置（缺失静默）
+    ("/etc/initramfs-tools", false),
+    ("/etc/dracut.conf", false),
+    ("/etc/dracut.conf.d", false),
+    ("/etc/mkinitcpio.conf", false),
+    ("/etc/mkinitcpio.d", false),
+    ("/etc/modules", false),
+    ("/etc/sysconfig/modules", false),
 ];
 
 /// DKMS 已注册模块库（`<pkg>/<ver>/`） / Registered DKMS modules.
@@ -62,20 +97,38 @@ const DKMS_ROOT: &str = "/var/lib/dkms";
 /// DKMS 源码目录（与 `/var/lib/dkms` 的 pkg 同名，或名字含 `-dkms`） / DKMS source trees.
 const USR_SRC: &str = "/usr/src";
 
-/// 固件目录，仅 Full 模式（usr-merge 下 `/lib → /usr/lib`，无需另扫 `/usr/lib/firmware`）。
-const FIRMWARE_DIR: &str = "/lib/firmware";
+/// 固件目录候选，仅 Full 模式（C-28：usr-merge 下 `/lib/firmware` 为符号链接，
+/// 需要回退到真实目录 `/usr/lib/firmware`）。
+/// Firmware directory candidates (C-28: `/lib/firmware` is a symlink on usr-merged systems).
+const FIRMWARE_DIRS: &[&str] = &["/lib/firmware", "/usr/lib/firmware"];
 
 /// 批处理外部命令（`dpkg-query` / `rpm`）时每次传入的最大路径/包数，防命令行超长。
 /// Max paths/packages per external query invocation, guarding against ARG_MAX.
 const QUERY_CHUNK: usize = 256;
 
+/// 依赖外部命令（`rpm` / `modinfo`）的默认超时：超时即放弃该批、降级为 `None`。
+/// Default timeout for external queries (C-24/C-43): on timeout the batch is dropped.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `modinfo` 失败原因最多写入的 warning 条数（去重后），避免刷屏。
 /// Maximum number of distinct `modinfo` failure warnings (after dedup).
 const MAX_MODINFO_WARNINGS: usize = 3;
 
-/// `rpm -qf` 的查询格式：`NAME<TAB>VERSION-RELEASE<TAB>FILENAMES`。
-/// The query format used for `rpm -qf`.
-const RPM_QF_FORMAT: &str = "%{NAME}\t%{VERSION}-%{RELEASE}\t%{FILENAMES}\n";
+/// `rpm -qf` 的批量查询格式：只取包名与版本，**不取 `%{FILENAMES}`**
+/// （C-24：后者对每个包输出全部文件列表，可达数 MB 且只用首行）。
+/// Batched `rpm -qf` query format: package name + version only, never `%{FILENAMES}`.
+///
+/// P-1 待容器复核：若 Fedora 上多路径 `-qf` 并非"每个路径一行"，解析会按键数
+/// 校验失败并自动回退到逐路径查询（见 [`collect_owners_rpm_with`]），不影响正确性。
+const RPM_BATCH_FORMAT: &str = "%{NAME}\t%{VERSION}-%{RELEASE}\n";
+
+/// `report.warnings` 的全局上限（C-26）：超过后只保留一条溢出计数。
+/// Global cap for `report.warnings` (C-26); beyond it only an overflow counter is kept.
+const MAX_WARNINGS: usize = 200;
+
+/// 溢出计数的前缀，用于在达到上限后原地累加被省略的条数。
+/// Prefix of the overflow counter warning, updated in place once the cap is hit.
+const WARNING_OVERFLOW_PREFIX: &str = "（更多告警已省略，共 ";
 
 /// Scan input: kernel version, distro, backup mode and an optional cancellation flag.
 ///
@@ -120,29 +173,35 @@ pub fn scan(opt: &ScanOptions<'_>) -> AppResult<ScanReport> {
         } else {
             opt.distro.id.as_str()
         };
-        report.warnings.push(format!(
-            "未识别的发行版家族（ID={id}），还原时将跳过 initramfs 更新"
-        ));
+        push_warning(
+            &mut report,
+            format!("未识别的发行版家族（ID={id}），还原时将跳过 initramfs 更新"),
+        );
     }
 
     // 1) out-of-tree 模块：/lib/modules/<kver> 与 /usr/lib/modules/<kver>
     let roots = module_roots();
     if roots.is_empty() {
-        report
-            .warnings
-            .push("未找到可读的模块目录（/lib/modules、/usr/lib/modules）".to_string());
+        push_warning(
+            &mut report,
+            "未找到可读的模块目录（/lib/modules、/usr/lib/modules）".to_string(),
+        );
     }
     for root in &roots {
         scan_module_root(&root.join(opt.kver), opt, &mut report)?;
     }
 
-    // 2) 配置文件：Minimal 起就包含
-    for dir in CONFIG_DIRS {
-        let path = Path::new(dir);
-        if path.is_dir() {
-            walk_files(path, EntryKind::Config, opt, &mut report)?;
-        } else {
-            report.warnings.push(format!("配置目录不存在或不可读: {dir}"));
+    // 2) 配置文件/目录：Minimal 起就包含（C-27：目录与单文件混合，按类型分派）
+    for (raw, warn_if_missing) in CONFIG_PATHS {
+        let path = Path::new(raw);
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => walk_files(path, EntryKind::Config, opt, &mut report)?,
+            Ok(meta) if meta.file_type().is_symlink() => handle_symlink(path, &mut report),
+            Ok(meta) if meta.is_file() => push_file(path, EntryKind::Config, &mut report),
+            _ if *warn_if_missing => {
+                push_warning(&mut report, format!("配置目录不存在或不可读: {raw}"));
+            }
+            _ => {}
         }
     }
 
@@ -158,22 +217,26 @@ pub fn scan(opt: &ScanOptions<'_>) -> AppResult<ScanReport> {
     // 因此额外把总字节累计到 `firmware_bytes` 供体积预估，UI 侧（main.rs）只把
     // module/dkms/config 摘要塞进列表，firmware 不进 UI 列表。
     if opt.mode == BackupMode::Full {
-        let fw = Path::new(FIRMWARE_DIR);
-        if fw.is_dir() {
-            walk_files(fw, EntryKind::Firmware, opt, &mut report)?;
-            tally_firmware(&mut report);
-        } else {
-            report
-                .warnings
-                .push(format!("固件目录不存在或不可读: {FIRMWARE_DIR}"));
+        match firmware_dir() {
+            Some(fw) => walk_files(Path::new(fw), EntryKind::Firmware, opt, &mut report)?,
+            None => push_warning(
+                &mut report,
+                format!(
+                    "固件目录不存在或不可读: {}",
+                    FIRMWARE_DIRS.join("、")
+                ),
+            ),
         }
     }
 
     // 5) v2 元数据：模块 modinfo（P0-2）、来源包 owner（P0-5）、固件内容标记、DKMS 清单。
-    collect_module_metadata(&mut report);
+    //    C-43：这一阶段（尤其 full 模式的上万条固件归属查询）同样必须可取消。
+    check_cancel(opt)?;
+    collect_module_metadata(opt, &mut report)?;
 
+    check_cancel(opt)?;
     let paths: Vec<PathBuf> = report.entries.iter().map(|e| e.abs_path.clone()).collect();
-    let owners = collect_owners(&paths);
+    let owners = collect_owners(&paths, opt.cancel)?;
     if !owners.is_empty() {
         for entry in report.entries.iter_mut() {
             if let Some(prov) = owners.get(&entry.abs_path) {
@@ -183,10 +246,9 @@ pub fn scan(opt: &ScanOptions<'_>) -> AppResult<ScanReport> {
     }
     // 由系统包提供的固件不再重复存内容（ROADMAP §4 的 `content_stored=false`）。
     mark_package_provided_firmware(&mut report.entries);
-
-    // DKMS 包清单：仅 Standard/Full（与 scan_dkms 的收录范围一致）。
-    if matches!(opt.mode, BackupMode::Standard | BackupMode::Full) {
-        report.dkms = dkms_packages_in(Path::new(DKMS_ROOT));
+    // C-28：体积只统计"真正存入内容"的固件（必须在标记之后累计）。
+    if opt.mode == BackupMode::Full {
+        tally_firmware(&mut report);
     }
 
     Ok(report)
@@ -224,8 +286,22 @@ fn scan_module_root(
             }
         };
         let file_type = entry.file_type();
-        // 符号链接：不跟随；链接名/目标形如模块才收录（如 weak-updates/foo.ko）。
+        // 相对 kver 目录的第一段即分类依据；C-25：**先判 in-tree，再处理符号链接**，
+        // 否则 `kernel/` 子树内的链接会被当成外置模块收录。
+        let rel = match entry.path().strip_prefix(kver_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let in_tree = rel.starts_with("kernel");
         if file_type.is_symlink() {
+            if in_tree {
+                // 内核基线子树内的链接：既不是外置模块，也不值得告警。
+                if is_module_file(&entry.file_name().to_string_lossy()) {
+                    report.skipped_in_tree += 1;
+                }
+                continue;
+            }
+            // 符号链接：不跟随；链接名/目标形如模块才收录（如 weak-updates/foo.ko）。
             handle_symlink(entry.path(), report);
             continue;
         }
@@ -236,12 +312,7 @@ fn scan_module_root(
         if !is_module_file(&name) {
             continue;
         }
-        // 相对 kver 目录的第一段即分类依据
-        let rel = match entry.path().strip_prefix(kver_dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if rel.starts_with("kernel") {
+        if in_tree {
             // 内核自带基线：不备份，只统计数量
             report.skipped_in_tree += 1;
             continue;
@@ -268,9 +339,7 @@ fn walk_files(
         let entry = match result {
             Ok(e) => e,
             Err(err) => {
-                report
-                    .warnings
-                    .push(format!("遍历 {} 时出错: {err}", root.display()));
+                push_warning(report, format!("遍历 {} 时出错: {err}", root.display()));
                 continue;
             }
         };
@@ -292,28 +361,32 @@ fn walk_files(
 /// 形如模块（[`crate::distro::is_module_path`]）或链接位于受管配置目录时，才按链接
 /// 语义收录（`size = 0`，保存 `readlink` 的原始字符串）。
 fn handle_symlink(abs: &Path, report: &mut ScanReport) {
+    // C-26：`/lib/modules/<kver>/build`、`source` 是内核头文件链接，**必然存在**，
+    // 既无备份价值也不应每次扫描都告警 —— 静默跳过。
+    if is_kernel_header_link(abs) {
+        return;
+    }
     // 目录符号链接：walkdir 默认不跟随，这里也明确跳过并记 warning。
     if abs.is_dir() {
-        report
-            .warnings
-            .push(format!("跳过目录符号链接（不跟随）: {}", abs.display()));
+        push_warning(report, format!("跳过目录符号链接（不跟随）: {}", abs.display()));
         return;
     }
     let target = match fs::read_link(abs) {
         Ok(t) => t,
         Err(err) => {
-            report
-                .warnings
-                .push(format!("无法读取符号链接 {}: {err}", abs.display()));
+            push_warning(report, format!("无法读取符号链接 {}: {err}", abs.display()));
             return;
         }
     };
     if !symlink_is_relevant(abs, &target) {
-        report.warnings.push(format!(
-            "跳过无关符号链接: {} -> {}",
-            abs.display(),
-            target.display()
-        ));
+        push_warning(
+            report,
+            format!(
+                "跳过无关符号链接: {} -> {}",
+                abs.display(),
+                target.display()
+            ),
+        );
         return;
     }
     report.entries.push(ScanEntry {
@@ -330,16 +403,27 @@ fn handle_symlink(abs: &Path, report: &mut ScanReport) {
 
 /// Whether a symlink is worth archiving: module-like name/target, or inside a managed config dir.
 ///
-/// 链接名或链接目标形如模块，或链接位于受管配置目录（[`CONFIG_DIRS`]）时才有意义。
+/// 链接名或链接目标形如模块，或链接位于受管配置路径（[`CONFIG_PATHS`]）时才有意义。
 fn symlink_is_relevant(abs: &Path, target: &Path) -> bool {
     is_module_path(abs) || is_module_path(target) || is_managed_config_dir(abs)
 }
 
-/// Whether a path sits under one of the managed configuration dirs.
+/// Whether a path sits under one of the managed configuration paths (C-27).
 ///
-/// 用于判断配置目录内的符号链接是否需要收录。
+/// 用于判断配置目录/文件内的符号链接是否需要收录。
 fn is_managed_config_dir(path: &Path) -> bool {
-    CONFIG_DIRS.iter().any(|dir| path.starts_with(*dir))
+    CONFIG_PATHS.iter().any(|(dir, _)| path.starts_with(dir))
+}
+
+/// Whether this symlink is the well-known `build`/`source` header link under a kernel tree.
+///
+/// `/lib/modules/<kver>/build`、`source` 指向内核头文件，几乎每台机器都有；
+/// 扫描时静默跳过，不再产生噪声告警（C-26）。
+fn is_kernel_header_link(abs: &Path) -> bool {
+    matches!(
+        abs.file_name().and_then(|n| n.to_str()),
+        Some("build") | Some("source")
+    )
 }
 
 /// Collect DKMS sources: `/var/lib/dkms/<pkg>/<ver>/**` and matching `/usr/src` trees.
@@ -358,160 +442,276 @@ fn scan_dkms_in(
     opt: &ScanOptions<'_>,
     report: &mut ScanReport,
 ) -> AppResult<()> {
-    let mut pkgs: Vec<String> = Vec::new();
-    if dkms_root.is_dir() {
-        for pkg_dir in sorted_dirs(dkms_root, report) {
-            if let Some(name) = pkg_dir.file_name().map(|n| n.to_string_lossy().into_owned()) {
-                pkgs.push(name);
-            }
-            // <pkg>/<ver> 整棵树纳入（modules/ 与 source/ 都在其中）
-            for ver_dir in sorted_dirs(&pkg_dir, report) {
-                walk_files(&ver_dir, EntryKind::Dkms, opt, report)?;
-            }
-        }
-    } else {
-        report.warnings.push(format!(
-            "DKMS 目录不存在或不可读: {}",
-            dkms_root.display()
-        ));
+    // C-29：只枚举一次 `/var/lib/dkms`，同时得到「包清单」与「待遍历版本目录」，
+    // 供 `ScanReport::dkms` 与文件遍历复用（消除旧实现的两遍目录遍历）。
+    let enumerated = enumerate_dkms(dkms_root, report);
+    report.dkms = enumerated.packages;
+
+    for ver_dir in &enumerated.walk_dirs {
+        walk_files(ver_dir, EntryKind::Dkms, opt, report)?;
+    }
+    if !dkms_root.is_dir() {
+        push_warning(
+            report,
+            format!("DKMS 目录不存在或不可读: {}", dkms_root.display()),
+        );
     }
 
     if usr_src.is_dir() {
+        let pkgs = &enumerated.names;
         let prefixes: Vec<String> = pkgs.iter().map(|p| format!("{p}-")).collect();
         for dir in sorted_dirs(usr_src, report) {
             let name = match dir.file_name() {
                 Some(n) => n.to_string_lossy().into_owned(),
                 None => continue,
             };
+            // C-29：优先读目录内 `dkms.conf` 的 `PACKAGE_NAME=`（可识别不带
+            // `-dkms` 后缀、命名不一致的包），目录名启发式仅作回退。
+            let conf_name = dkms_conf_package_name(&dir);
             let matched = name.contains("-dkms")
                 || pkgs.contains(&name)
-                || prefixes.iter().any(|pre| name.starts_with(pre.as_str()));
+                || prefixes.iter().any(|pre| name.starts_with(pre.as_str()))
+                || conf_name
+                    .as_deref()
+                    .is_some_and(|pkg| pkgs.iter().any(|p| p == pkg));
             if matched {
                 walk_files(&dir, EntryKind::Dkms, opt, report)?;
             }
         }
     } else {
-        report
-            .warnings
-            .push(format!("DKMS 源码目录不存在或不可读: {}", usr_src.display()));
+        push_warning(
+            report,
+            format!("DKMS 源码目录不存在或不可读: {}", usr_src.display()),
+        );
     }
     Ok(())
 }
 
-/// List registered DKMS packages from `/var/lib/dkms/<name>/<version>` (P0-4 重建输入).
+/// One-pass enumeration of `/var/lib/dkms` (C-29).
 ///
-/// 遍历一级 `<name>` 与二级 `<version>` 目录，产出去重后按名称、版本排序的
-/// [`DkmsPackage`]；根目录不存在或不可读时返回空列表（`scan_dkms` 已另行告警）。
-fn dkms_packages_in(root: &Path) -> Vec<DkmsPackage> {
-    let mut packages: Vec<DkmsPackage> = Vec::new();
-    let read_dir = match fs::read_dir(root) {
-        Ok(rd) => rd,
-        Err(_) => return packages,
-    };
-    let mut name_dirs: Vec<PathBuf> = read_dir
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    name_dirs.sort();
+/// 「注册包清单」用于 manifest 重建、名字集合用于匹配 `/usr/src`、
+/// `walk_dirs` 用于实际遍历（`<pkg>/<ver>` 与按内核的 `kernel-*` 构建目录都收录，
+/// 与旧行为一致；只有 `<ver>` 计入包清单）。
+struct DkmsEnum {
+    /// 去重排序后的注册包（`<pkg>/<ver>`）。
+    packages: Vec<DkmsPackage>,
+    /// 一级 `<pkg>` 名字（供 `/usr/src` 匹配）。
+    names: Vec<String>,
+    /// 需要遍历的二级目录（`<pkg>/<ver>` 与 `<pkg>/kernel-*`）。
+    walk_dirs: Vec<PathBuf>,
+}
 
-    for name_dir in name_dirs {
-        let name = match name_dir.file_name() {
+/// Enumerate `/var/lib/dkms` once; read errors degrade to warnings.
+fn enumerate_dkms(root: &Path, report: &mut ScanReport) -> DkmsEnum {
+    let mut packages: Vec<DkmsPackage> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut walk_dirs: Vec<PathBuf> = Vec::new();
+
+    if !root.is_dir() {
+        return DkmsEnum {
+            packages,
+            names,
+            walk_dirs,
+        };
+    }
+
+    for pkg_dir in sorted_dirs(root, report) {
+        let name = match pkg_dir.file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
             None => continue,
         };
-        let ver_rd = match fs::read_dir(&name_dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        let mut ver_dirs: Vec<PathBuf> = ver_rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            // `/var/lib/dkms/<pkg>/kernel-<kver>-<arch>/` 是**按内核的构建目录**，
-            // 不是模块版本；只有 `<version>/` 才是（形如 `0.12.7`）。
-            .filter(|p| {
-                !p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with("kernel-"))
-                    .unwrap_or(true)
-            })
-            .collect();
-        ver_dirs.sort();
-        for ver_dir in ver_dirs {
-            if let Some(version) = ver_dir.file_name() {
-                packages.push(DkmsPackage {
-                    name: name.clone(),
-                    version: version.to_string_lossy().into_owned(),
-                });
+        names.push(name.clone());
+        for ver_dir in sorted_dirs(&pkg_dir, report) {
+            let is_kernel_build = ver_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("kernel-"))
+                .unwrap_or(false);
+            // `/var/lib/dkms/<pkg>/kernel-<kver>-<arch>/` 是按内核的构建目录，
+            // 不是模块版本，因此不计入包清单；但仍要遍历其内容。
+            if !is_kernel_build {
+                if let Some(version) = ver_dir.file_name() {
+                    packages.push(DkmsPackage {
+                        name: name.clone(),
+                        version: version.to_string_lossy().into_owned(),
+                    });
+                }
             }
+            walk_dirs.push(ver_dir);
         }
     }
 
     packages.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
     packages.dedup();
-    packages
+    DkmsEnum {
+        packages,
+        names,
+        walk_dirs,
+    }
 }
 
-/// Fill [`ScanEntry::modinfo`] for every module entry, calling `modinfo` once per module (P0-2).
+/// Read `<dir>/dkms.conf` and return the value of its `PACKAGE_NAME=` directive (C-29).
+fn dkms_conf_package_name(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join("dkms.conf")).ok()?;
+    parse_dkms_conf_package_name(&text)
+}
+
+/// Parse `PACKAGE_NAME=` out of `dkms.conf` text (pure function).
 ///
-/// 先确认存在 `modinfo`（否则记一条 warning 后返回）；失败原因去重后最多记
-/// [`MAX_MODINFO_WARNINGS`] 条，避免刷屏。实际收集逻辑见
-/// [`collect_module_metadata_with`]（可注入，便于单测）。
-fn collect_module_metadata(report: &mut ScanReport) {
-    if !report.entries.iter().any(|e| e.kind == EntryKind::Module) {
-        return;
-    }
-    if !has_cmd("modinfo") {
-        report
-            .warnings
-            .push("未找到 modinfo 命令，跳过模块元数据收集".to_string());
-        return;
-    }
-    collect_module_metadata_with(report, run_modinfo);
-}
-
-/// [`collect_module_metadata`] 的可测试核心：`run` 注入"取 modinfo 文本"的实现。
-/// Testable core of [`collect_module_metadata`] with an injectable `modinfo` runner.
-fn collect_module_metadata_with<F>(report: &mut ScanReport, run: F)
-where
-    F: Fn(&Path) -> Result<String, String>,
-{
-    let mut failures: Vec<String> = Vec::new();
-    for entry in report.entries.iter_mut() {
-        if entry.kind != EntryKind::Module {
+/// 支持 `PACKAGE_NAME=foo`、`PACKAGE_NAME="foo"`、`PACKAGE_NAME='foo'` 以及
+/// `export PACKAGE_NAME=foo`；注释行忽略，值为空时继续找下一行。
+fn parse_dkms_conf_package_name(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match run(&entry.abs_path) {
-            Ok(text) => entry.modinfo = Some(parse_modinfo(&text)),
-            Err(reason) => {
-                if failures.len() < MAX_MODINFO_WARNINGS && !failures.contains(&reason) {
-                    failures.push(reason);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.split_whitespace().last().unwrap_or("");
+        if key != "PACKAGE_NAME" {
+            continue;
+        }
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Fill [`ScanEntry::modinfo`] for every module entry with a **batched** `modinfo`
+/// call (P0-2, C-43).
+///
+/// 先确认存在 `modinfo`（否则记一条 warning 后返回）；之后按 [`QUERY_CHUNK`] 分片，
+/// 每次传入多个模块路径（`modinfo a.ko b.ko …` 会按 `filename:` 分块输出）。
+/// 失败原因去重后最多记 [`MAX_MODINFO_WARNINGS`] 条，避免刷屏。
+fn collect_module_metadata(opt: &ScanOptions<'_>, report: &mut ScanReport) -> AppResult<()> {
+    if !report.entries.iter().any(|e| e.kind == EntryKind::Module) {
+        return Ok(());
+    }
+    if !has_cmd("modinfo") {
+        push_warning(report, "未找到 modinfo 命令，跳过模块元数据收集".to_string());
+        return Ok(());
+    }
+    collect_module_metadata_with(opt.cancel, report, run_modinfo_batch)
+}
+
+/// [`collect_module_metadata`] 的可测试核心：`run` 注入"一批模块 → modinfo 文本"。
+/// Testable core of [`collect_module_metadata`] with an injectable batched runner.
+///
+/// `run` 接收一批模块路径，返回合并后的 `modinfo` 文本（含每个模块的 `filename:`
+/// 行）；返回 `Err(原因)` 表示整批失败。找不到块的模块不计入成功。
+fn collect_module_metadata_with<F>(
+    cancel: Option<&AtomicBool>,
+    report: &mut ScanReport,
+    run: F,
+) -> AppResult<()>
+where
+    F: Fn(&[PathBuf]) -> Result<String, String>,
+{
+    let modules: Vec<PathBuf> = report
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Module)
+        .map(|e| e.abs_path.clone())
+        .collect();
+    if modules.is_empty() {
+        return Ok(());
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut found: HashMap<PathBuf, ModInfo> = HashMap::new();
+    let mut missing = 0usize;
+
+    for chunk in modules.chunks(QUERY_CHUNK) {
+        check_cancel_flag(cancel)?;
+        match run(chunk) {
+            Ok(text) => {
+                for (filename, info) in parse_modinfo_blocks(&text) {
+                    found.insert(PathBuf::from(filename), info);
                 }
+                missing += chunk
+                    .iter()
+                    .filter(|path| !found.contains_key(*path))
+                    .count();
+            }
+            Err(reason) => push_failure(&mut failures, reason),
+        }
+    }
+
+    if missing > 0 {
+        push_failure(
+            &mut failures,
+            format!("modinfo 未返回 {missing} 个模块的元数据"),
+        );
+    }
+    for entry in report.entries.iter_mut() {
+        if entry.kind == EntryKind::Module {
+            if let Some(info) = found.remove(&entry.abs_path) {
+                entry.modinfo = Some(info);
             }
         }
     }
     for reason in failures {
-        report.warnings.push(format!("modinfo 收集失败: {reason}"));
+        push_warning(report, format!("modinfo 收集失败: {reason}"));
+    }
+    Ok(())
+}
+
+/// Record one distinct failure reason, capped at [`MAX_MODINFO_WARNINGS`] (order preserved).
+fn push_failure(failures: &mut Vec<String>, reason: String) {
+    if failures.len() < MAX_MODINFO_WARNINGS && !failures.contains(&reason) {
+        failures.push(reason);
     }
 }
 
-/// Run `modinfo <module>` once and return its stdout, or a short failure reason.
+/// Run one batched `modinfo` over `modules`, returning combined stdout (C-43).
 ///
-/// 命令缺失/非零退出都返回 `Err(原因)`；调用方据此降级。
-fn run_modinfo(module: &Path) -> Result<String, String> {
-    let output = Command::new("modinfo")
-        .arg(module)
-        .output()
-        .map_err(|e| format!("无法执行 modinfo: {e}"))?;
-    if !output.status.success() {
-        let code = output
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string());
-        return Err(format!("modinfo 退出码 {code}"));
+/// 只应 spawn 失败/超时返回 `Err`：`modinfo` 对个别坏模块会非零退出但仍输出有效
+/// 模块的信息，按退出码丢弃会连带丢掉整批元数据（与 [`run_command_stdout`] 同理由）。
+fn run_modinfo_batch(modules: &[PathBuf]) -> Result<String, String> {
+    let args: Vec<OsString> = modules
+        .iter()
+        .map(|m| m.as_os_str().to_os_string())
+        .collect();
+    run_command_stdout_timeout("modinfo", &args, QUERY_TIMEOUT)
+        .ok_or_else(|| "无法执行 modinfo（缺失或超时）".to_string())
+}
+
+/// Split batched `modinfo` output into `(filename, ModInfo)` pairs (pure function).
+///
+/// `modinfo a.ko b.ko …` 为每个模块输出一段以 `filename:` 开头的块；以新的
+/// `filename:` 行为界切块，再交给 [`parse_modinfo`]。首行之前的内容忽略。
+fn parse_modinfo_blocks(text: &str) -> Vec<(String, ModInfo)> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for line in text.lines() {
+        let is_filename = line
+            .split_once(':')
+            .map(|(k, _)| k.trim() == "filename")
+            .unwrap_or(false);
+        if is_filename {
+            if let Some(done) = current.take() {
+                blocks.push(done);
+            }
+            let filename = line
+                .split_once(':')
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            current = Some((filename, format!("{line}\n")));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if let Some(done) = current.take() {
+        blocks.push(done);
+    }
+    blocks
+        .into_iter()
+        .map(|(filename, body)| (filename, parse_modinfo(&body)))
+        .collect()
 }
 
 /// Parse `modinfo` text into [`ModInfo`] (pure function, unit-test friendly).
@@ -606,19 +806,22 @@ fn usr_merge_normalize(p: &Path) -> PathBuf {
 /// 入口先对每个路径做 usr-merge 归一化（C-23，见 [`usr_merge_normalize`]），查询用
 /// 归一化路径，命中的结果**映射回原始路径键**插入 `owners` —— map 的 key 永远是调用方
 /// 传入的 `paths` 中的路径；查询本身走 [`run_command_stdout`]（C-22：不看退出码）。
-fn collect_owners(paths: &[PathBuf]) -> HashMap<PathBuf, Provenance> {
+fn collect_owners(
+    paths: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+) -> AppResult<HashMap<PathBuf, Provenance>> {
     let mut owners: HashMap<PathBuf, Provenance> = HashMap::new();
     if paths.is_empty() {
-        return owners;
+        return Ok(owners);
     }
     // 归一化只在入口做一次，dpkg 与 rpm 两条查询路径共用（C-23）。
     let queries: Vec<PathBuf> = paths.iter().map(|p| usr_merge_normalize(p)).collect();
     if has_cmd("dpkg-query") {
-        collect_owners_dpkg(paths, &queries, &mut owners);
+        collect_owners_dpkg(paths, &queries, &mut owners, cancel)?;
     } else if has_cmd("rpm") {
-        collect_owners_rpm(paths, &queries, &mut owners);
+        collect_owners_rpm(paths, &queries, &mut owners, cancel)?;
     }
-    owners
+    Ok(owners)
 }
 
 /// `dpkg-query -S` 批量查来源包，再 `-W` 批量取版本，写入 `owners`。
@@ -631,10 +834,11 @@ fn collect_owners_dpkg(
     paths: &[PathBuf],
     queries: &[PathBuf],
     owners: &mut HashMap<PathBuf, Provenance>,
-) {
+    cancel: Option<&AtomicBool>,
+) -> AppResult<()> {
     // 查询串 -> 包名
     let mut package_by_path: HashMap<String, String> = HashMap::new();
-    dpkg_query_s(queries, &mut package_by_path);
+    dpkg_query_s(queries, &mut package_by_path, cancel)?;
 
     // 回退：归一化改变了路径却未命中的条目，用原始路径再查一次。
     // 设计文档 §4-W0 C-23 允许"自然无归属"与"原路径重试"二选一，这里选重试：
@@ -650,10 +854,10 @@ fn collect_owners_dpkg(
             retry.push(orig.clone());
         }
     }
-    dpkg_query_s(&retry, &mut package_by_path);
+    dpkg_query_s(&retry, &mut package_by_path, cancel)?;
 
     if package_by_path.is_empty() {
-        return;
+        return Ok(());
     }
 
     // 去重后的包名列表
@@ -663,6 +867,7 @@ fn collect_owners_dpkg(
 
     let mut versions: HashMap<String, String> = HashMap::new();
     for chunk in packages.chunks(QUERY_CHUNK) {
+        check_cancel_flag(cancel)?;
         let mut args: Vec<OsString> = Vec::with_capacity(chunk.len() + 2);
         args.push(OsString::from("-W"));
         // dpkg-query 会解释格式串里的 `\t` / `\n` 转义。
@@ -699,56 +904,114 @@ fn collect_owners_dpkg(
             );
         }
     }
+    Ok(())
 }
 
-/// `rpm -qf` 逐路径查来源包（`%{NAME}` + `%{VERSION}-%{RELEASE}`），写入 `owners`。
-/// Query provenance per path with `rpm -qf`.
+/// `rpm -qf` **批量**查来源包（C-24），写入 `owners`。
+/// Query provenance in **batch** with `rpm -qf` (C-24).
 ///
-/// `queries` 与 `paths` 等长（C-23 归一化后的查询串）：先查归一化路径，未命中且与
-/// 原路径不同（非 usr-merge 系统）时用原始路径重试一次；命中一律回填**原始路径键**。
-/// 与 dpkg 一样走 [`run_command_stdout`]（C-22）：文件无归属时 rpm 非零退出，
-/// stdout 为空，解析自然得 `None`。
+/// 旧实现每路径 fork 一次 `rpm`（full 模式数万固件＝数万进程），且 `%{FILENAMES}`
+/// 输出可达数 MB 却只取首行。现在按 [`QUERY_CHUNK`] 分片，一次传入多个路径，格式只取
+/// 包名与版本（[`RPM_BATCH_FORMAT`]），并设 [`QUERY_TIMEOUT`] 超时。
+///
+/// 关联策略：`rpm -qf a b …` 按参数逐个输出（每个归属路径一行）；当输出行数与传入
+/// 路径数一致时按序对应，否则整片回退到逐路径查询，保证正确性（P-1 待容器复核）。
+/// `queries` 与 `paths` 等长（C-23 归一化查询串）：先用归一化串批量查，未命中且与
+/// 原始路径不同者再用原始路径逐条重试；命中一律回填**原始路径键**。
 fn collect_owners_rpm(
     paths: &[PathBuf],
     queries: &[PathBuf],
     owners: &mut HashMap<PathBuf, Provenance>,
-) {
-    for (path, query) in paths.iter().zip(queries) {
-        let hit = rpm_owner_of(query).or_else(|| {
-            if query == path {
-                None
-            } else {
-                rpm_owner_of(path)
-            }
-        });
-        let Some((name, version)) = hit else {
-            continue;
-        };
-        owners.insert(
-            path.clone(),
-            Provenance {
-                manager: "rpm".to_string(),
-                package: name,
-                version,
-            },
-        );
-    }
+    cancel: Option<&AtomicBool>,
+) -> AppResult<()> {
+    collect_owners_rpm_with(paths, queries, owners, cancel, |args| {
+        run_command_stdout_timeout("rpm", args, QUERY_TIMEOUT)
+    })
 }
 
-/// Single-path `rpm -qf` lookup returning `(package, version)`.
+/// [`collect_owners_rpm`] 的可测试核心：`run` 注入"一批 rpm 参数 → stdout"。
+/// Testable core of [`collect_owners_rpm`] with an injectable runner.
+fn collect_owners_rpm_with<F>(
+    paths: &[PathBuf],
+    queries: &[PathBuf],
+    owners: &mut HashMap<PathBuf, Provenance>,
+    cancel: Option<&AtomicBool>,
+    run: F,
+) -> AppResult<()>
+where
+    F: Fn(&[OsString]) -> Option<String>,
+{
+    let mut resolved = vec![false; paths.len()];
+    for (chunk_index, chunk) in queries.chunks(QUERY_CHUNK).enumerate() {
+        check_cancel_flag(cancel)?;
+        let Some(hits) = rpm_query_batch(chunk, &run) else {
+            continue; // 输出对不齐：留给下面的逐路径回退
+        };
+        for (offset, (name, version)) in hits.into_iter().enumerate() {
+            let index = chunk_index * QUERY_CHUNK + offset;
+            owners.insert(
+                paths[index].clone(),
+                Provenance {
+                    manager: "rpm".to_string(),
+                    package: name,
+                    version,
+                },
+            );
+            resolved[index] = true;
+        }
+    }
+
+    // 回退：归一化查询未命中、且原始拼写不同的（非 usr-merge 系统），逐条再查。
+    for (index, (path, query)) in paths.iter().zip(queries).enumerate() {
+        if resolved[index] || query == path {
+            continue;
+        }
+        check_cancel_flag(cancel)?;
+        let args: Vec<OsString> = vec![
+            OsString::from("-qf"),
+            OsString::from("--qf"),
+            OsString::from(RPM_BATCH_FORMAT),
+            path.as_os_str().to_os_string(),
+        ];
+        let Some(text) = run(&args) else {
+            continue;
+        };
+        if let Some((name, version)) = parse_rpm_batch(&text).into_iter().next() {
+            owners.insert(
+                path.clone(),
+                Provenance {
+                    manager: "rpm".to_string(),
+                    package: name,
+                    version,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One batched `rpm -qf` over `query_paths`; `None` when output cannot be aligned.
 ///
-/// 单条 `rpm -qf` 查询：spawn 失败、文件无归属（非零退出且 stdout 为空）都返回
-/// `None`；命中取首行即可（`FILENAMES` 可能内含该包全部文件，属 C-24 已知问题）。
-fn rpm_owner_of(path: &Path) -> Option<(String, String)> {
-    let args: Vec<OsString> = vec![
-        OsString::from("-qf"),
-        OsString::from("--qf"),
-        OsString::from(RPM_QF_FORMAT),
-        path.as_os_str().to_os_string(),
-    ];
-    let text = run_command_stdout("rpm", &args)?;
-    let (name, version, _) = parse_rpm_qf(&text).into_iter().next()?;
-    Some((name, version))
+/// 返回与 `query_paths` 等长（且按序对应）的 `(name, version)` 列表；任一无法归属的
+/// 路径会让 rpm 少输出一行，此时返回 `None` 触发调用方逐路径回退（顺序关联不可靠）。
+fn rpm_query_batch<F>(query_paths: &[PathBuf], run: &F) -> Option<Vec<(String, String)>>
+where
+    F: Fn(&[OsString]) -> Option<String>,
+{
+    if query_paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut args: Vec<OsString> = Vec::with_capacity(query_paths.len() + 3);
+    args.push(OsString::from("-qf"));
+    args.push(OsString::from("--qf"));
+    args.push(OsString::from(RPM_BATCH_FORMAT));
+    args.extend(query_paths.iter().map(|p| p.as_os_str().to_os_string()));
+    let text = run(&args)?;
+    let hits = parse_rpm_batch(&text);
+    if hits.len() != query_paths.len() {
+        return None;
+    }
+    Some(hits)
 }
 
 /// Batch `dpkg-query -S` over `query_paths`, merging hits into `package_by_path`.
@@ -757,8 +1020,13 @@ fn rpm_owner_of(path: &Path) -> Option<(String, String)> {
 /// C-22：查询走 [`run_command_stdout`] —— 批内只要有一个未归属路径 dpkg 就 `exit=1`，
 /// 但 stdout 仍包含其余路径的匹配（实测见 docs/ITERATION-v0.3.0.md §3.1-4），按退出码
 /// 丢弃会让整批最多 [`QUERY_CHUNK`] 条归属信息全部丢失。
-fn dpkg_query_s(query_paths: &[PathBuf], package_by_path: &mut HashMap<String, String>) {
+fn dpkg_query_s(
+    query_paths: &[PathBuf],
+    package_by_path: &mut HashMap<String, String>,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<()> {
     for chunk in query_paths.chunks(QUERY_CHUNK) {
+        check_cancel_flag(cancel)?;
         let mut args: Vec<OsString> = Vec::with_capacity(chunk.len() + 1);
         args.push(OsString::from("-S"));
         args.extend(chunk.iter().map(|p| p.as_os_str().to_os_string()));
@@ -769,6 +1037,7 @@ fn dpkg_query_s(query_paths: &[PathBuf], package_by_path: &mut HashMap<String, S
             package_by_path.entry(path).or_insert(package);
         }
     }
+    Ok(())
 }
 
 /// Look up one path's owning package, preferring the usr-merged query spelling (C-23).
@@ -806,6 +1075,49 @@ fn run_command_stdout(program: &str, args: &[OsString]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Like [`run_command_stdout`] but with a wall-clock timeout (C-24/C-43).
+///
+/// "尽力而为"执行器：忽略退出码，成功 spawn 即读取 stdout（在独立线程里读，避免
+/// 管道写满导致子进程阻塞）；仅 spawn 失败或 [`Duration`] 内未退出（随后 `kill`）
+/// 返回 `None`。
+fn run_command_stdout_timeout(
+    program: &str,
+    args: &[OsString],
+    timeout: Duration,
+) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                break false;
+            }
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    finished.then_some(text)
+}
+
 /// Parse `dpkg-query -S` output: `package: path1, path2` (one package per line).
 ///
 /// 返回 `(包名, 路径)` 对；同一包多路径用 `,` 分隔，多包多行。`diversion by …`
@@ -834,23 +1146,21 @@ fn parse_dpkg_query_s(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Parse `rpm -qf --qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{FILENAMES}\n'` output.
+/// Parse batched `rpm -qf --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n'` output (C-24).
 ///
-/// 返回 `(name, version, path)` 三元组；字段不足三列（或 path 为空）的脏行忽略。
-fn parse_rpm_qf(text: &str) -> Vec<(String, String, String)> {
-    let mut out: Vec<(String, String, String)> = Vec::new();
+/// 每行一个 `(name, version)`；字段不足两列、包名为空的脏行忽略。**不再解析
+/// `%{FILENAMES}`**，因此输出始终很小。
+fn parse_rpm_batch(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
-        if line.trim().is_empty() {
+        let Some((name, version)) = line.split_once('\t') else {
+            continue; // 无制表符 = 脏行（例如 rpm 的诊断输出混入）
+        };
+        let name = name.trim();
+        if name.is_empty() {
             continue;
         }
-        let mut fields = line.splitn(3, '\t');
-        let name = fields.next().unwrap_or("").trim();
-        let version = fields.next().unwrap_or("").trim();
-        let path = fields.next().unwrap_or("").trim();
-        if name.is_empty() || path.is_empty() {
-            continue;
-        }
-        out.push((name.to_string(), version.to_string(), path.to_string()));
+        out.push((name.to_string(), version.trim().to_string()));
     }
     out
 }
@@ -867,19 +1177,42 @@ fn mark_package_provided_firmware(entries: &mut [ScanEntry]) {
     }
 }
 
-/// Sum firmware entry sizes into [`ScanReport::firmware_bytes`] (size hint for the UI).
+/// Sum the sizes of firmware entries that actually store content (C-28, W5).
+///
+/// 只累计 `content_stored == true` 的固件：由系统包提供的固件只记路径、不进归档，
+/// 计入体积会让 UI 虚高。必须在 [`mark_package_provided_firmware`] **之后**调用。
 fn tally_firmware(report: &mut ScanReport) {
     report.firmware_bytes = report
         .entries
         .iter()
-        .filter(|e| e.kind == EntryKind::Firmware)
+        .filter(|e| e.kind == EntryKind::Firmware && e.content_stored)
         .map(|e| e.size)
         .sum();
+}
+
+/// Locate the firmware tree, preferring a real directory (C-28).
+///
+/// usr-merge 系统上 `/lib/firmware` 是符号链接；`WalkDir` 默认不跟随链接，直接遍历会
+/// 得到空结果。因此优先选**非符号链接的目录**（`/lib/firmware` → `/usr/lib/firmware`），
+/// 两者都不是真实目录时，退而取任一个 `is_dir()` 跟随链接成立的候选。
+fn firmware_dir() -> Option<&'static str> {
+    for dir in FIRMWARE_DIRS {
+        if let Ok(meta) = fs::symlink_metadata(dir) {
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                return Some(dir);
+            }
+        }
+    }
+    FIRMWARE_DIRS
+        .iter()
+        .copied()
+        .find(|dir| Path::new(dir).is_dir())
 }
 
 /// Append one regular-file entry; unreadable files degrade to a warning, never an error.
 ///
 /// 常规文件默认 `content_stored = true`；`owner`/`modinfo` 留待后续批量填充。
+/// C-37 的"单文件不可读不中止"在本模块即体现为这里只记 warning（备份流水线另有处理）。
 fn push_file(abs: &Path, kind: EntryKind, report: &mut ScanReport) {
     match fs::metadata(abs) {
         Ok(meta) => report.entries.push(ScanEntry {
@@ -892,9 +1225,7 @@ fn push_file(abs: &Path, kind: EntryKind, report: &mut ScanReport) {
             modinfo: None,
             content_stored: true,
         }),
-        Err(err) => report
-            .warnings
-            .push(format!("无法读取 {}: {err}", abs.display())),
+        Err(err) => push_warning(report, format!("无法读取 {}: {err}", abs.display())),
     }
 }
 
@@ -918,9 +1249,7 @@ fn sorted_dirs(dir: &Path, report: &mut ScanReport) -> Vec<PathBuf> {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(err) => {
-            report
-                .warnings
-                .push(format!("无法读取目录 {}: {err}", dir.display()));
+            push_warning(report, format!("无法读取目录 {}: {err}", dir.display()));
             return Vec::new();
         }
     };
@@ -935,10 +1264,51 @@ fn sorted_dirs(dir: &Path, report: &mut ScanReport) -> Vec<PathBuf> {
 
 /// Bail out as soon as the shared cancel flag is set.
 fn check_cancel(opt: &ScanOptions<'_>) -> AppResult<()> {
-    match opt.cancel {
+    check_cancel_flag(opt.cancel)
+}
+
+/// [`check_cancel`] 的裸旗标版本：供不持有 [`ScanOptions`] 的第 5 阶段辅助函数复用（C-43）。
+/// Bare-flag variant of [`check_cancel`] reused by the stage-5 helpers (C-43).
+fn check_cancel_flag(flag: Option<&AtomicBool>) -> AppResult<()> {
+    match flag {
         Some(flag) if flag.load(Ordering::Relaxed) => Err(AppError::Cancelled),
         _ => Ok(()),
     }
+}
+
+/// Append a warning with global dedup and a hard cap (C-26).
+///
+/// 同一条消息只保留一次；总数达 [`MAX_WARNINGS`] 后不再追加具体消息，而是把
+/// "省略计数"标记原地累加（`（更多告警已省略，共 N 条）`）。
+fn push_warning(report: &mut ScanReport, message: String) {
+    if message.is_empty() {
+        return;
+    }
+    if report.warnings.contains(&message) {
+        return;
+    }
+    if report.warnings.len() < MAX_WARNINGS {
+        report.warnings.push(message);
+        return;
+    }
+    if let Some(last) = report.warnings.last_mut() {
+        if let Some(count) = parse_overflow_count(last) {
+            *last = format!("{WARNING_OVERFLOW_PREFIX}{} 条）", count + 1);
+            return;
+        }
+    }
+    report
+        .warnings
+        .push(format!("{WARNING_OVERFLOW_PREFIX}1 条）"));
+}
+
+/// Parse the omitted-warning count out of an overflow marker (see [`push_warning`]).
+fn parse_overflow_count(marker: &str) -> Option<usize> {
+    marker
+        .strip_prefix(WARNING_OVERFLOW_PREFIX)?
+        .strip_suffix(" 条）")?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -1193,15 +1563,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// C-28：`firmware_bytes` 只累计 `content_stored == true` 的固件（包提供的跳过）。
     #[test]
-    fn tally_firmware_sums_only_firmware_bytes() {
+    fn tally_firmware_sums_only_content_stored_firmware() {
         let mut report = ScanReport::default();
         report
             .entries
             .push(entry("/lib/firmware/a.bin", 100, EntryKind::Firmware, None));
-        report
-            .entries
-            .push(entry("/lib/firmware/b.bin", 250, EntryKind::Firmware, None));
+        let mut provided = entry("/lib/firmware/b.bin", 250, EntryKind::Firmware, None);
+        provided.content_stored = false; // 由系统包提供，不进归档
+        report.entries.push(provided);
         report.entries.push(entry(
             "/lib/modules/x/updates/m.ko",
             7,
@@ -1209,7 +1580,7 @@ mod tests {
             None,
         ));
         tally_firmware(&mut report);
-        assert_eq!(report.firmware_bytes, 350);
+        assert_eq!(report.firmware_bytes, 100, "包提供固件不得计入体积");
     }
 
     // -----------------------------------------------------------------------
@@ -1378,18 +1749,20 @@ firmware: nvidia/2.bin
         assert!(!parse_modinfo("").is_signed());
     }
 
-    /// P0-2：注入式收集器把 modinfo 文本填入每个 Module 条目。
+    /// P0-2：注入式收集器把 modinfo 文本填入每个 Module 条目（批处理，按 filename 分块）。
     #[test]
     fn module_metadata_is_filled_from_modinfo() {
+        let path = "/lib/modules/6.0.0-test/updates/dkms/a.ko";
         let mut report = ScanReport::default();
-        report.entries.push(entry(
-            "/lib/modules/6.0.0-test/updates/dkms/a.ko",
-            1,
-            EntryKind::Module,
-            None,
-        ));
-        let canned = "vermagic: 6.8.0-45-generic SMP\nfirmware: fw/a.bin\ndepends: dep1, dep2\nsig_id: PKCS#7\n";
-        collect_module_metadata_with(&mut report, |_path: &Path| Ok(canned.to_string()));
+        report.entries.push(entry(path, 1, EntryKind::Module, None));
+        let canned = format!(
+            "filename:       {path}\nvermagic:       6.8.0-45-generic SMP\n\
+             firmware:       fw/a.bin\ndepends:        dep1, dep2\nsig_id:         PKCS#7\n"
+        );
+        collect_module_metadata_with(None, &mut report, |_paths: &[PathBuf]| {
+            Ok(canned.clone())
+        })
+        .expect("collect");
 
         let info = report.entries[0].modinfo.as_ref().expect("metadata filled");
         assert_eq!(info.vermagic.as_deref(), Some("6.8.0-45-generic SMP"));
@@ -1397,6 +1770,26 @@ firmware: nvidia/2.bin
         assert_eq!(info.firmware, vec!["fw/a.bin".to_string()]);
         assert!(info.is_signed());
         assert!(report.warnings.is_empty());
+    }
+
+    /// C-43：批处理下 `modinfo` 文本按 `filename:` 分块，映射回各自的模块条目。
+    #[test]
+    fn parse_modinfo_blocks_maps_each_module_by_filename() {
+        let text = "\
+filename:       /lib/modules/6/updates/a.ko
+vermagic:       6.8.0 SMP
+sig_id:         PKCS#7
+filename:       /lib/modules/6/updates/b.ko
+depends:        a
+";
+        let blocks = parse_modinfo_blocks(text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "/lib/modules/6/updates/a.ko");
+        assert_eq!(blocks[0].1.vermagic.as_deref(), Some("6.8.0 SMP"));
+        assert!(blocks[0].1.is_signed());
+        assert_eq!(blocks[1].0, "/lib/modules/6/updates/b.ko");
+        assert_eq!(blocks[1].1.depends, vec!["a".to_string()]);
+        assert!(parse_modinfo_blocks("").is_empty());
     }
 
     /// P0-2：失败原因去重，且最多写 [`MAX_MODINFO_WARNINGS`] 条。
@@ -1411,9 +1804,54 @@ firmware: nvidia/2.bin
                 None,
             ));
         }
-        collect_module_metadata_with(&mut report, |_path: &Path| Err("boom".to_string()));
+        collect_module_metadata_with(None, &mut report, |_paths: &[PathBuf]| {
+            Err("boom".to_string())
+        })
+        .expect("collect");
         assert_eq!(report.warnings.len(), 1, "同一失败原因去重后只记一条");
         assert!(report.entries.iter().all(|e| e.modinfo.is_none()));
+    }
+
+    /// C-43：`modinfo` 批次内成功与缺失并存时，只对缺失项记一条失败告警。
+    #[test]
+    fn modinfo_missing_entries_are_reported_once() {
+        let mut report = ScanReport::default();
+        for i in 0..3 {
+            report.entries.push(entry(
+                &format!("/lib/modules/6/updates/m{i}.ko"),
+                1,
+                EntryKind::Module,
+                None,
+            ));
+        }
+        // 只返回第一个模块的块，其余两个缺失。
+        collect_module_metadata_with(None, &mut report, |paths: &[PathBuf]| {
+            Ok(format!("filename:       {}\nvermagic: 6.8.0 SMP\n", paths[0].display()))
+        })
+        .expect("collect");
+        assert_eq!(report.entries[0].modinfo.as_ref().unwrap().vermagic.as_deref(), Some("6.8.0 SMP"));
+        assert!(report.entries[1].modinfo.is_none() && report.entries[2].modinfo.is_none());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("未返回 2 个模块"));
+    }
+
+    /// C-43：第 5 阶段元数据收集可取消。
+    #[test]
+    fn modinfo_collection_respects_cancel() {
+        let cancel = AtomicBool::new(true);
+        let mut report = ScanReport::default();
+        report.entries.push(entry(
+            "/lib/modules/6/updates/a.ko",
+            1,
+            EntryKind::Module,
+            None,
+        ));
+        match collect_module_metadata_with(Some(&cancel), &mut report, |_p: &[PathBuf]| {
+            Ok(String::new())
+        }) {
+            Err(AppError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 
     /// P0-5：`pkg: /path1, /path2` 单包多路径。
@@ -1460,27 +1898,119 @@ diversion by foo from: /usr/lib/old
         assert!(parse_dpkg_query_s("no-separator-here").is_empty());
     }
 
-    /// P0-5：解析 `rpm -qf` 的 `NAME\tVERSION-RELEASE\tFILENAMES` 行。
+    /// C-24：解析批量 `rpm -qf` 的 `NAME\tVERSION-RELEASE` 行（不再含 FILENAMES）。
     #[test]
-    fn parse_rpm_qf_reads_tab_separated_rows() {
-        let text = "kmod-nvidia\t550.107.02-1\t/usr/lib/modules/6.8/extra/nvidia.ko\n\
-                    kmod-nvidia\t550.107.02-1\t/usr/lib/modules/6.8/extra/nvidia-uvm.ko\n";
-        let parsed = parse_rpm_qf(text);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "kmod-nvidia");
-        assert_eq!(parsed[0].1, "550.107.02-1");
-        assert_eq!(parsed[0].2, "/usr/lib/modules/6.8/extra/nvidia.ko");
-    }
-
-    /// P0-5：字段不足/路径为空的脏行被忽略。
-    #[test]
-    fn parse_rpm_qf_skips_malformed_lines() {
-        let text = "only-one-field\nname\tversion\n\t\t/path\nreal\t1.0\t/p\n";
-        let parsed = parse_rpm_qf(text);
+    fn parse_rpm_batch_reads_name_and_version() {
+        let text = "kmod-nvidia\t550.107.02-1\nkmod-nvidia\t550.107.02-1\n";
+        let parsed = parse_rpm_batch(text);
         assert_eq!(
             parsed,
-            vec![("real".to_string(), "1.0".to_string(), "/p".to_string())]
+            vec![
+                ("kmod-nvidia".to_string(), "550.107.02-1".to_string()),
+                ("kmod-nvidia".to_string(), "550.107.02-1".to_string()),
+            ]
         );
+    }
+
+    /// C-24：包名为空/无分隔符的脏行被忽略。
+    #[test]
+    fn parse_rpm_batch_skips_malformed_lines() {
+        let text = "only-one-field\n\tno-name\nreal\nreal\t1.0\n";
+        let parsed = parse_rpm_batch(text);
+        assert_eq!(parsed, vec![("real".to_string(), "1.0".to_string())]);
+    }
+
+    /// C-24：批量查询按"每路径一行"关联；行数不符时返回 `None` 触发逐路径回退。
+    #[test]
+    fn rpm_query_batch_aligns_only_on_matching_line_count() {
+        let paths = vec![
+            PathBuf::from("/usr/lib/modules/6/extra/a.ko"),
+            PathBuf::from("/usr/lib/modules/6/extra/b.ko"),
+        ];
+        let ok = rpm_query_batch(&paths, &|_args: &[OsString]| {
+            Some("kmod-a\t1.0-1\nkmod-b\t2.0-1\n".to_string())
+        })
+        .expect("aligned");
+        assert_eq!(ok.len(), 2);
+        assert_eq!(ok[0].0, "kmod-a");
+        assert_eq!(ok[1].0, "kmod-b");
+
+        // 有一路径未归属 → rpm 只输出一行 → 无法按序对应 → None
+        assert!(rpm_query_batch(&paths, &|_a: &[OsString]| {
+            Some("kmod-a\t1.0-1\n".to_string())
+        })
+        .is_none());
+        // spawn 失败 → None
+        assert!(rpm_query_batch(&paths, &|_a: &[OsString]| None).is_none());
+    }
+
+    /// C-24：可注入的批量 rpm 收集器按序回填原始路径键，并对未命中项逐路径回退。
+    #[test]
+    fn collect_owners_rpm_maps_paths_and_falls_back() {
+        let paths = vec![
+            PathBuf::from("/lib/modules/6/extra/a.ko"),
+            PathBuf::from("/lib/modules/6/extra/b.ko"),
+        ];
+        // 归一化查询；整批因有一路径未归属而无法按序对齐 → 回退到原始路径逐条单查。
+        let queries = vec![
+            PathBuf::from("/usr/lib/modules/6/extra/a.ko"),
+            PathBuf::from("/usr/lib/modules/6/extra/b.ko"),
+        ];
+        let mut owners = HashMap::new();
+        collect_owners_rpm_with(&paths, &queries, &mut owners, None, |args| {
+            // 批查询最后一个是归一化后的 b；单查回退最后一个是原始路径。
+            let last = args
+                .last()
+                .map(|a| a.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match last.as_str() {
+                // 批查询：故意只回一行 → 行数不符 → 无法对齐
+                "/usr/lib/modules/6/extra/b.ko" => Some("kmod-a\t1.0-1\n".to_string()),
+                // 逐路径回退：非 usr-merge 数据库记录的是 /lib 原始路径
+                "/lib/modules/6/extra/a.ko" => Some("kmod-a\t1.0-1\n".to_string()),
+                "/lib/modules/6/extra/b.ko" => Some("kmod-b\t2.0-1\n".to_string()),
+                _ => None,
+            }
+        })
+        .expect("collect rpm");
+
+        assert_eq!(owners[&paths[0]].package, "kmod-a");
+        assert_eq!(owners[&paths[0]].version, "1.0-1");
+        assert_eq!(owners[&paths[1]].package, "kmod-b");
+        assert!(owners.keys().all(|k| paths.contains(k)), "key 必须是原始路径");
+    }
+
+    /// C-24：`rpm -qf` 批量查询优先按"每个归属路径一行"关联，一次填入全部。
+    #[test]
+    fn collect_owners_rpm_batch_fills_all_aligned_paths() {
+        let paths = vec![
+            PathBuf::from("/usr/lib/modules/6/extra/a.ko"),
+            PathBuf::from("/usr/lib/modules/6/extra/b.ko"),
+        ];
+        let queries = paths.clone(); // 已归一化，无需回退
+        let mut owners = HashMap::new();
+        collect_owners_rpm_with(&paths, &queries, &mut owners, None, |_args| {
+            Some("kmod-a\t1.0-1\nkmod-b\t2.0-1\n".to_string())
+        })
+        .expect("collect rpm");
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[&paths[0]].package, "kmod-a");
+        assert_eq!(owners[&paths[1]].package, "kmod-b");
+    }
+
+    /// C-43：归属查询阶段同样可取消。
+    #[test]
+    fn collect_owners_rpm_respects_cancel() {
+        let cancel = AtomicBool::new(true);
+        let paths = vec![PathBuf::from("/usr/lib/modules/6/extra/a.ko")];
+        let queries = paths.clone();
+        let mut owners = HashMap::new();
+        match collect_owners_rpm_with(&paths, &queries, &mut owners, Some(&cancel), |_a| {
+            Some(String::new())
+        }) {
+            Err(AppError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 
     /// C-22：`dpkg-query -S` 批内含未归属路径时 exit=1，stdout 里已匹配的部分必须仍被解析。
@@ -1616,7 +2146,7 @@ dash: /bin/sh, /usr/bin/sh
         let inputs = vec![PathBuf::from(
             "/lib/modules/6.8.0-test/updates/dkms/ldb-owner-probe.ko",
         )];
-        let owners = collect_owners(&inputs);
+        let owners = collect_owners(&inputs, None).expect("collect owners");
         assert!(
             owners.keys().all(|k| inputs.contains(k)),
             "owners 只能用原始路径做 key，实际: {:?}",
@@ -1663,9 +2193,9 @@ dash: /bin/sh, /usr/bin/sh
         assert_eq!(entries[2].kind, EntryKind::Module, "kind 保持不变");
     }
 
-    /// DKMS 清单：`/var/lib/dkms/<name>/<version>` 去重后按名称、版本排序。
+    /// DKMS 清单：`/var/lib/dkms/<name>/<version>` 去重后按名称、版本排序（单次枚举）。
     #[test]
-    fn dkms_packages_in_lists_sorted_deduped() {
+    fn dkms_enumeration_lists_sorted_deduped() {
         let base = temp_dir("dkmslist");
         fs::create_dir_all(base.join("nvidia/550.1")).unwrap();
         fs::create_dir_all(base.join("nvidia/535.2")).unwrap();
@@ -1673,7 +2203,8 @@ dash: /bin/sh, /usr/bin/sh
         fs::create_dir_all(base.join("nvidia")).unwrap(); // 只有 name，无 version
         fs::write(base.join("stray"), b"x").unwrap(); // 非目录忽略
 
-        let packages = dkms_packages_in(&base);
+        let packages =
+            enumerate_dkms(&base, &mut ScanReport::default()).packages;
         let got: Vec<(String, String)> = packages
             .iter()
             .map(|p| (p.name.clone(), p.version.clone()))
@@ -1686,8 +2217,236 @@ dash: /bin/sh, /usr/bin/sh
                 ("vbox".to_string(), "7.0".to_string()),
             ]
         );
-        assert!(dkms_packages_in(&base.join("missing")).is_empty());
+        assert!(
+            enumerate_dkms(&base.join("missing"), &mut ScanReport::default())
+                .packages
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0 W3 新增：C-24…C-29 / C-43
+    // -----------------------------------------------------------------------
+
+    /// C-25：`kernel/` 子树内的符号链接属于内核基线，不得被当成外置模块收录。
+    #[test]
+    fn symlink_inside_kernel_subtree_is_not_out_of_tree() {
+        let base = temp_dir("kernellink");
+        let kver_dir = base.join("6.0.0-test");
+        write_file(&kver_dir.join("kernel/drivers/real.ko"));
+        std::os::unix::fs::symlink("real.ko", kver_dir.join("kernel/drivers/link.ko"))
+            .expect("symlink in kernel tree");
+        write_file(&kver_dir.join("updates/out.ko"));
+
+        let distro = dummy_distro();
+        let opt = ScanOptions {
+            kver: "6.0.0-test",
+            distro: &distro,
+            mode: BackupMode::Minimal,
+            cancel: None,
+        };
+        let mut report = ScanReport::default();
+        scan_module_root(&kver_dir, &opt, &mut report).expect("scan");
+
+        assert_eq!(report.entries.len(), 1, "只有 kernel/ 之外的 out.ko 收录");
+        assert!(report.entries[0].rel_path.ends_with("updates/out.ko"));
+        assert_eq!(report.skipped_in_tree, 2, "kernel/ 下的 real.ko 与 link.ko 计为 in-tree");
+        assert!(report.entries.iter().all(|e| e.kind == EntryKind::Module));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// C-26：`build`/`source` 目录链接静默跳过，不再产生告警。
+    #[test]
+    fn build_and_source_kernel_links_are_silently_skipped() {
+        let base = temp_dir("buildlink");
+        let kver_dir = base.join("6.0.0-test");
+        write_file(&kver_dir.join("updates/a.ko"));
+        std::os::unix::fs::symlink("/usr/src/linux-headers-6.0.0-test", kver_dir.join("build"))
+            .expect("build symlink");
+        std::os::unix::fs::symlink("/usr/src/linux-headers-6.0.0-test", kver_dir.join("source"))
+            .expect("source symlink");
+
+        let distro = dummy_distro();
+        let opt = ScanOptions {
+            kver: "6.0.0-test",
+            distro: &distro,
+            mode: BackupMode::Minimal,
+            cancel: None,
+        };
+        let mut report = ScanReport::default();
+        scan_module_root(&kver_dir, &opt, &mut report).expect("scan");
+
+        assert_eq!(report.entries.len(), 1);
+        assert!(
+            report.warnings.is_empty(),
+            "build/source 链接不得告警: {:?}",
+            report.warnings
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// C-26：`report.warnings` 全局去重，并在上限后累计溢出条数。
+    #[test]
+    fn warnings_are_deduped_and_capped_with_overflow_count() {
+        let mut report = ScanReport::default();
+        push_warning(&mut report, "dup".to_string());
+        push_warning(&mut report, "dup".to_string());
+        assert_eq!(report.warnings.len(), 1, "重复消息只保留一条");
+
+        // 填满到上限
+        for i in 0..MAX_WARNINGS - 1 {
+            push_warning(&mut report, format!("w{i}"));
+        }
+        assert_eq!(report.warnings.len(), MAX_WARNINGS);
+        // 再多的告警只累加溢出计数
+        for i in 0..50 {
+            push_warning(&mut report, format!("x{i}"));
+        }
+        assert_eq!(report.warnings.len(), MAX_WARNINGS + 1);
+        let last = report.warnings.last().unwrap();
+        assert_eq!(parse_overflow_count(last), Some(50));
+        // 空消息被忽略
+        push_warning(&mut report, String::new());
+        assert_eq!(report.warnings.len(), MAX_WARNINGS + 1);
+    }
+
+    /// C-27：配置路径扩展覆盖 initramfs 控制文件，且匹配遵守组件边界。
+    #[test]
+    fn config_paths_cover_initramfs_controls() {
+        for p in [
+            "/etc/initramfs-tools",
+            "/etc/dracut.conf",
+            "/etc/dracut.conf.d",
+            "/etc/mkinitcpio.conf",
+            "/etc/mkinitcpio.d",
+            "/etc/modules",
+            "/etc/sysconfig/modules",
+        ] {
+            assert!(CONFIG_PATHS.iter().any(|(d, _)| *d == p), "缺少 {p}");
+            assert!(is_managed_config_dir(Path::new(p)), "未纳入受管路径: {p}");
+        }
+        assert!(!is_managed_config_dir(Path::new("/etc/modules-other")));
+        assert!(is_managed_config_dir(Path::new(
+            "/etc/modules-load.d/x.conf"
+        )));
+    }
+
+    /// C-28：固件目录优先选真实目录（usr-merge 下回退 `/usr/lib/firmware`）。
+    #[test]
+    fn firmware_dir_prefers_real_directory() {
+        let exists = FIRMWARE_DIRS.iter().any(|d| Path::new(d).is_dir());
+        match firmware_dir() {
+            Some(dir) => assert!(FIRMWARE_DIRS.contains(&dir) && Path::new(dir).is_dir()),
+            None => assert!(!exists, "存在候选目录却返回 None"),
+        }
+        let lib_symlink = fs::symlink_metadata("/lib/firmware")
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let usr_real = fs::symlink_metadata("/usr/lib/firmware")
+            .map(|m| m.is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false);
+        if lib_symlink && usr_real {
+            assert_eq!(firmware_dir(), Some("/usr/lib/firmware"));
+            assert_eq!(firmware_dir(), Some(FIRMWARE_DIRS[1]));
+        }
+    }
+
+    /// C-29：解析 `dkms.conf` 的 `PACKAGE_NAME=`（引号/export/注释/空值）。
+    #[test]
+    fn parse_dkms_conf_package_name_variants() {
+        assert_eq!(
+            parse_dkms_conf_package_name("PACKAGE_NAME=nvidia\n"),
+            Some("nvidia".to_string())
+        );
+        assert_eq!(
+            parse_dkms_conf_package_name("PACKAGE_NAME=\"nvidia-550\"\n"),
+            Some("nvidia-550".to_string())
+        );
+        assert_eq!(
+            parse_dkms_conf_package_name("export PACKAGE_NAME='foo'\n"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            parse_dkms_conf_package_name("# PACKAGE_NAME=x\nPACKAGE_NAME=bar\n"),
+            Some("bar".to_string())
+        );
+        assert_eq!(parse_dkms_conf_package_name("PACKAGE_NAME=\n"), None);
+        assert_eq!(parse_dkms_conf_package_name("OTHER=1\n"), None);
+    }
+
+    /// C-29：目录名不提示 DKMS，仅 `dkms.conf` 的 `PACKAGE_NAME` 指向已注册包时也应收录。
+    #[test]
+    fn dkms_conf_package_name_selects_usr_src_tree() {
+        let base = temp_dir("dkmsconf");
+        let dkms_root = base.join("var/lib/dkms");
+        let usr_src = base.join("usr/src");
+        write_file(&dkms_root.join("nvidia/550.1/module.c"));
+        write_file(&usr_src.join("weird-name-1.2/dkms.conf"));
+        fs::write(
+            usr_src.join("weird-name-1.2/dkms.conf"),
+            b"PACKAGE_NAME=\"nvidia\"\n",
+        )
+        .unwrap();
+        write_file(&usr_src.join("unrelated/x.c"));
+
+        let distro = dummy_distro();
+        let opt = ScanOptions {
+            kver: "6.0.0-test",
+            distro: &distro,
+            mode: BackupMode::Standard,
+            cancel: None,
+        };
+        let mut report = ScanReport::default();
+        scan_dkms_in(&dkms_root, &usr_src, &opt, &mut report).expect("scan dkms");
+
+        assert!(report
+            .entries
+            .iter()
+            .any(|e| e.rel_path.ends_with("usr/src/weird-name-1.2/dkms.conf")));
+        assert!(!report
+            .entries
+            .iter()
+            .any(|e| e.rel_path.contains("unrelated")));
+        assert_eq!(
+            report.dkms,
+            vec![DkmsPackage {
+                name: "nvidia".to_string(),
+                version: "550.1".to_string(),
+            }],
+            "扫描一次同时产出 manifest 的 dkms 清单"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// C-43：`run_command_stdout_timeout` 忽略退出码读取 stdout，超时返回 `None`。
+    #[test]
+    fn run_command_stdout_timeout_handles_exit_and_timeout() {
+        let ok = run_command_stdout_timeout(
+            "sh",
+            &[
+                OsString::from("-c"),
+                OsString::from("printf hi; exit 1"),
+            ],
+            Duration::from_secs(5),
+        );
+        assert_eq!(ok.as_deref(), Some("hi"), "非零退出仍返回 stdout");
+
+        let timed_out = run_command_stdout_timeout(
+            "sh",
+            &[
+                OsString::from("-c"),
+                OsString::from("sleep 5; printf late"),
+            ],
+            Duration::from_millis(150),
+        );
+        assert!(timed_out.is_none(), "超时必须返回 None 而非阻塞");
+
+        assert!(
+            run_command_stdout_timeout("ldb-no-such-command-xyz", &[], Duration::from_secs(1))
+                .is_none(),
+            "命令缺失返回 None"
+        );
     }
 
     /// 冒烟：在真实主机上以 Minimal 模式跑一次，任何环境都必须 Ok（缺失项只进 warnings）。

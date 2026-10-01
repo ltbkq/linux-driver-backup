@@ -9,8 +9,11 @@ Name=Linux 驱动备份与还原工具
 Name[en]=Linux Driver Backup & Restore
 Comment=备份与还原 Linux 外置（out-of-tree）驱动模块 / Back up and restore out-of-tree Linux kernel drivers
 # Exec 只写命令名（不带路径）：deb/rpm 装到 /usr/bin、install.sh 装到 /usr/local/bin，
-# 桌面环境会按 PATH 解析 / bare command name resolved via PATH wherever it is installed
+# 桌面环境会按 PATH 解析 / bare command name resolved via PATH wherever it is installed.
+# install.sh 会在安装时把 Exec/TryExec 改写为 --prefix 下的绝对路径（C-55）。
 Exec=linux-driver-backup
+# TryExec 供菜单项在安装缺失时自动隐藏（同样由 install.sh 改写为绝对路径）
+TryExec=linux-driver-backup
 Icon=linux-driver-backup
 Terminal=false
 # Categories 必须以分号结尾；主类 System，次类 Utility，Settings 为补充类

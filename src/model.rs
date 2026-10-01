@@ -173,6 +173,86 @@ impl RestoreStrategy {
     }
 }
 
+/// Non-file side effect of a restore (W1/C-15, ITERATION §5.3): one command run
+/// during the system phase, plus the compensation command that undoes it.
+/// 还原的非文件副作用（W1/C-15，ITERATION §5.3）：系统阶段执行的一条命令，
+/// 以及回滚时用于补偿它的命令。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommandEntry {
+    /// Program that was run / 执行的程序名。
+    pub program: String,
+    /// Arguments passed to the program / 传给程序的参数。
+    pub args: Vec<String>,
+    /// Full compensation argv (including the program) run on rollback; `None`
+    /// means the effect cannot be compensated precisely.
+    /// 回滚时执行的补偿命令完整 argv（含程序名）；`None` 表示无法精确补偿。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undone_by: Option<Vec<String>>,
+    /// Whether only a best-effort compensation is possible (e.g. a package was
+    /// reinstalled at a newer version); recorded as a note on rollback.
+    /// 是否只可"尽力补偿"（如包重装为新版本）；回滚时记入 notes。
+    #[serde(default)]
+    pub best_effort: bool,
+    /// Human-readable description / 人类可读说明。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// One entry of a [`RestorePlan`] (W1/C-19): the decision taken for one manifest
+/// path before any write — shared by dry-run reporting and the real run.
+/// [`RestorePlan`] 中的单条决策（W1/C-19）：dry-run 与实跑共用，保证统计同源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedEntry {
+    /// Archive-relative path (without the `data/` prefix) / 归档相对路径（不含 `data/`）。
+    pub path: String,
+    /// Entry classification / 条目分类。
+    pub kind: EntryKind,
+    /// Resolved (degraded) restore strategy / 已解析（含降级）的还原策略。
+    pub strategy: RestoreStrategy,
+    /// Whether the payload is stored in the archive / 内容是否存入归档。
+    pub content_stored: bool,
+    /// Uncompressed size recorded in the manifest / manifest 记录的字节数。
+    pub size: u64,
+    /// Symlink target (only for `EntryKind::Symlink`) / 符号链接目标（仅 Symlink）。
+    pub link_target: Option<String>,
+}
+
+/// Deterministic restore plan (W1/C-19): the shared source of truth for dry-run
+/// statistics and the real run; W6 per-module selection will consume it too.
+/// 确定性还原计划（W1/C-19）：dry-run 统计与实跑的共同事实源；W6 勾选还原亦将消费它。
+#[derive(Debug, Clone, Default)]
+pub struct RestorePlan {
+    /// Per-entry decisions / 逐条计划。
+    pub entries: Vec<PlannedEntry>,
+    /// Regular files that will be copied directly (excludes modules that will be
+    /// rebuilt/reinstalled) / 将直接拷贝的普通文件数（不含将重建/重装的模块）。
+    pub files: usize,
+    /// Symlinks that will be created / 将写入的符号链接数。
+    pub links: usize,
+    /// Bytes that will be copied directly / 将直接拷贝的字节数。
+    pub bytes: u64,
+    /// Firmware entries skipped because firmware restore is disabled / 未开启固件而跳过的条目数。
+    pub firmware_skipped: usize,
+    /// Entries skipped because the payload is provided by a system package /
+    /// 内容未存入归档（由系统包提供）而跳过的条目数。
+    pub provided_skipped: usize,
+    /// Counts per strategy (Chinese label → count) / 各策略条目数（中文标签 → 数量）。
+    pub strategy_counts: Vec<(String, usize)>,
+    /// Plan-level notes (e.g. offline downgrade) / 计划阶段说明（如离线降级）。
+    pub notes: Vec<String>,
+}
+
+impl RestorePlan {
+    /// Resolved strategy for a manifest-relative path, when planned.
+    /// 某 manifest 相对路径的已解析策略（若在计划内）。
+    pub fn strategy_for(&self, path: &str) -> Option<RestoreStrategy> {
+        self.entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.strategy)
+    }
+}
+
 /// Secure Boot 上下文（v2 新增）。
 /// Secure Boot context recorded in the manifest (new in v2).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -762,5 +842,73 @@ mod tests {
         assert_eq!(RestoreStrategy::WeakModules.label_zh(), "弱更新链接");
         assert_eq!(RestoreStrategy::Copy.label_zh(), "拷贝");
         assert_eq!(RestoreStrategy::Skip.label_zh(), "跳过");
+    }
+
+    /// W1/C-19：`RestorePlan` 的按路径查询是稳定契约。
+    #[test]
+    fn restore_plan_strategy_lookup_w1() {
+        let plan = RestorePlan {
+            entries: vec![
+                PlannedEntry {
+                    path: "lib/modules/6.8/x.ko".to_string(),
+                    kind: EntryKind::Module,
+                    strategy: RestoreStrategy::Rebuild,
+                    content_stored: true,
+                    size: 10,
+                    link_target: None,
+                },
+                PlannedEntry {
+                    path: "etc/modprobe.d/x.conf".to_string(),
+                    kind: EntryKind::Config,
+                    strategy: RestoreStrategy::Copy,
+                    content_stored: true,
+                    size: 3,
+                    link_target: None,
+                },
+            ],
+            files: 1,
+            links: 0,
+            bytes: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan.strategy_for("lib/modules/6.8/x.ko"),
+            Some(RestoreStrategy::Rebuild)
+        );
+        assert_eq!(
+            plan.strategy_for("etc/modprobe.d/x.conf"),
+            Some(RestoreStrategy::Copy)
+        );
+        assert_eq!(plan.strategy_for("missing"), None);
+    }
+
+    /// W1/C-15：`CommandEntry` 必须可 JSON 往返（journal 需持久化）。
+    #[test]
+    fn command_entry_roundtrip_w1() {
+        let entry = CommandEntry {
+            program: "dkms".to_string(),
+            args: vec![
+                "install".to_string(),
+                "-m".to_string(),
+                "foo".to_string(),
+            ],
+            undone_by: Some(vec![
+                "dkms".to_string(),
+                "remove".to_string(),
+                "-m".to_string(),
+                "foo".to_string(),
+            ]),
+            best_effort: false,
+            note: "DKMS 重建 foo".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: CommandEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+        // 缺省字段可反序列化（向后兼容）
+        let minimal: CommandEntry =
+            serde_json::from_str(r#"{"program":"depmod","args":["-a","6.8"]}"#).unwrap();
+        assert_eq!(minimal.undone_by, None);
+        assert!(!minimal.best_effort);
+        assert!(minimal.note.is_empty());
     }
 }

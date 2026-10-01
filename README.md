@@ -126,7 +126,7 @@ GUI 主窗口（扫描 → 选择模式与输出路径 → 备份 / 还原，含
 | Debian / Ubuntu / Linux Mint 等（arm64） | `.deb` | `sudo apt install ./linux-driver-backup_<版本>_arm64.deb`（树莓派 / ARM 服务器 / Apple Silicon 虚拟机） |
 | Fedora / RHEL / Rocky / AlmaLinux / openEuler（x86_64） | `.rpm` | `sudo dnf install ./linux-driver-backup-<版本>-1.x86_64.rpm` |
 | Fedora / RHEL / Rocky / AlmaLinux 等（aarch64） | `.rpm` | `sudo dnf install ./linux-driver-backup-<版本>-1.aarch64.rpm` |
-| Arch / Manjaro / EndeavourOS | 源码包（PKGBUILD，AUR 用） | 本地构建安装：`cd packaging/arch`，先按 [packaging/arch/README.md](packaging/arch/README.md) 渲染模板中的 `@VERSION@`，再执行 `makepkg -si`；若已提交 AUR，可用 `yay -S linux-driver-backup` |
+| Arch / Manjaro / EndeavourOS | 源码包（PKGBUILD，AUR 用） | 渲染并构建：`bash packaging/build-packages.sh arch --tarball <tarball> --sha256 <sha256>` 产出填充好的 `PKGBUILD` 与 `.SRCINFO`（版本取自 `Cargo.toml`，无需手工替换），再执行 `makepkg -si`；若已提交 AUR，可用 `yay -S linux-driver-backup` |
 | 任意发行版 / Any distro | AppImage（免安装，可放 U 盘，仅 x86_64） | `chmod +x linux-driver-backup-<版本>-linux-x86_64.AppImage`<br>`./linux-driver-backup-<版本>-linux-x86_64.AppImage` |
 | 任意发行版 / Any distro | `tar.gz`（通用兜底，x86_64 + aarch64） | 解压后执行 `./install.sh`（默认装入 `/usr/local`，可用 `--prefix` 改前缀） |
 | 从源码构建 / Build from source | — | 见下方 [快速开始 / Quick Start](#快速开始--quick-start) 的「从源码构建 / Build from source」 |
@@ -168,13 +168,15 @@ linux-driver-backup
 | 内容 / Item | `.deb` / `.rpm` / AUR | `install.sh`（默认前缀） |
 |---|---|---|
 | 可执行文件 | `/usr/bin/linux-driver-backup` | `/usr/local/bin/linux-driver-backup` |
-| 桌面入口 | `/usr/share/applications/linux-driver-backup.desktop` | `/usr/local/share/applications/…` |
+| 桌面入口 | `/usr/share/applications/linux-driver-backup.desktop`（`Exec`/`TryExec` 为绝对路径） | `/usr/local/share/applications/…` |
 | 图标 | `/usr/share/icons/hicolor/scalable/apps/linux-driver-backup.svg` | `/usr/local/share/icons/hicolor/scalable/apps/…` |
+| polkit 策略 | `/usr/share/polkit-1/actions/io.github.ltbkq.linux-driver-backup.policy`（GUI 提权） | `/usr/local/share/polkit-1/actions/…`（可用 `--no-polkit` 关闭） |
 | 许可全文 | `/usr/share/doc/linux-driver-backup/copyright`（deb）/ `%{_docdir}`（rpm） | `/usr/local/share/doc/linux-driver-backup/LICENSE` |
 
 > 维护者提示 / Maintainer tip：本机可用 `bash packaging/build-packages.sh deb tar` 产出 `.deb` 与
 > `tar.gz`；`.rpm` 与 AppImage 需要 `rpmbuild` / `appimagetool`，本机缺失时脚本会打印「[跳过]」，
-> 由 CI 的 `package` 作业补齐。
+> 由 CI 的 `package` 作业补齐。版本与架构解析统一在 [`packaging/lib/common.sh`](packaging/lib/common.sh)
+> （唯一事实源）；RPM 目标默认 `auto`，可用 `--rpm-target fedora|suse|both` 指定。
 
 ## 快速开始 / Quick Start
 
@@ -349,9 +351,11 @@ linux-driver-backup-rust/
 │   ├── linux-driver-backup.spec    # RPM spec 模板（%build 留空，CI 拷入二进制）
 │   ├── arch/PKGBUILD               # Arch/AUR 源码包模板（见 arch/README.md）
 │   ├── appimage/                   # AppDir 结构说明
-│   ├── build-appimage.sh           # 组 AppDir 并用 appimagetool 产 AppImage
-│   ├── build-packages.sh           # 统一打包入口：deb / tar / rpm / appimage / all
-│   └── install.sh                  # 通用安装脚本（--prefix / --uninstall / --help）
+│   ├── lib/common.sh               # 版本/架构/校验/占位符唯一解析（各脚本 source）
+│   ├── polkit/                     # pkexec 提权 policy（io.github.ltbkq.linux-driver-backup）
+│   ├── build-appimage.sh           # 组 AppDir 并用 appimagetool（固定版本+SHA-256）产 AppImage
+│   ├── build-packages.sh           # 统一打包入口：deb / tar / rpm / arch / appimage / all
+│   └── install.sh                  # 通用安装脚本（--prefix / --uninstall / --polkit-dir / --help）
 ├── ui/
 │   └── app_window.slint            # 声明式 GUI（含 struct 模型）
 ├── src/

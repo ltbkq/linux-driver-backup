@@ -28,20 +28,22 @@
 ```bash
 cd packaging/arch
 
-# 1) 把模板里的 @VERSION@ 替换成 Cargo.toml 里的真实版本（根目录可一键生成）
-VERSION=$(grep -m1 '^version' ../../Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-sed "s/@VERSION@/$VERSION/g" PKGBUILD > PKGBUILD.rendered
-mv PKGBUILD.rendered PKGBUILD        # 或直接手工编辑 pkgver
+# 1) 渲染模板并生成 .SRCINFO：由统一打包管线完成（C-52）
+#    - @VERSION@ 取自 Cargo.toml，@SHA256@ 为发布归档真实哈希
+#    - 产物写入仓库根 dist/aur/（PKGBUILD + .SRCINFO）
+#    需联网下载发布归档；也可用 --tarball/--sha256 离线指定
+cd ../..
+bash packaging/build-packages.sh arch
+# 或离线 / offline:
+# bash packaging/build-packages.sh arch --tarball dist/linux-driver-backup-<版本>-linux-x86_64.tar.gz
 
-# 2) 生成/更新校验和（发布 release 之后执行；未发 release 前保持 SKIP）
-updpkgsums                          # 或 makepkg -g
-
-# 3) 生成 .SRCINFO（AUR 必需，改任何字段后都要重跑）
-makepkg --printsrcinfo > .SRCINFO
-
-# 4) 构建并安装（-s 自动装依赖，-i 装完直接 pacman -U）
+# 2) 构建并安装（-s 自动装依赖，-i 装完直接 pacman -U）
+cd dist/aur
 makepkg -si
 ```
+
+> 手工维护时（不使用统一管线）：把 `@VERSION@` 替换为真实版本、用 `updpkgsums`
+> 生成 `sha256sums`、再 `makepkg --printsrcinfo > .SRCINFO`（AUR 不接受 `SKIP`）。
 
 安装落点 / Install layout：
 
@@ -49,6 +51,7 @@ makepkg -si
 /usr/bin/linux-driver-backup
 /usr/share/applications/linux-driver-backup.desktop
 /usr/share/icons/hicolor/scalable/apps/linux-driver-backup.svg
+/usr/share/polkit-1/actions/linux-driver-backup.policy
 /usr/share/licenses/linux-driver-backup/LICENSE
 ```
 
@@ -78,6 +81,7 @@ git push
 - **`ERROR: deps not satisfied`**：缺少 `cargo`，装 Rust 工具链；
 - **`.SRCINFO` 与 `PKGBUILD` 不一致**（AUR 机器人会报错）：任何时候改了 `PKGBUILD`
   都要重跑 `makepkg --printsrcinfo > .SRCINFO`；
-- **Arch 的 `depends` 与 deb 的 `Depends` 不同名**：Arch 包名是 `wayland` /
-  `libxkbcommon` / `glibc`，deb 是 `libc6` / `libwayland-client0` / `libxkbcommon0`，
+- **Arch 的 `depends` 与 deb 的 `Depends` 不同名**：Arch 包名是 `glibc` /
+  `fontconfig` / `freetype2` / `wayland` / `libxkbcommon`，deb 是 `libc6` /
+  `libfontconfig1` / `libfreetype6` / `libwayland-client0` / `libxkbcommon0`，
   这是发行版命名差异，不是错误。
